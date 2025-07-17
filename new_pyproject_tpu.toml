@@ -1,0 +1,47 @@
+[project]
+name = "MaxText"
+version = "0.1.0"
+description = "MaxText is a high performance, highly scalable, open-source LLM written in pure Python/Jax and targeting Google Cloud TPUs and GPUs for training and inference"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10,<4"
+dependencies = [
+    "aqtp (>=0.8.4,<0.9.0)",
+    "cloud-accelerator-diagnostics (>=0.1.1,<0.2.0)",
+    "cloud-tpu-diagnostics (>=0.1.5,<0.2.0)",
+    "datasets (>=4.0.0,<5.0.0)",
+    "flax (>=0.10.7,<0.11.0)",
+    "google-cloud-storage (>=2.19.0,<4.0.0)",
+    "grain (>=0.2.11,<0.3.0)",
+    "jax[tpu] (>=0.6.2,<0.7.0)",
+    "jaxtyping (>=0.3.2,<0.4.0)",
+    "ml-collections (>=1.1.0,<2.0.0)",
+    "ml-goodput-measurement (>=0.0.12,<0.0.13)",
+    "omegaconf (>=2.3.0,<3.0.0)",
+    "pathwaysutils (>=0.1.1,<0.2.0)",
+    "pillow (>=11.3.0,<12.0.0)",
+    "psutil (>=7.0.0,<8.0.0)",
+    "sentencepiece (>=0.2.0,<0.3.0)",
+    "tensorflow (>=2.13.0,<3.0.0)",
+    "tensorflow-datasets (>=4.9.9,<5.0.0)",
+    "tensorflow-text (>=2.19.0,<3.0.0)",
+    "tensorboardx (>=2.6.4,<3.0.0)",
+    "tiktoken (>=0.9.0,<0.10.0)",
+    "transformers (>=4.53.2,<5.0.0)",
+]
+
+[tool.poetry.requires-plugins]
+poetry-plugin-export = ">=1.8"
+
+[tool.poetry]
+packages = [{include = "MaxText", from=""}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0","setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]  
+where = ["MaxText"]
+include = ["MaxText*"]
+exclude = ["MaxText.tests.*"]
+
