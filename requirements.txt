@@ -1,6 +1,6 @@
 # We recommend using lower bounds for dependencies instead of exact == pins.
-jax>=0.4.30
-jaxlib>=0.4.30
+jax>=0.5.1
+jaxlib>=0.5.1
 orbax-checkpoint>=0.5.12
 absl-py>=2.1.0
 array-record>=0.7.2
