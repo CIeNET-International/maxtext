@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "MaxText is a high performance, highly scalable, open-source LLM written in pure Python/Jax and targeting Google Cloud TPUs and GPUs for training and inference"
 readme = "README.md"
 license = {file = "LICENSE"}
-requires-python = ">=3.10,<4"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "aqtp (>=0.8.4,<0.9.0)",
     "cloud-accelerator-diagnostics (>=0.1.1,<0.2.0)",
@@ -12,12 +12,12 @@ dependencies = [
     "datasets (>=4.0.0,<5.0.0)",
     "flax (>=0.10.7,<0.11.0)",
     "google-cloud-storage (>=2.19.0,<4.0.0)",
-    "grain (>=0.2.11,<0.3.0)",
-    "jaxtyping (>=0.3.2,<0.4.0)",
+    "grain[parquet] (>=0.2.11,<0.3.0)",
+    "jsonlines (>=4.0.0,<5.0.0)",
     "ml-collections (>=1.1.0,<2.0.0)",
     "ml-goodput-measurement (>=0.0.12,<0.0.13)",
     "omegaconf (>=2.3.0,<3.0.0)",
-    "pathwaysutils (>=0.1.1,<0.2.0)",
+    "pathwaysutils (>=0.1.1,<0.2.0)", 
     "pillow (>=11.3.0,<12.0.0)",
     "psutil (>=7.0.0,<8.0.0)",
     "sentencepiece (>=0.2.0,<0.3.0)",
@@ -33,14 +33,63 @@ dependencies = [
 poetry-plugin-export = ">=1.8"
 
 [tool.poetry]
-packages = [{include = "MaxText", from=""}]
+packages = [{include = "MaxText", from = ""}]
+
+[tool.poetry.group.stable_tpu.dependencies]
+jax = {extras = ["tpu"], version = "^0.6.2"}
+jaxtyping = "^0.3.2"
+
+[tool.poetry.group.stable_gpu.dependencies]
+jax = {extras = ["cuda12"], version = "^0.6.2"}
+jaxtyping = "^0.3.2"
+
+[tool.poetry.group.pinned_gpu.dependencies]
+jax = {extras = ["cuda12"], version = "^0.6.2"}
+transformer-engine = { version = "1.13.0", extras = ["jax"], optional = true }
+
+[tool.poetry.group.nightly_tpu.dependencies]
+jax = { version = "*", source = "jax-nightly", allow-prereleases = true }
+jaxlib = { version = "*", source = "jax-nightly", allow-prereleases = true }
+libtpu = { version = "*", allow-prereleases = true, source = "jax-nightly" }
+tbp-nightly = { version = "*", allow-prereleases = true }
+
+[tool.poetry.group.nightly_gpu.dependencies]
+jax = { version = "*", source = "jax-nightly", allow-prereleases = true }
+jaxlib = { version = "*", source = "jax-nightly", allow-prereleases = true }
+jax-cuda12-plugin = { version = "*", extras = ["with-cuda"], source = "jax-nightly", allow-prereleases = true }
+jax-cuda12-pjrt = { version = "*", source = "jax-nightly", allow-prereleases = true }
+
+[tool.poetry.group.jax_ai_image_tpu.dependencies]
+mlperf-logging = { git = "https://github.com/mlperf/logging.git" }
+google-jetstream = { git = "https://github.com/AI-Hypercomputer/JetStream.git" }
+
+[tool.poetry.group.jax_ai_image_gpu.dependencies]
+mlperf-logging = { git = "https://github.com/mlperf/logging.git" }
+google-jetstream = { git = "https://github.com/AI-Hypercomputer/JetStream.git" }
+
+[tool.poetry.group.stable_stack_tpu.dependencies]
+etils = "^1.13.0"
+mlperf-logging = { git = "https://github.com/mlperf/logging.git" }
+google-jetstream = { git = "https://github.com/AI-Hypercomputer/JetStream.git" }
+jax = {extras = ["tpu"], version = "^0.6.2"}
+
+[tool.poetry.group.stable_stack_gpu.dependencies]
+etils = "^1.13.0"
+jaxtyping = "^0.3.2"
+
+[tool.poetry.group.libtpu_only.dependencies]
+crcmod = "^1.7"
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0","setuptools>=61.0"]
+requires = ["poetry-core>=2.0.0,<3.0.0", "setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]  
+[tool.setuptools.packages.find]
 where = ["MaxText"]
 include = ["MaxText*"]
 exclude = ["MaxText.tests.*"]
 
+
+[[tool.poetry.source]]
+name = "jax-nightly"
+url = "https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/"
