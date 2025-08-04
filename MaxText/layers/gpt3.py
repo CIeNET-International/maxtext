@@ -237,7 +237,7 @@ class Gpt3MultiHeadAttention(nnx.Module):
     self.value = self.create_projection_layer(feature_dim, ("embed", "heads", "kv"),(self.num_heads,self.head_dim))
     self.out_proj = DenseGeneral(
         in_features_shape=(self.num_heads, self.head_dim),
-        out_features_shape=feature_dim,
+        out_features_shape=self.num_heads*self.head_dim,
         axis=(-2, -1),  # collapse heads and head_dim
         kernel_init=self.kernel_init,
         kernel_axes=("heads", "kv", "embed"),
