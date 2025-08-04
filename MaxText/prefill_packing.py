@@ -315,7 +315,7 @@ class BatchedPrefillProcessor:
           model_params, input_padding, bucket.capacity, bucket.count, return_prompt_logp
       )
       first_tokens, decode_state = prefill_fn(
-          model_params, tok_ids, slots, pos_ids, seg_ids, offsets_jax, lengths_jax, decode_state, return_prompt_logp
+          model_params, tok_ids, slots, pos_ids, seg_ids, offsets_jax, lengths_jax, decode_state
       )
 
     prefill_result = []
