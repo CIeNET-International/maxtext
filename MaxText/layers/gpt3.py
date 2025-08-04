@@ -271,7 +271,6 @@ class Gpt3MultiHeadAttention(nn.Module):
       model_mode: str = MODEL_MODE_TRAIN,
       deterministic: bool = False,
   ):
-    breakpoint()
     inputs_q = nn.with_logical_constraint(inputs_q, self.input_axis_names)
     if self.fused_qkv:
       query, key, value = self.qkv_projection(inputs_q, proj_name="qkv_proj")
@@ -379,8 +378,6 @@ class Gpt3DecoderLayer(nn.Module):
         quant=self.quant,
         kv_quant=quantizations.configure_kv_quant(cfg),
     )
-
-    breakpoint()
 
     attention_lnx = attention_layer(
         lnx, decoder_segment_ids=decoder_segment_ids, model_mode=model_mode, deterministic=deterministic
