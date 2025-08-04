@@ -32,7 +32,7 @@ from flax import nnx
 from MaxText import max_logging
 from MaxText.common_types import Config, DType, AxisNames, BATCH, LENGTH, EMBED, HEAD, D_KV, Array, MODEL_MODE_TRAIN
 from MaxText.layers import initializers, nnx_wrappers
-from MaxText.layers.linears import DenseGeneral, MlpBlock
+from MaxText.layers.linears import DenseGeneral, MlpBlock,_canonicalize_tuple,_normalize_axes
 from MaxText.layers import models
 from MaxText.layers import quantizations
 from MaxText.layers.attentions import AttentionOp, KVQuant
@@ -231,16 +231,44 @@ class Gpt3MultiHeadAttention(nnx.Module):
     self.out_axis_names = out_axis_names
     self.rngs = rngs if rngs is not None else kwargs.get("rngs", nnx.Rngs(0))
     print(f'feature_dim: {feature_dim}')
-    self.qkv_projection_layer = self.create_projection_layer(feature_dim, ("embed", "qkv", "heads", "kv"))
-    self.q_projection_layer = self.create_projection_layer(feature_dim, ("embed", "heads", "kv"))
-    self.k_projection_layer = self.create_projection_layer(feature_dim, ("embed", "heads", "kv"))
-    self.v_projection_layer = self.create_projection_layer(feature_dim, ("embed", "heads", "kv"))
-    self.out_projection_layer = self.create_projection_layer(feature_dim, ("heads", "kv", "embed"))
+    self.qkv_proj = self.create_projection_layer(feature_dim, ("embed", "qkv", "heads", "kv"),(3,self.num_heads,self.head_dim))
+    self.query = self.create_projection_layer(feature_dim, ("embed", "heads", "kv"),(self.num_heads,self.head_dim))
+    self.key = self.create_projection_layer(feature_dim, ("embed", "heads", "kv"),(self.num_heads,self.head_dim))
+    self.value = self.create_projection_layer(feature_dim, ("embed", "heads", "kv"),(self.num_heads,self.head_dim))
+    self.out_proj = DenseGeneral(
+        in_features_shape=(self.num_heads, self.head_dim),
+        out_features_shape=feature_dim,
+        axis=(-2, -1),  # collapse heads and head_dim
+        kernel_init=self.kernel_init,
+        kernel_axes=("heads", "kv", "embed"),
+        dtype=self.dtype,
+        weight_dtype=self.weight_dtype,
+        quant=self.quant,
+        use_bias=self.use_bias,
+        matmul_precision=self.config.matmul_precision,
+        rngs=self.rngs,
+    )
+    self.attention_op = AttentionOp(
+        config=self.config,
+        mesh=self.mesh,
+        attention_kernel=self.attention_kernel,
+        max_target_length=self.max_target_length,
+        float32_qk_product=self.float32_qk_product,
+        float32_logits=self.float32_logits,
+        quant=self.quant,
+        kv_quant=self.kv_quant,
+        num_query_heads=self.num_heads,
+        num_kv_heads=self.num_heads,
+        dtype=self.dtype,
+    )
+  def create_projection_layer(self, input_shape: Array, kernel_axes: tuple[str], out_shapes: tuple[int]):
+    axis = -1
+    axis = _canonicalize_tuple(axis)
+    in_features_shape = tuple(input_shape[ax] for ax in _normalize_axes(axis, len(input_shape)))
 
-  def create_projection_layer(self, input_shape: Array, kernel_axes: str):
     return DenseGeneral(
-        in_features_shape=input_shape,
-        out_features_shape=(3, self.num_heads, self.head_dim),
+        in_features_shape=in_features_shape,
+        out_features_shape=out_shapes,
         axis=-1,
         kernel_init=self.kernel_init,
         kernel_axes=kernel_axes,
@@ -252,22 +280,22 @@ class Gpt3MultiHeadAttention(nnx.Module):
         rngs=self.rngs,
     )
 
-  def qkv_projection(self, projection_layer: Any, inputs: Array, proj_name: str):
+  def qkv_projection(self, projection_layer: Any, inputs: Array):
     """Fused QKV projection"""
     print(f'qkv_projection in_features_shape: {inputs.shape}')
 
-    qkv_proj = self.qkv_projection_layer(inputs)
+    qkv_proj = projection_layer(inputs)
 
     qkv_proj = checkpoint_name(qkv_proj, "qkv_proj")
     query, key, value = qkv_proj[:, :, 0, ...], qkv_proj[:, :, 1, ...], qkv_proj[:, :, 2, ...]
     return query, key, value
 
-  def projection(self, projection_layer: Any, inputs: Array, proj_name: str) -> Array:
+  def projection(self, projection_layer: Any, inputs: Array) -> Array:
     """individual projection for one of q, k and v."""
     proj = projection_layer(inputs)
     return proj
 
-  def out_projection(self, projection_layer: Any, output_dim: int, out: Array) -> Array:
+  def out_projection(self, projection_layer: Any, out: Array) -> Array:
     """output projection"""
 
     out_proj = projection_layer(out)
@@ -283,12 +311,11 @@ class Gpt3MultiHeadAttention(nnx.Module):
   ):
     inputs_q = nn.with_logical_constraint(inputs_q, self.input_axis_names)
     if self.fused_qkv:
-      print(f'inputs_q size: {inputs_q.shape}')
-      query, key, value = self.qkv_projection(self.qkv_projection_layer, inputs_q, proj_name="qkv_proj")
+      query, key, value = self.qkv_projection(self.qkv_proj, inputs_q)
     else:
-      query = self.projection(self.q_projection_layer, inputs_q, proj_name="query")
-      key = self.projection(self.k_projection_layer, inputs_q, proj_name="key")
-      value = self.projection(self.v_projection_layer, inputs_q, proj_name="value")
+      query = self.projection(self.query, inputs_q)
+      key = self.projection(self.key, inputs_q)
+      value = self.projection(self.value, inputs_q)
 
     depth_scaling = jnp.sqrt(self.head_dim).astype(self.dtype)
     query /= depth_scaling
@@ -301,26 +328,12 @@ class Gpt3MultiHeadAttention(nnx.Module):
     value = nn.with_logical_constraint(value, self.value_axis_names)
     value = checkpoint_name(value, "value_proj")
 
-    attention_op = AttentionOp(
-        config=self.config,
-        mesh=self.mesh,
-        attention_kernel=self.attention_kernel,
-        max_target_length=self.max_target_length,
-        float32_qk_product=self.float32_qk_product,
-        float32_logits=self.float32_logits,
-        quant=self.quant,
-        kv_quant=self.kv_quant,
-        num_query_heads=self.num_heads,
-        num_kv_heads=self.num_heads,
-        dtype=self.dtype,
-    )
-
-    out = attention_op(query, key, value, decoder_segment_ids, model_mode)
+    out = self.attention_op(query, key, value, decoder_segment_ids, model_mode)
 
     out = nn.with_logical_constraint(out, self.out_axis_names)
 
-    # apply output projection,  output dim is set to the input dim.
-    out = self.out_projection(self.out_projection_layer, inputs_q.shape[-1], out)
+    # apply output projection
+    out = self.out_projection(self.out_proj, out)
     out = checkpoint_name(out, "out_proj")
     return out
 
