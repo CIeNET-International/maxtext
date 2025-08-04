@@ -389,7 +389,7 @@ class Gpt3DecoderLayer(nnx.Module):
         config=self.config,
         num_heads=self.config.num_query_heads,
         dtype=self.config.dtype,
-        feature_dim=lnx.shape[-1],
+        feature_dim=lnx.shape,
         weight_dtype=self.config.weight_dtype,
         head_dim=self.config.head_dim,
         max_target_length=self.config.max_target_length,
