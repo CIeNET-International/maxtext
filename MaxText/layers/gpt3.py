@@ -205,6 +205,8 @@ class Gpt3MultiHeadAttention(nn.Module):
 
   def qkv_projection(self, inputs: Array, proj_name: str):
     """Fused QKV projection"""
+    print(f'qkv_projection: inputs_shape {inputs.shape}')
+    print(f'qkv_projection: out_features_shape {(3, self.num_heads, self.head_dim)}')
 
     qkv_proj = dense_general(
         inputs_shape=inputs.shape,
@@ -225,6 +227,9 @@ class Gpt3MultiHeadAttention(nn.Module):
 
   def projection(self, inputs: Array, proj_name: str) -> Array:
     """individual projection for one of q, k and v."""
+    print(f'projection: inputs_shape {inputs.shape}')
+    print(f'projection: out_features_shape {(self.num_heads, self.head_dim)}')
+
     proj = dense_general(
         inputs_shape=inputs.shape,
         out_features_shape=(self.num_heads, self.head_dim),
