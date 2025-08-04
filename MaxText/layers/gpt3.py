@@ -384,14 +384,12 @@ class Gpt3DecoderLayer(nnx.Module):
         self.config.num_query_heads == self.config.num_kv_heads
     ), f"{self.config.num_query_heads=} should be the same as {self.config.num_kv_heads=} in gpt3"
 
-    # Todo: make the axis names parameters
-    lnx_sharding = nn.with_logical_constraint(lnx, (BATCH, LENGTH, EMBED))
 
     attention_layer = Gpt3MultiHeadAttention(
         config=self.config,
         num_heads=self.config.num_query_heads,
         dtype=self.config.dtype,
-        feature_dim=lnx_sharding.shape,
+        feature_dim=lnx.shape[-1],
         weight_dtype=self.config.weight_dtype,
         head_dim=self.config.head_dim,
         max_target_length=self.config.max_target_length,
