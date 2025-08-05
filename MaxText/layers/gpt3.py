@@ -357,7 +357,7 @@ class Gpt3DecoderLayer(nn.Module):
 
     for device in jax.devices():
         print(device)
-        print(f"  Memory: {device.memory_stats()}")
+        print(f"gpt3_layer_norm  Memory: {device.memory_stats()}")
 
     # Self-attention block
     assert (
@@ -393,7 +393,7 @@ class Gpt3DecoderLayer(nn.Module):
 
     for device in jax.devices():
         print(device)
-        print(f"  Memory: {device.memory_stats()}")
+        print(f"Gpt3MultiHeadAttention  Memory: {device.memory_stats()}")
 
     attention_lnx += inputs
 
@@ -417,7 +417,7 @@ class Gpt3DecoderLayer(nn.Module):
 
     for device in jax.devices():
         print(device)
-        print(f"  Memory: {device.memory_stats()}")
+        print(f" mlp_block Memory: {device.memory_stats()}")
 
     layer_output = attention_lnx + mlp_lnx
 
