@@ -278,7 +278,7 @@ class Gpt3MultiHeadAttention(nn.Module):
       query = self.projection(inputs_q, proj_name="query")
       key = self.projection(inputs_q, proj_name="key")
       value = self.projection(inputs_q, proj_name="value")
-
+    print(f'query, key, value shape: {query.shape} {key.shape} {value.shape}')
     depth_scaling = jnp.sqrt(self.head_dim).astype(self.dtype)
     query /= depth_scaling
 
@@ -289,6 +289,7 @@ class Gpt3MultiHeadAttention(nn.Module):
     key = checkpoint_name(key, "key_proj")
     value = nn.with_logical_constraint(value, self.value_axis_names)
     value = checkpoint_name(value, "value_proj")
+    print(f'query2, key2, value2 shape: {query.shape} {key.shape} {value.shape}')
 
     attention_op = attention_op_as_linen(
         config=self.config,
@@ -307,6 +308,7 @@ class Gpt3MultiHeadAttention(nn.Module):
     out = attention_op(query, key, value, decoder_segment_ids, model_mode)
 
     out = nn.with_logical_constraint(out, self.out_axis_names)
+    print(f'out shape: {out.shape}')
 
     # apply output projection,  output dim is set to the input dim.
     out = self.out_projection(inputs_q.shape[-1], out)
@@ -354,10 +356,12 @@ class Gpt3DecoderLayer(nn.Module):
     )(inputs)
 
     lnx = nn.with_logical_constraint(lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
-
+    '''
     for device in jax.devices():
         print(device)
         print(f"gpt3_layer_norm  Memory: {device.memory_stats()}")
+    '''
+    print(f'lnx.shape: {lnx.shape}')
 
     # Self-attention block
     assert (
@@ -390,11 +394,13 @@ class Gpt3DecoderLayer(nn.Module):
     attention_lnx = nn.with_logical_constraint(
         attention_lnx, ("activation_batch", "activation_norm_length", "activation_embed")
     )
+    print(f'attention_lnx.shape: {attention_lnx.shape}')
 
+    '''
     for device in jax.devices():
         print(device)
         print(f"Gpt3MultiHeadAttention  Memory: {device.memory_stats()}")
-
+    '''
     attention_lnx += inputs
 
     # MLP block.
@@ -413,12 +419,12 @@ class Gpt3DecoderLayer(nn.Module):
     )(attention_lnx, deterministic=deterministic)
 
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
-
-
+    print(f'mlp_lnx.shape: {mlp_lnx.shape}')
+    '''
     for device in jax.devices():
         print(device)
         print(f" mlp_block Memory: {device.memory_stats()}")
-
+    '''
     layer_output = attention_lnx + mlp_lnx
 
     layer_output = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(layer_output, deterministic=deterministic)
