@@ -355,6 +355,10 @@ class Gpt3DecoderLayer(nn.Module):
 
     lnx = nn.with_logical_constraint(lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
 
+    for device in jax.devices():
+        print(device)
+        print(f"  Memory: {device.memory_stats()}")
+
     # Self-attention block
     assert (
         cfg.num_query_heads == cfg.num_kv_heads
@@ -386,6 +390,11 @@ class Gpt3DecoderLayer(nn.Module):
     attention_lnx = nn.with_logical_constraint(
         attention_lnx, ("activation_batch", "activation_norm_length", "activation_embed")
     )
+
+    for device in jax.devices():
+        print(device)
+        print(f"  Memory: {device.memory_stats()}")
+
     attention_lnx += inputs
 
     # MLP block.
@@ -402,7 +411,13 @@ class Gpt3DecoderLayer(nn.Module):
         config=cfg,
         quant=self.quant,
     )(attention_lnx, deterministic=deterministic)
+
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
+
+
+    for device in jax.devices():
+        print(device)
+        print(f"  Memory: {device.memory_stats()}")
 
     layer_output = attention_lnx + mlp_lnx
 
