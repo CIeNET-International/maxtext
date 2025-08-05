@@ -44,6 +44,7 @@ from MaxText.common_types import MODEL_MODE_PREFILL
 
 
 def self_attention_with_norm(
+    attention_layer,
     inputs,
     cfg,
     mesh,
@@ -75,33 +76,6 @@ def self_attention_with_norm(
     logical_axis_names = ("activation_batch", "activation_norm_length", "activation_embed")
 
   lnx = nn.with_logical_constraint(lnx, logical_axis_names)
-
-  #TODO: update the attention type to use nnx Attention
-  attention_layer = attentions.MLA(
-      config=cfg,
-      num_query_heads=cfg.num_query_heads,
-      num_kv_heads=cfg.num_kv_heads,
-      head_dim=cfg.head_dim,
-      max_target_length=cfg.max_target_length,
-      max_prefill_predict_length=cfg.max_prefill_predict_length,
-      attention_kernel=cfg.attention,
-      mesh=mesh,
-      dtype=cfg.dtype,
-      weight_dtype=cfg.weight_dtype,
-      dropout_rate=cfg.dropout_rate,
-      name="self_attention",
-      quant=quant,
-      kv_quant=quantizations.configure_kv_quant(cfg),
-      q_lora_rank=cfg.q_lora_rank,
-      kv_lora_rank=cfg.kv_lora_rank,
-      qk_nope_head_dim=cfg.qk_nope_head_dim,
-      qk_rope_head_dim=cfg.qk_rope_head_dim,
-      v_head_dim=cfg.v_head_dim,
-      max_position_embeddings=cfg.max_position_embeddings,
-      original_max_position_embeddings=cfg.original_max_position_embeddings,
-      mscale=cfg.mscale,
-      rope_factor=cfg.rope_factor,
-  )
 
   attention_lnx = attention_layer(
       lnx,
@@ -165,6 +139,31 @@ class DeepSeekDenseLayer(nnx.Module):
     self.mesh = mesh
     self.quant = quant
     self.rngs = rngs if rngs is not None else kwargs.get("rngs", nnx.Rngs(0))
+    self.attention_layer = attentions.MLA(
+        config=self.config,
+        num_query_heads=self.config.num_query_heads,
+        num_kv_heads=self.config.num_kv_heads,
+        head_dim=self.config.head_dim,
+        max_target_length=self.config.max_target_length,
+        max_prefill_predict_length=self.config.max_prefill_predict_length,
+        attention_kernel=self.config.attention,
+        mesh=mesh,
+        dtype=self.config.dtype,
+        weight_dtype=self.config.weight_dtype,
+        dropout_rate=self.config.dropout_rate,
+        name="self_attention",
+        quant=quant,
+        kv_quant=quantizations.configure_kv_quant(self.config),
+        q_lora_rank=self.config.q_lora_rank,
+        kv_lora_rank=self.config.kv_lora_rank,
+        qk_nope_head_dim=self.config.qk_nope_head_dim,
+        qk_rope_head_dim=self.config.qk_rope_head_dim,
+        v_head_dim=self.config.v_head_dim,
+        max_position_embeddings=self.config.max_position_embeddings,
+        original_max_position_embeddings=self.config.original_max_position_embeddings,
+        mscale=self.config.mscale,
+        rope_factor=self.config.rope_factor,
+    )
 
   def __call__(
       self,
@@ -186,6 +185,7 @@ class DeepSeekDenseLayer(nnx.Module):
     inputs = checkpoint_name(inputs, "decoder_layer_input")
 
     hidden_states, intermediate_inputs = self_attention_with_norm(
+        self.attention_layer,
         inputs,
         cfg,
         self.mesh,
