@@ -339,7 +339,10 @@ class Decoder(nn.Module):
       case DecoderBlockType.MIXTRAL:
         return [mixtral.MixtralDecoderLayer]
       case DecoderBlockType.DEEPSEEK:
-        return [deepseek.DeepSeekDenseLayer, deepseek.DeepSeekMoELayer]
+        return [
+            deepseek.deepseek_decoder_layer_class(),
+            deepseek.deepseek_moe_layer_class()
+        ]
       case DecoderBlockType.GEMMA:
         return [gemma.GemmaDecoderLayer]
       case DecoderBlockType.GEMMA2:

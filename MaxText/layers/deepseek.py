@@ -13,25 +13,25 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-
 """Transformer model definition."""
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
-
-from typing import Optional
+from typing import Any, Optional
 
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh
 import jax.numpy as jnp
 
 from flax import linen as nn
+from flax import nnx
 
 from MaxText.layers import attentions
 from MaxText.layers import initializers
 from MaxText.layers import linears
+from MaxText.layers import nnx_wrappers
 from MaxText.common_types import Config
-from MaxText.layers.normalizations import rms_norm
+from MaxText.layers.normalizations import RMSNorm
 from MaxText.layers import moe
 from MaxText.layers import quantizations
 from MaxText.layers.quantizations import AqtQuantization as Quant
@@ -52,19 +52,21 @@ def self_attention_with_norm(
     decoder_positions,
     deterministic,
     model_mode,
+    rngs: nnx.Rngs,
     previous_chunk=None,
     page_state: Optional[page_manager.PageState] = None,
     slot: Optional[int] = None,
 ):
   """self-attention with normalization"""
   # Normalization
-  lnx_rms = rms_norm(
+  lnx_rms = RMSNorm(
       num_features=inputs.shape[-1],
       dtype=cfg.dtype,
       weight_dtype=cfg.weight_dtype,
-      name="pre_self_attention_layer_norm",
-      kernel_axes=("norm",),
+      # name="pre_self_attention_layer_norm",
+      kernel_axes=("norm", ),
       epsilon=cfg.normalization_layer_epsilon,
+      rngs=rngs
   )
   lnx = lnx_rms(inputs)
   if model_mode == MODEL_MODE_PREFILL:
@@ -74,6 +76,7 @@ def self_attention_with_norm(
 
   lnx = nn.with_logical_constraint(lnx, logical_axis_names)
 
+  #TODO: update the attention type to use nnx Attention
   attention_layer = attentions.MLA(
       config=cfg,
       num_query_heads=cfg.num_query_heads,
@@ -116,13 +119,14 @@ def self_attention_with_norm(
   intermediate_inputs = inputs + attention_lnx
 
   # Normalization
-  hidden_states = rms_norm(
+  hidden_states = RMSNorm(
       num_features=intermediate_inputs.shape[-1],
       dtype=cfg.dtype,
       weight_dtype=cfg.weight_dtype,
-      name="post_self_attention_layer_norm",
-      kernel_axes=("norm",),
+      # name="post_self_attention_layer_norm",
+      kernel_axes=("norm", ),
       epsilon=cfg.normalization_layer_epsilon,
+      rngs=rngs
   )(intermediate_inputs)
   hidden_states = nn.with_logical_constraint(hidden_states, logical_axis_names)
   return hidden_states, intermediate_inputs
@@ -145,14 +149,23 @@ def post_process(cfg, layer_output, sow):
     return layer_output
 
 
-class DeepSeekDenseLayer(nn.Module):
+class DeepSeekDenseLayer(nnx.Module):
   """DeepSeek-style dense layer with Multi-Head Latent Attention."""
 
-  config: Config
-  mesh: Mesh
-  quant: Optional[Quant] = None
+  def __init__(
+      self,
+      *,
+      config: Config,
+      mesh: Mesh,
+      quant: Optional[quantizations.AqtQuantization] = None,
+      rngs: Optional[nnx.Rngs] = None,
+      **kwargs: Any
+  ) -> None:
+    self.config = config
+    self.mesh = mesh
+    self.quant = quant
+    self.rngs = rngs if rngs is not None else kwargs.get("rngs", nnx.Rngs(0))
 
-  @nn.compact
   def __call__(
       self,
       inputs,
@@ -181,25 +194,26 @@ class DeepSeekDenseLayer(nn.Module):
         decoder_positions,
         deterministic,
         model_mode,
+        self.rngs,
         previous_chunk,
         page_state,
         slot,
     )
-    mlp_lnx = linears.mlp_block(
+    mlp_lnx = linears.MlpBlock(
         in_features=hidden_states.shape[-1],
         intermediate_dim=cfg.mlp_dim,
         activations=cfg.mlp_activations,
         intermediate_dropout_rate=cfg.dropout_rate,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
-        name="mlp",
         config=cfg,
         quant=self.quant,
+        rngs=self.rngs
     )(hidden_states, deterministic=deterministic)
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, logical_axis_names)
 
     layer_output = mlp_lnx + intermediate_inputs
-    layer_output = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(layer_output, deterministic=deterministic)
+    layer_output = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2, ))(layer_output, deterministic=deterministic)
     layer_output = nn.with_logical_constraint(
         layer_output,
         logical_axis_names,
@@ -207,17 +221,49 @@ class DeepSeekDenseLayer(nn.Module):
     return post_process(cfg, layer_output, self.sow)
 
 
-class DeepSeekMoELayer(nn.Module):
+def deepseek_dense_layer(
+    *, config: Config, mesh: Mesh, quant: Optional[Quant] = None, name: Optional[str] = None, **kwargs: Any
+):
+  """Factory function to create a DeepSeekDenseLayer."""
+  return nnx_wrappers.to_linen(
+      DeepSeekDenseLayer,
+      config=config,
+      mesh=mesh,
+      quant=quant,
+      name=name,
+      **kwargs,
+      metadata_fn=initializers.variable_to_logically_partitioned,
+  )
+
+
+def deepseek_decoder_layer_class():
+  """Creates a DeepSeekDenseLayer class."""
+  return nnx_wrappers.to_linen_class(
+      DeepSeekDenseLayer,
+      metadata_fn=initializers.variable_to_logically_partitioned,
+  )
+
+
+class DeepSeekMoELayer(nnx.Module):
   """DeepSeek-style MoE layer with Multi-Head Latent Attention.
   Supports dropless and dropping base on configs.
   Uses a bias in routing instead of load balancing loss.
   """
 
-  config: Config
-  mesh: Mesh
-  quant: Optional[Quant] = None
+  def __init__(
+      self,
+      *,
+      config: Config,
+      mesh: Mesh,
+      quant: Optional[quantizations.AqtQuantization] = None,
+      rngs: Optional[nnx.Rngs] = None,
+      **kwargs: Any
+  ) -> None:
+    self.config = config
+    self.mesh = mesh
+    self.quant = quant
+    self.rngs = rngs if rngs is not None else kwargs.get("rngs", nnx.Rngs(0))
 
-  @nn.compact
   def __call__(
       self,
       inputs,
@@ -246,6 +292,7 @@ class DeepSeekMoELayer(nn.Module):
         decoder_positions,
         deterministic,
         model_mode,
+        self.rngs,
         previous_chunk,
         page_state,
         slot,
@@ -267,9 +314,32 @@ class DeepSeekMoELayer(nn.Module):
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, logical_axis_names)
 
     layer_output = mlp_lnx + intermediate_inputs
-    layer_output = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(layer_output, deterministic=deterministic)
+    layer_output = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2, ))(layer_output, deterministic=deterministic)
     layer_output = nn.with_logical_constraint(
         layer_output,
         logical_axis_names,
     )
     return post_process(cfg, layer_output, self.sow)
+
+
+def deepseek_moe_layer(
+    *, config: Config, mesh: Mesh, quant: Optional[Quant] = None, name: Optional[str] = None, **kwargs: Any
+):
+  """Factory function to create a DeepSeekMoELayer."""
+  return nnx_wrappers.to_linen(
+      DeepSeekMoELayer,
+      config=config,
+      mesh=mesh,
+      quant=quant,
+      name=name,
+      **kwargs,
+      metadata_fn=initializers.variable_to_logically_partitioned,
+  )
+
+
+def deepseek_moe_layer_class():
+  """Creates a DeepSeekDenseLayer class."""
+  return nnx_wrappers.to_linen_class(
+      DeepSeekMoELayer,
+      metadata_fn=initializers.variable_to_logically_partitioned,
+  )
