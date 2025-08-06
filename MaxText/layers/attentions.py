@@ -400,6 +400,7 @@ class AttentionOp(nnx.Module):
     self.chunk_attn_window_size = chunk_attn_window_size
     self.use_ragged_attention = use_ragged_attention
     self.ragged_block_size = ragged_block_size
+    self.rngs = rngs
 
     def maybe_create_nnx(einsum, *args):
       if isinstance(einsum, nn.Module):
@@ -1038,7 +1039,7 @@ class AttentionOp(nnx.Module):
       mask_type = "padding_causal"  # only padding_causal mask type can take a created mask
       attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
 
-    dpa_layer = DotProductAttention(
+    dpa_layer = nnx_wrappers.ToNNX(DotProductAttention(
         head_dim=head_dim,
         num_attention_heads=self.num_query_heads,
         num_gqa_groups=self.num_kv_heads,
@@ -1054,7 +1055,7 @@ class AttentionOp(nnx.Module):
         window_size=sliding_window_size,
         context_parallel_causal_load_balanced=self.config.context_parallel_load_balance,
         context_parallel_axis="context",
-    )
+    ),rngs=self.rngs)
     return dpa_layer(query, key, value, mask=attn_mask)
 
   def cudnn_jax_flash_attention(
