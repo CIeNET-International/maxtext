@@ -30,7 +30,7 @@ from flax.linen.partitioning import ScanIn
 from MaxText.common_types import DecoderBlockType, Config, MODEL_MODE_TRAIN, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
 from MaxText import max_logging
 from MaxText.inference import page_manager
-from MaxText.layers import linears
+from MaxText.layers import linears, nnx_wrappers
 from MaxText.layers import quantizations
 from MaxText.layers import pipeline
 from MaxText import maxtext_utils
@@ -335,7 +335,7 @@ class Decoder(nn.Module):
       case DecoderBlockType.DEFAULT:
         return [DecoderLayer]
       case DecoderBlockType.LLAMA2:
-        return [llama2.LlamaDecoderLayer]
+        return [nnx_wrappers.to_linen_class(llama2.LlamaDecoderLayer)]
       case DecoderBlockType.MISTRAL:
         # TODO(ranran): update to Mistral with sliding window attention
         return [mistral.MistralDecoderLayer]
