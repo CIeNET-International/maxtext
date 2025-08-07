@@ -347,6 +347,7 @@ class Gpt3DecoderLayer(nnx.Module):
     self.mesh = mesh
     self.quant = quant
     self.rngs = rngs if rngs is not None else kwargs.get("rngs", nnx.Rngs(0))
+    print(f'config.base_emb_dim: {config.base_emb_dim}')
     self.pre_self_attention_norm = Gpt3LayerNorm(
         num_features=config.base_emb_dim,
         dtype=self.config.dtype,
