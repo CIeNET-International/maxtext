@@ -305,7 +305,7 @@ class Gpt3MultiHeadAttention(nnx.Module):
   ):
     inputs_q = nn.with_logical_constraint(inputs_q, self.input_axis_names)
     if self.fused_qkv:
-      query, key, value = self.qkv_projection(self.qkv_projection_layer, inputs_q)
+      query, key, value = self.qkv_projection(self.qkv_proj, inputs_q)
     else:
       query = self.projection(self.query, inputs_q)
       key = self.projection(self.key, inputs_q)
@@ -412,7 +412,7 @@ class Gpt3DecoderLayer(nnx.Module):
         self.config.num_query_heads == self.config.num_kv_heads
     ), f"{self.config.num_query_heads=} should be the same as {self.config.num_kv_heads=} in gpt3"
 
-    attention_lnx = self.attention_layer(
+    attention_lnx = self.self_attention(
         lnx, decoder_segment_ids=decoder_segment_ids, model_mode=model_mode, deterministic=deterministic
     )
 
@@ -421,7 +421,7 @@ class Gpt3DecoderLayer(nnx.Module):
     )
     attention_lnx += inputs
     # MLP block.
-    mlp_lnx = self.mlp_block(attention_lnx, deterministic=deterministic)
+    mlp_lnx = self.mlp(attention_lnx, deterministic=deterministic)
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
 
     layer_output = attention_lnx + mlp_lnx
