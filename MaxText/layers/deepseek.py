@@ -57,6 +57,7 @@ def self_attention_with_norm(
     slot: Optional[int] = None,
 ):
   """self-attention with normalization"""
+  breakpoint()
   # Normalization
   lnx_rms = rms_norm(
       num_features=inputs.shape[-1],
@@ -116,6 +117,7 @@ def self_attention_with_norm(
   intermediate_inputs = inputs + attention_lnx
 
   # Normalization
+  breakpoint()
   hidden_states = rms_norm(
       num_features=intermediate_inputs.shape[-1],
       dtype=cfg.dtype,
@@ -171,7 +173,7 @@ class DeepSeekDenseLayer(nn.Module):
       logical_axis_names = ("activation_batch", "activation_norm_length", "activation_embed")
     inputs = nn.with_logical_constraint(inputs, logical_axis_names)
     inputs = checkpoint_name(inputs, "decoder_layer_input")
-
+    breakpoint()
     hidden_states, intermediate_inputs = self_attention_with_norm(
         inputs,
         cfg,
@@ -185,6 +187,7 @@ class DeepSeekDenseLayer(nn.Module):
         page_state,
         slot,
     )
+    breakpoint()
     mlp_lnx = linears.mlp_block(
         in_features=hidden_states.shape[-1],
         intermediate_dim=cfg.mlp_dim,
