@@ -345,6 +345,7 @@ class Gpt3DecoderLayer(nn.Module):
 
     inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_norm_length", "activation_embed"))
     inputs = checkpoint_name(inputs, "decoder_layer_input")
+    print(f'num_features: {inputs.shape[-1]}')
     lnx = gpt3_layer_norm(
         num_features=inputs.shape[-1],
         dtype=cfg.dtype,
