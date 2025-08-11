@@ -350,7 +350,7 @@ class Decoder(nn.Module):
       case DecoderBlockType.GEMMA3:
         return [gemma3.Gemma3DecoderLayer]
       case DecoderBlockType.GPT3:
-        return [gpt3.Gpt3DecoderLayerWrapper]
+        return [gpt3.Gpt3DecoderLayerToLinen]
       case DecoderBlockType.QWEN3:
         return [qwen3.Qwen3DecoderLayer]
       case DecoderBlockType.SIMPLE:
@@ -374,9 +374,7 @@ class Decoder(nn.Module):
 
           def map_fn(path, value):
             max_logging.log(f"models.py: Moving parameter {path} to device")
-            return jax.device_put(
-                value, jax.memory.Space.Device
-            )
+            return jax.device_put(value, jax.memory.Space.Device)
 
           return jax.tree_util.tree_map_with_path(map_fn, variables)
 

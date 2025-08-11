@@ -235,20 +235,14 @@ class Gpt3MultiHeadAttention(nnx.Module):
           feature_dim, (3, self.num_heads, self.head_dim), ("embed", "qkv", "heads", "kv")
       )
     else:
-      self.query = self.create_projection_layer(
-          feature_dim, (self.num_heads, self.head_dim), ("embed", "heads", "kv")
-      )
-      self.key = self.create_projection_layer(
-          feature_dim, (self.num_heads, self.head_dim), ("embed", "heads", "kv")
-      )
-      self.value = self.create_projection_layer(
-          feature_dim, (self.num_heads, self.head_dim), ("embed", "heads", "kv")
-      )
+      self.query = self.create_projection_layer(feature_dim, (self.num_heads, self.head_dim), ("embed", "heads", "kv"))
+      self.key = self.create_projection_layer(feature_dim, (self.num_heads, self.head_dim), ("embed", "heads", "kv"))
+      self.value = self.create_projection_layer(feature_dim, (self.num_heads, self.head_dim), ("embed", "heads", "kv"))
     self.out = self.create_projection_layer(
         (self.num_heads, self.head_dim), self.num_heads * self.head_dim, ("heads", "kv", "embed"), axis=(-2, -1)
     )
     self.attention_op = AttentionOp(
-        config=self.config,
+        config=config,
         mesh=self.mesh,
         attention_kernel=self.attention_kernel,
         max_target_length=self.max_target_length,
@@ -341,54 +335,65 @@ class Gpt3DecoderLayer(nnx.Module):
   """Transformer decoder layer that attends to the encoder."""
 
   def __init__(
-      self, config: models.Config, mesh: Mesh, quant: Optional[Quant] = None, rngs: Optional[nnx.Rngs] = None, **kwargs: Any
+      self,
+      config: models.Config,
+      mesh: Mesh,
+      quant: Optional[Quant] = None,
+      rngs: Optional[nnx.Rngs] = None,
   ):
+
     self.config = config
     self.mesh = mesh
     self.quant = quant
-    self.rngs = rngs if rngs is not None else kwargs.get("rngs", nnx.Rngs(0))
+    self.rngs = rngs
+
+    dummy_inputs_shape = (int(config.per_device_batch_size), config.max_target_length, int(config.emb_dim))
+
     self.pre_self_attention_norm = Gpt3LayerNorm(
-        num_features=config.base_emb_dim,
-        dtype=self.config.dtype,
+        num_features=config.emb_dim,
+        dtype=config.dtype,
         kernel_axes=("norm",),
-        epsilon=self.config.normalization_layer_epsilon,
+        epsilon=config.normalization_layer_epsilon,
         reductions_in_fp32=False,
         use_bias=True,
         rngs=self.rngs,
     )
     self.mlp = MlpBlock(
-        in_features=config.base_emb_dim,
-        intermediate_dim=self.config.mlp_dim,
-        activations=self.config.mlp_activations,
-        intermediate_dropout_rate=self.config.dropout_rate,
-        dtype=self.config.dtype,
-        weight_dtype=self.config.weight_dtype,
+        in_features=config.emb_dim,
+        intermediate_dim=config.mlp_dim,
+        activations=config.mlp_activations,
+        intermediate_dropout_rate=config.dropout_rate,
+        dtype=config.dtype,
+        weight_dtype=config.weight_dtype,
         use_bias=True,
         use_pre_norm=True,
-        config=self.config,
+        config=config,
         quant=self.quant,
         rngs=self.rngs,
     )
+
     self.self_attention = Gpt3MultiHeadAttention(
-        config=self.config,
-        num_heads=self.config.num_query_heads,
-        dtype=self.config.dtype,
-        feature_dim=(self.config.per_device_batch_size, self.config.max_target_length, self.config.base_emb_dim),
-        weight_dtype=self.config.weight_dtype,
-        head_dim=self.config.head_dim,
-        max_target_length=self.config.max_target_length,
-        max_prefill_predict_length=self.config.max_prefill_predict_length,
-        attention_kernel=self.config.attention,
+        config=config,
+        num_heads=config.num_query_heads,
+        dtype=config.dtype,
+        feature_dim=dummy_inputs_shape,
+        weight_dtype=config.weight_dtype,
+        head_dim=config.head_dim,
+        max_target_length=config.max_target_length,
+        max_prefill_predict_length=config.max_prefill_predict_length,
+        attention_kernel=config.attention,
         mesh=self.mesh,
-        dropout_rate=self.config.dropout_rate,
+        dropout_rate=config.dropout_rate,
         name="self_attention",
-        float32_qk_product=self.config.float32_qk_product,
-        float32_logits=self.config.float32_logits,
-        fused_qkv=self.config.fused_qkv,
+        float32_qk_product=config.float32_qk_product,
+        float32_logits=config.float32_logits,
+        fused_qkv=config.fused_qkv,
         use_bias=True,
         quant=self.quant,
-        kv_quant=quantizations.configure_kv_quant(self.config),
+        kv_quant=quantizations.configure_kv_quant(config),
     )
+
+    self.dropout = nnx.Dropout(rate=config.dropout_rate, broadcast_dims=(-2,), rngs=self.rngs)
 
   def __call__(
       self,
@@ -426,7 +431,7 @@ class Gpt3DecoderLayer(nnx.Module):
 
     layer_output = attention_lnx + mlp_lnx
 
-    layer_output = nn.Dropout(rate=self.config.dropout_rate, broadcast_dims=(-2,))(layer_output, deterministic=deterministic)
+    layer_output = self.dropout(layer_output, deterministic=deterministic)
 
     layer_output = nn.with_logical_constraint(
         layer_output,
@@ -448,21 +453,7 @@ class Gpt3DecoderLayer(nnx.Module):
       return layer_output
 
 
-class Gpt3DecoderLayerWrapper(nn.Module):
-  """Creates a Gemma3DecoderLayer Linen module."""
-
-  config: Config
-  mesh: Mesh
-  quant: Quant | None = None
-
-  @nn.compact
-  def __call__(self, *args, **kwargs):
-    """Call the underlying NNX layer"""
-    gpt3_nnx_layer = nnx_wrappers.to_linen(
-        Gpt3DecoderLayer,
-        config=self.config,
-        mesh=self.mesh,
-        quant=self.quant,
-        metadata_fn=initializers.variable_to_logically_partitioned,
-    )
-    return gpt3_nnx_layer(*args, **kwargs)
+Gpt3DecoderLayerToLinen = nnx_wrappers.to_linen_class(
+    Gpt3DecoderLayer,
+    base_metadata_fn=initializers.variable_to_logically_partitioned,
+)
