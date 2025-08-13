@@ -330,6 +330,7 @@ def attention_op_as_linen(
       metadata_fn=variable_to_logically_partitioned,
   )
 
+
 class AttentionOp(nnx.Module):
   """Attention operation"""
 
@@ -427,24 +428,26 @@ class AttentionOp(nnx.Module):
     self.chunk_attn_window_size = chunk_attn_window_size
     self.use_ragged_attention = use_ragged_attention
     self.ragged_block_size = ragged_block_size
+    self.rngs = rngs
 
     def maybe_create_nnx(einsum, *args):
       if isinstance(einsum, nn.Module):
         return nnx_wrappers.ToNNX(einsum, rngs=rngs).lazy_init(*args)
       return einsum
 
+    # Dummy inputs for lazy initialization
+    b = 1
+    t_prefill = self.max_prefill_predict_length
+    t_ar = 1  # Autoregressive mode has a query length of 1
+    n = self.num_query_heads
+    n_kv = self.num_kv_heads
+    d = self.config.head_dim
+    g = n // n_kv
+    s_prefill = self.max_prefill_predict_length
+    s_ar = self.max_target_length
+
     # qk_product
     if self.kv_quant:
-      # Dummy inputs for lazy initialization
-      b = 1
-      t_prefill = self.max_prefill_predict_length
-      t_ar = 1  # Autoregressive mode has a query length of 1
-      n = self.num_query_heads
-      n_kv = self.num_kv_heads
-      d = self.config.head_dim
-      g = n // n_kv
-      s_prefill = self.max_prefill_predict_length
-      s_ar = self.max_target_length
 
       # Dummy query/key/value shapes as before...
       dummy_query_prefill = jnp.zeros((b, t_prefill, n_kv, g, d), dtype=self.dtype)
@@ -481,6 +484,36 @@ class AttentionOp(nnx.Module):
       self.AqtEinsum_2 = jnp.einsum
       self.AqtEinsum_3 = jnp.einsum
 
+
+    from transformer_engine.jax.flax.transformer import DotProductAttention  # pytype: disable=import-error
+    # TODO: Check the input dim
+
+    dpa_layer = DotProductAttention(
+        head_dim=config.head_dim,
+        num_attention_heads=config.base_num_query_heads,
+        num_gqa_groups=config.base_num_kv_heads,
+        attn_mask_type=config.mask_type,  # 'no_mask', 'padding', 'causal', or 'padding_causal'
+        attn_bias_type="no_bias",  # 'no_bias', 'pre_scale_bias' or 'post_scale_bias'
+        attention_dropout=self.dropout_rate,
+        dropout_rng_name="aqt",
+        dtype=self.dtype,
+        float32_logits=self.float32_logits,
+        qkv_layout="BSHD_BSHD_BSHD",  # 'BS3HD', 'BSHD_BS2HD' or 'BSHD_BSHD_BSHD'
+        scale_factor=1.0,
+        transpose_batch_sequence=False,
+        window_size=sliding_window_size,
+        context_parallel_causal_load_balanced=self.config.context_parallel_load_balance,
+        context_parallel_axis="context",
+    )
+    # TODO: if is DotProduct
+    dpa_layer = nnx_wrappers.ToNNX(dpa_layer, rngs=self.rngs)
+    dummy_query_prefill = jnp.zeros((b, t_prefill, n_kv, g, d), dtype=self.dtype)
+    dummy_key_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
+    dummy_value_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
+    dummy_attn_weights_prefill = jnp.zeros((b, n_kv, g, t_prefill, s_prefill), dtype=jnp.float32)
+
+    dpa_layer.lazy_init(dummy_query_prefill, dummy_key_prefill, dummy_value_prefill, mask=dummy_attn_weights_prefill)
+    self.dpa_layer = dpa_layer
 
   def check_attention_inputs(self, query: Array, key: Array | KVTensor, value: Array | KVTensor) -> None:
     """Check attention inputs."""
@@ -1065,24 +1098,7 @@ class AttentionOp(nnx.Module):
       mask_type = "padding_causal"  # only padding_causal mask type can take a created mask
       attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
 
-    dpa_layer = DotProductAttention(
-        head_dim=head_dim,
-        num_attention_heads=self.num_query_heads,
-        num_gqa_groups=self.num_kv_heads,
-        attn_mask_type=mask_type,  # 'no_mask', 'padding', 'causal', or 'padding_causal'
-        attn_bias_type="no_bias",  # 'no_bias', 'pre_scale_bias' or 'post_scale_bias'
-        attention_dropout=self.dropout_rate,
-        dropout_rng_name="aqt",
-        dtype=self.dtype,
-        float32_logits=self.float32_logits,
-        qkv_layout="BSHD_BSHD_BSHD",  # 'BS3HD', 'BSHD_BS2HD' or 'BSHD_BSHD_BSHD'
-        scale_factor=1.0,
-        transpose_batch_sequence=False,
-        window_size=sliding_window_size,
-        context_parallel_causal_load_balanced=self.config.context_parallel_load_balance,
-        context_parallel_axis="context",
-    )
-    return dpa_layer(query, key, value, mask=attn_mask)
+    return self.dpa_layer(query, key, value, mask=attn_mask)
 
   def cudnn_jax_flash_attention(
       self,
