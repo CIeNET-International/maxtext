@@ -446,19 +446,19 @@ class AttentionOp(nnx.Module):
     s_prefill = self.max_prefill_predict_length
     s_ar = self.max_target_length
 
+    # Dummy query/key/value shapes as before...
+    dummy_query_prefill = jnp.zeros((b, t_prefill, n_kv, g, d), dtype=self.dtype)
+    dummy_key_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
+    dummy_query_ar = jnp.zeros((b, t_ar, n_kv, g, d), dtype=self.dtype)
+    dummy_key_ar = jnp.zeros((b, s_ar, n_kv, d), dtype=self.dtype)
+
+    dummy_attn_weights_prefill = jnp.zeros((b, n_kv, g, t_prefill, s_prefill), dtype=jnp.float32)
+    dummy_value_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
+    dummy_attn_weights_ar = jnp.zeros((b, n_kv, g, t_ar, s_ar), dtype=jnp.float32)
+    dummy_value_ar = jnp.zeros((b, s_ar, n_kv, d), dtype=self.dtype)
+
     # qk_product
     if self.kv_quant:
-
-      # Dummy query/key/value shapes as before...
-      dummy_query_prefill = jnp.zeros((b, t_prefill, n_kv, g, d), dtype=self.dtype)
-      dummy_key_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
-      dummy_query_ar = jnp.zeros((b, t_ar, n_kv, g, d), dtype=self.dtype)
-      dummy_key_ar = jnp.zeros((b, s_ar, n_kv, d), dtype=self.dtype)
-
-      dummy_attn_weights_prefill = jnp.zeros((b, n_kv, g, t_prefill, s_prefill), dtype=jnp.float32)
-      dummy_value_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
-      dummy_attn_weights_ar = jnp.zeros((b, n_kv, g, t_ar, s_ar), dtype=jnp.float32)
-      dummy_value_ar = jnp.zeros((b, s_ar, n_kv, d), dtype=self.dtype)
 
       # Prefill AqtEinsum instances
       self.AqtEinsum_0 = maybe_create_nnx(
@@ -507,11 +507,6 @@ class AttentionOp(nnx.Module):
     )
     # TODO: if is DotProduct
     dpa_layer = nnx_wrappers.ToNNX(dpa_layer, rngs=self.rngs)
-    dummy_query_prefill = jnp.zeros((b, t_prefill, n_kv, g, d), dtype=self.dtype)
-    dummy_key_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
-    dummy_value_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
-    dummy_attn_weights_prefill = jnp.zeros((b, n_kv, g, t_prefill, s_prefill), dtype=jnp.float32)
-
     dpa_layer.lazy_init(dummy_query_prefill, dummy_key_prefill, dummy_value_prefill, mask=dummy_attn_weights_prefill)
     self.dpa_layer = dpa_layer
 
