@@ -235,7 +235,11 @@ class SequentialBlockDecoderLayers(nnx.Module):
     return inputs
 
 class Decoder(nnx.Module):
-  """A stack of decoder layers as a part of an encoder-decoder architecture."""
+  """A stack of decoder layers as a part of an encoder-decoder architecture.
+  All modules/layers are created in __init__. __call__ only executes.
+  """
+
+  BROADCAST_ARGS_LENGTH : int = 4
 
   def __init__(
       self,
@@ -246,15 +250,7 @@ class Decoder(nnx.Module):
       model_mode: str = MODEL_MODE_TRAIN,
       rngs : nnx.Rngs | None = None,
   ):
-    """Initialize the decoder module.
-
-    Args:
-        config: Configuration object containing model parameters.
-        shared_embedding: Shared embedding layer for token embeddings.
-        mesh: JAX mesh for distributed computation.
-        quant: Optional quantization configuration.
-        model_mode: Mode of the model (e.g., training, prefill, autoregressive).
-    """
+    # ====== Basic assignments ======
     self.config = config
     self.shared_embedding = shared_embedding
     self.mesh = mesh
@@ -262,27 +258,86 @@ class Decoder(nnx.Module):
     self.model_mode = model_mode
     self.rngs = rngs if rngs is not None else nnx.Rngs(0)
 
-    """Initialize decoder layer."""
-    #TODO: retrieve more layers from __call__ function
-    self.decoder_layer = self.get_decoder_layers()
-    self.norm_layer = self.get_norm_layer(num_features=self.config.emb_dim)
+    layer_classes = self.get_decoder_layers()
+    policy = self.get_remat_policy()
+    self.rematted_layer_classes = self.set_remat_policy(layer_classes, policy)
+    
+    self.embedding_dropout = nnx.Dropout(rate=self.config.dropout_rate, broadcast_dims=(-2,))
+    self.output_head_dropout = nnx.Dropout(rate=self.config.dropout_rate, broadcast_dims=(-2,))
+    
+    self.decoder_norm = self.get_norm_layer(num_features=self.config.emb_dim)(
+        dtype=config.dtype,
+        weight_dtype=config.weight_dtype,
+        epsilon=config.normalization_layer_epsilon,
+        kernel_axes=("norm",),
+        parameter_memory_host_offload=config.parameter_memory_host_offload,
+        rngs=self.rngs,
+    )
+
     self._pipeline_module: Optional[pipeline.Pipeline] = None
-    if self.config.using_pipeline_parallelism:
-      pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer)
+    if config.using_pipeline_parallelism:
+      pipeline_stage_module = self.get_pipeline_stage_module(self.rematted_layer_classes)
       remat_policy = self.get_remat_policy()
       self._pipeline_module = pipeline.Pipeline(
-          config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy
+          config=config,
+          mesh=self.mesh,
+          layers=pipeline_stage_module,
+          remat_policy=remat_policy,
       )
 
+    if config.using_pipeline_parallelism:
+      if config.decoder_block == DecoderBlockType.DEEPSEEK:
+        self._build_exec_deepseek_pipeline()
+      else:
+        self._build_exec_standard_pipeline()
+    else:
+      if config.scan_layers:
+        self._build_exec_scanned()
+      else:
+        self._build_exec_unscanned()
+
+    inputs_shape = (
+      int(config.per_device_batch_size),
+      int(config.max_target_length),
+      int(config.emb_dim),
+    )
+    self.logits_dense = linears.dense_general(
+          inputs_shape=inputs_shape,
+          out_features_shape=self.config.vocab_size,
+          weight_dtype=self.config.weight_dtype,
+          dtype=jnp.float32 if self.config.logits_dot_in_fp32 else self.config.dtype,
+          kernel_axes=("embed", "vocab"),
+          name="logits_dense",
+          matmul_precision=self.config.matmul_precision,
+          parameter_memory_host_offload=self.config.parameter_memory_host_offload,
+      )
+
+    # Untrainable (static) positional embedding
+    self._static_pos_embedding = None
+    if self.config.use_untrainable_positional_embedding:
+        self._static_pos_embedding = positional_embedding_as_linen(
+            embedding_dims=self.config.base_emb_dim
+        )
+
+    # Trainable position embedding
+    self.position_embedder = None
+    if self.config.trainable_position_size > 0:
+        self.position_embedder = embed_as_linen(
+            num_embeddings=self.config.trainable_position_size,
+            num_features=self.config.emb_dim,
+            dtype=self.config.dtype,
+            embedding_init=nn.initializers.normal(stddev=1.0),
+            name="position_embedder",
+            config=self.config,
+        )
+
   def get_remat_policy(self)-> Optional[Callable[..., bool]]:
-    """Get remat policy from configuration."""
     cfg = self.config
     policy_name = cfg.remat_policy
 
     if policy_name == "none" or policy_name == "full":
       return None
     
-    # Static policy mapping
     static_policies : dict[str,Any] = {
         "minimal": jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
         "save_dot_with_context_except_mlp": jax.checkpoint_policies.save_only_these_names(
@@ -304,7 +359,6 @@ class Decoder(nnx.Module):
         ),
     }
 
-    # Dynamic policy mapping
     dynamic_policies : dict[str,Callable] = {
         "qkv_proj_offloaded": lambda: jax.checkpoint_policies.save_and_offload_only_these_names(
             names_which_can_be_saved=[],
@@ -327,18 +381,10 @@ class Decoder(nnx.Module):
     if policy_name in static_policies:
       return static_policies[policy_name]
     elif policy_name in dynamic_policies:
-      # Call the lambda
       return dynamic_policies[policy_name]()
     raise ValueError(f"Unknown remat policy: '{policy_name}'")
 
   def get_decoder_layers(self)->list[Type[nnx.Module]]:
-    """Retrieves a list of decoder layer classes based on the `decoder_block` config.
-
-    Returns:
-        A list containing one or more `nn.Module` classes for the decoder.
-    """
-
-    # Mapping of decoder types to their corresponding layers
     decoder_layer_map = {
         DecoderBlockType.DEFAULT: [DecoderLayer],
         DecoderBlockType.LLAMA2: [llama2.LlamaDecoderLayer],
@@ -360,35 +406,25 @@ class Decoder(nnx.Module):
     }
 
     decoder_type = self.config.decoder_block
-
     if decoder_type in decoder_layer_map:
-        return decoder_layer_map[decoder_type]
-
+      return decoder_layer_map[decoder_type]
     raise ValueError(f"Incorrect decoder_block name: {decoder_type.value}")
 
   def set_remat_policy(self, block_layers, policy : Callable[..., bool]|None = None)->list[Type[nnx.Module]]:
-    """Set remat policy"""
     RemattedBlockLayers = []
     for block_layer in block_layers:
       if self.config.parameter_memory_host_offload:
-        # Define parameter movement with mesh-based sharding
+        # Move params to device with proper sharding before remat
         def move_to_device(variables):
-          """Move parameters to device with proper sharding."""
-
           def map_fn(path, value):
             max_logging.log(f"models.py: Moving parameter {path} to device")
-            return jax.device_put(
-                value, max_utils.device_space()
-            )
-
+            return jax.device_put(value, max_utils.device_space())
           return jax.tree_util.tree_map_with_path(map_fn, variables)
 
-        # Transform layer class before remat
         graphdef, params = nnx.split(block_layer, nnx.Param)
         params = move_to_device(params)
         block_layer = nnx.merge(graphdef, params)
 
-      # Apply remat policy to layer
       layer = nnx.remat(
           block_layer,
           prevent_cse=not self.config.scan_layers,
@@ -399,7 +435,6 @@ class Decoder(nnx.Module):
     return RemattedBlockLayers
 
   def get_norm_layer(self, num_features: int)-> Callable[...,Any]:
-    """get normalization layer (return type inherits from nn.Module)"""
     if self.config.decoder_block in (
         DecoderBlockType.DEFAULT,
         DecoderBlockType.LLAMA2,
@@ -416,11 +451,263 @@ class Decoder(nnx.Module):
     ):
       return functools.partial(RMSNorm, num_features=num_features)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
-      return functools.partial(gpt3.Gpt3LayerNorm, num_features=num_features, reductions_in_fp32=False, use_bias=True)
+      return functools.partial(
+          gpt3.Gpt3LayerNorm,
+          num_features=num_features,
+          reductions_in_fp32=False,
+          use_bias=True
+      )
     raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
 
+  def _make_scan_runner(self, layer_ctor_or_fn, length:int, name:str, **layer_kwargs):
+    """Return a callable: run(y, *broadcast_args) -> y that executes a prebuilt scan."""
+    cfg = self.config
+    mesh = self.mesh
+
+    def build_scan_fn():
+      # we bake in_axes based on the 4-tuple broadcast args we use everywhere:
+      in_axes_tuple = (nn.broadcast,) * self.BROADCAST_ARGS_LENGTH
+      return self.scan_decoder_layers(
+          cfg, layer_ctor_or_fn, length, name, mesh, in_axes_tuple,
+          model_mode=cfg.model_mode, **layer_kwargs
+      )
+
+    scan_fn = build_scan_fn()
+
+    def run(y, *broadcast_args):
+      y, _ = scan_fn(y, *broadcast_args)
+      return y
+
+    return run
+
+  def _build_exec_deepseek_pipeline(self):
+    """Pipeline + DeepSeek: some layers outside pipeline, then pipeline, following your logic."""
+    cfg = self.config
+    mesh = self.mesh
+    if len(self.rematted_layer_classes) != 2:
+      raise ValueError(
+          f"Scanned layers must have a length of 2 when using DeepSeek, "
+          f"but got {len(self.rematted_layer_classes)}."
+      )
+    dense_cls, moe_cls = self.rematted_layer_classes
+
+    num_moe_layers = cfg.num_decoder_layers - cfg.first_num_dense_layers
+    num_moe_layers_outside_pp = num_moe_layers - cfg.pipeline_parallel_layers
+
+    # Prebuild scan runners (outside pipeline)
+    self.dense_layers = self._make_scan_runner(
+        dense_cls, cfg.first_num_dense_layers, "dense_layers"
+    )
+    self.moe_layers = None
+    if num_moe_layers_outside_pp > 0:
+      self.moe_layers = self._make_scan_runner(
+          moe_cls, num_moe_layers_outside_pp, "moe_layers"
+      )
+
+    logical_axis_rules_pp_as_dp = maxtext_utils.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
+
+    def exec_run(y, decoder_segment_ids, decoder_positions, deterministic, model_mode,
+                 previous_chunk=None, slot=None, page_state=None, bidirectional_mask=None):
+      # Execute scans outside pipeline under adjusted logical axis rules
+      with mesh, nn_logical_axis_rules(logical_axis_rules_pp_as_dp):
+        y = self.dense_layers(y, decoder_segment_ids, decoder_positions, deterministic, model_mode)
+        if self.moe_layers is not None:
+          y = self.moe_layers(y, decoder_segment_ids, decoder_positions, deterministic, model_mode)
+
+      # Optionally compute weight sharding once (shape-dependent)
+      partition_spec = None
+      if cfg.pipeline_fsdp_ag_once:
+        partition_spec = self.pipeline_module.get_weight_sharding(
+            y, decoder_segment_ids, decoder_positions, deterministic, model_mode
+        )
+
+      # Pipeline proper (stage module was built in __init__)
+      y = self.pipeline_module(y, decoder_segment_ids, decoder_positions, deterministic, model_mode,
+                               partition_spec=partition_spec)
+      return y
+
+    self._exec = exec_run
+
+  def _build_exec_standard_pipeline(self):
+    """Pipeline (non-DeepSeek). After pipeline, possibly run remaining scanned layers."""
+    cfg = self.config
+    mesh = self.mesh
+    # Remaining layers after pipeline, if any, are scanned with the single base layer
+    remaining_layers = cfg.num_decoder_layers - cfg.pipeline_parallel_layers
+    self.layers_outside_pipeline = None
+    if remaining_layers > 0:
+      self.layers_outside_pipeline = self._make_scan_runner(
+          self.rematted_layer_classes[0], remaining_layers, "layers_outside_pipeline"
+      )
+    logical_axis_rules_pp_as_dp = maxtext_utils.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
+
+    def exec_run(y, decoder_segment_ids, decoder_positions, deterministic, model_mode,
+                 previous_chunk=None, slot=None, page_state=None, bidirectional_mask=None):
+      # Optionally compute weight sharding once (shape-dependent)
+      partition_spec = None
+      if cfg.pipeline_fsdp_ag_once:
+        partition_spec = self.pipeline_module.get_weight_sharding(
+            y, decoder_segment_ids, decoder_positions, deterministic, model_mode
+        )
+
+      y = self.pipeline_module(y, decoder_segment_ids, decoder_positions, deterministic, model_mode,
+                               partition_spec=partition_spec)
+
+      if self.layers_outside_pipeline is not None:
+        with mesh, nn_logical_axis_rules(logical_axis_rules_pp_as_dp):
+          y = self.layers_outside_pipeline(y, decoder_segment_ids, decoder_positions, deterministic, model_mode)
+      return y
+
+    self._exec = exec_run
+
+  def _build_exec_scanned(self):
+    """No pipeline, scanned execution. Handle DeepSeek / Gemma3 / Llama4 / others."""
+    cfg = self.config
+    mesh = self.mesh
+
+    if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
+      if len(self.rematted_layer_classes) != 2:
+        raise ValueError(
+          f"Scanned layers must have a length of 2 when using DeepSeek, "
+          f"but got {len(self.rematted_layer_classes)}."
+        )
+      dense_cls, moe_cls = self.rematted_layer_classes
+      self.dense_layers = self._make_scan_runner(dense_cls, cfg.first_num_dense_layers, "dense_layers")
+      num_moe_layers = cfg.num_decoder_layers - cfg.first_num_dense_layers
+      self.moe_layers = self._make_scan_runner(moe_cls, num_moe_layers, "moe_layers")
+
+      def exec_run(y, decoder_segment_ids, decoder_positions, deterministic, model_mode,
+                   previous_chunk=None, slot=None, page_state=None, bidirectional_mask=None):
+        y = self.dense_layers(y, decoder_segment_ids, decoder_positions, deterministic, model_mode)
+        if self.moe_layers is not None:
+          y = self.moe_layers(y, decoder_segment_ids, decoder_positions, deterministic, model_mode)
+        return y
+
+      self._exec = exec_run
+      return
+
+    if cfg.decoder_block == DecoderBlockType.GEMMA3:
+      # Build the Gemma3 scanned blocks as in your _apply_gemma3_scanned_blocks, but prebuilt
+      attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
+      scan_length = cfg.num_decoder_layers // attention_pattern_length
+      RemattedGemma3Block = self.set_remat_policy([gemma3.Gemma3ScannableBlock], self.get_remat_policy())[0]
+
+      # main scan (full patterns)
+      self.layers = None
+      if scan_length > 0:
+        self.layers = self._make_scan_runner(
+            RemattedGemma3Block, scan_length, "layers", num_of_layers=attention_pattern_length
+        )
+
+      # remainder block (module instance)
+      self.layers_remainder = None
+      num_remaining_layers = cfg.num_decoder_layers % attention_pattern_length
+      if num_remaining_layers > 0:
+        self.layers_remainder = RemattedGemma3Block(
+            config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode,
+            name="layers_remainder", num_of_layers=num_remaining_layers
+        )
+
+      def exec_run(y, decoder_segment_ids, decoder_positions, deterministic, model_mode,
+                   previous_chunk=None, slot=None, page_state=None, bidirectional_mask=None):
+        if self.layers is not None:
+          y = self.layers(y, decoder_segment_ids, decoder_positions, deterministic, model_mode)
+        if self.layers_remainder is not None:
+          # Call remainder with extra kwargs
+          y, _ = self.layers_remainder(
+              y,
+              decoder_segment_ids,
+              decoder_positions,
+              deterministic,
+              model_mode,
+              previous_chunk=previous_chunk,
+              page_state=page_state,
+              slot=slot,
+              bidirectional_mask=bidirectional_mask,
+          )
+        return y
+
+      self._exec = exec_run
+      return
+
+    # All other scanned (including LLAMA4 scanned scannable block)
+    RemattedBlockLayer = self.rematted_layer_classes[0]
+    scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
+    # For LLAMA4 scanned, the layer itself needs kwargs — bake them into the scan builder
+    llama4_kwargs = {}
+    if cfg.decoder_block == DecoderBlockType.LLAMA4:
+      llama4_kwargs = {
+        "nope_layer_interval": cfg.nope_layer_interval,
+        "interleave_moe_layer_step": cfg.interleave_moe_layer_step,
+      }
+    self.layers = self._make_scan_runner(RemattedBlockLayer, scan_length, "layers", **llama4_kwargs)
+
+    def exec_run(y, decoder_segment_ids, decoder_positions, deterministic, model_mode,
+                 previous_chunk=None, slot=None, page_state=None, bidirectional_mask=None):
+      # For LLAMA4 scanned we must include bidirectional_mask in call — the runner calls the scan
+      # which calls the layer; scan runner already has layer kwargs set; the mask is passed below
+      # by extending broadcasted args through the call chain if the layer uses it internally.
+      if self.layers is not None:
+        y = self.layers(y, decoder_segment_ids=decoder_segment_ids, decoder_positions=decoder_positions, deterministic=deterministic, model_mode=model_mode)
+      return y
+
+    self._exec = exec_run
+
+  def _build_exec_unscanned(self):
+    """No pipeline, unscanned (instantiate all per-layer modules now)."""
+    cfg = self.config
+    mesh = self.mesh
+    self._unscanned_layers: list[nnx.Module] = []
+
+    if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
+      if len(self.rematted_layer_classes) != 2:
+        raise ValueError(
+          f"Unscanned layers must have a length of 2 when using DeepSeek, but got {len(self.rematted_layer_classes)}."
+        )
+      dense_cls, moe_cls = self.rematted_layer_classes
+      # Instantiate all layers now with unique names.
+      for idx in range(cfg.first_num_dense_layers):
+        self._unscanned_layers.append(
+          dense_cls(config=cfg, mesh=mesh, name=f"dense_layers_{idx}", quant=self.quant, model_mode=cfg.model_mode)
+        )
+      for idx in range(cfg.num_decoder_layers - cfg.first_num_dense_layers):
+        self._unscanned_layers.append(
+          moe_cls(config=cfg, mesh=mesh, name=f"moe_layers_{idx}", quant=self.quant, model_mode=cfg.model_mode)
+        )
+
+    else:
+      base_cls = self.rematted_layer_classes[0]
+      for idx in range(cfg.num_decoder_layers):
+        layer_kwargs = {}
+        if cfg.decoder_block == DecoderBlockType.GEMMA3:
+          layer_kwargs = {"attention_type": gemma3.get_attention_type(layer_id=idx)}
+        elif cfg.decoder_block == DecoderBlockType.LLAMA4:
+          layer_kwargs = {
+              "is_nope_layer": llama4.determine_is_nope_layer(idx, cfg.nope_layer_interval),
+              "is_moe_layer": llama4.determine_is_moe_layer(idx, cfg.interleave_moe_layer_step),
+          }
+        self._unscanned_layers.append(
+          base_cls(config=cfg, mesh=mesh, name=f"layers_{idx}", quant=self.quant, model_mode=cfg.model_mode, **layer_kwargs)
+        )
+
+    def exec_run(y, decoder_segment_ids, decoder_positions, deterministic, model_mode,
+                 previous_chunk=None, slot=None, page_state=None, bidirectional_mask=None):
+      for layer in self._unscanned_layers:
+        call_kwargs = {}
+        # These families accept extra call kwargs
+        if cfg.decoder_block in {DecoderBlockType.GEMMA3, DecoderBlockType.LLAMA4}:
+          call_kwargs["bidirectional_mask"] = bidirectional_mask
+        if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
+          call_kwargs.update(dict(previous_chunk=previous_chunk, page_state=page_state, slot=slot))
+        y = layer(
+            y, decoder_segment_ids, decoder_positions, deterministic, model_mode,
+            previous_chunk=previous_chunk, page_state=page_state, slot=slot, **call_kwargs
+        )
+      return y
+
+    self._exec = exec_run
+
   def scan_decoder_layers(self, cfg:Config, decoder_layer: Callable, length:int, metadata_axis_name:str, mesh:Mesh, in_axes_tuple:Any, model_mode:str, **kwargs):
-    """scan decoder layers, calls `flax.linen.transforms.scan`"""
     params_spec = cfg.param_scan_axis
     cache_spec = 0
     scan_fn = nn.scan(
@@ -450,6 +737,7 @@ class Decoder(nnx.Module):
         **kwargs
     )
 
+
   def get_pipeline_stage_module(self, decoder_blocks:list[Type[nnx.Module]]) -> nnx.Module:
     """get pipeline stage module"""
 
@@ -473,7 +761,7 @@ class Decoder(nnx.Module):
           cfg.num_layers_per_pipeline_stage,
           "layers_per_stage",
           self.mesh,
-          in_axes_tuple=(nn.broadcast,) * 4,
+          in_axes_tuple=(nn.broadcast,) * self.BROADCAST_ARGS_LENGTH,
           model_mode=self.model_mode,
       )
     else:
@@ -485,8 +773,8 @@ class Decoder(nnx.Module):
           quant=self.quant,
           model_mode=self.model_mode,
       )
-    return stage_module
-
+    return stage_module  
+  
   def _apply_embedding(
       self,
       decoder_input_tokens:Array,
@@ -496,93 +784,59 @@ class Decoder(nnx.Module):
       image_embeddings: np.ndarray | Array | None=None,
       bidirectional_mask=None,
   )->Array:
-    """Applies token and positional embeddings to the input tokens."""
     cfg = self.config
 
     y = self.shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
-
+    
     # Merge the image embeddings with the text embeddings for multimodal models
     if image_embeddings is not None and cfg.use_multimodal:
       # TODO(hengtaoguo): Add support for other multimodal models such as Llama4, refactor if needed
       if cfg.model_name not in {"gemma3-4b", "gemma3-12b", "gemma3-27b", "llama4-17b-16e", "llama4-17b-128e"}:
         raise ValueError(f"Unsupported model_name for multimodal: {cfg.model_name}")
-
+      
       y = multimodal_utils.merge_mm_embeddings(
           text_embeddings=y,
           vision_embeddings=image_embeddings,
           mask=bidirectional_mask,
       )
-
-    y = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(y, deterministic=deterministic)
+      
+    y = self.embedding_dropout(y, deterministic=deterministic)
     y = y.astype(cfg.dtype)
 
     if cfg.use_untrainable_positional_embedding:
-      y = positional_embedding_as_linen(embedding_dims=cfg.base_emb_dim)(y, decoder_positions)
+      y = self.static_pos_embedding(y, decoder_positions)
 
-    if cfg.trainable_position_size > 0:
-      y += embed_as_linen(
-          num_embeddings=cfg.trainable_position_size,
-          num_features=cfg.emb_dim,
-          dtype=cfg.dtype,
-          embedding_init=nn.initializers.normal(stddev=1.0),
-          name="position_embedder",
-          config=cfg,
-      )(decoder_positions, model_mode=model_mode)
+    if cfg.trainable_position_size > 0 and self.position_embedder:
+      y += self.position_embedder(decoder_positions, model_mode=model_mode)
     return y
 
   def _apply_output_head(self, y:Array, deterministic:bool, model_mode:str)->Array:
-    """Applies final normalization and projects hidden states to logits."""
-
     cfg = self.config
-    y = self.get_norm_layer(num_features=y.shape[-1])(
-        dtype=cfg.dtype,
-        weight_dtype=cfg.weight_dtype,
-        # name="decoder_norm",
-        epsilon=cfg.normalization_layer_epsilon,
-        kernel_axes=("norm",),
-        parameter_memory_host_offload=cfg.parameter_memory_host_offload,
-        rngs=self.rngs
-    )(y)
-    y = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(y, deterministic=deterministic)
 
-    # [batch, length, emb_dim] -> [batch, length, vocab_size]
+    # Use the pre-instantiated norm layer
+    y = self.decoder_norm(y)
+    y = self.output_head_dropout(y, deterministic=deterministic)
+
     if cfg.logits_via_embedding:
-      # Use the transpose of embedding matrix for logit transform.
       embedding_table = self.shared_embedding.variables["params"]["embedding"]
       if isinstance(embedding_table, nn.spmd.LogicallyPartitioned):
         embedding_table = embedding_table.unbox()
       attend_dtype = jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype
       logits = attend_on_embedding(y, embedding_table, attend_dtype, self.config)
-
       if self.config.normalize_embedding_logits:
-        # Correctly normalize pre-softmax logits for this shared case.
         logits = logits / jnp.sqrt(y.shape[-1])
       if cfg.final_logits_soft_cap:
         logits = logits / cfg.final_logits_soft_cap
         logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
     else:
-      logits = linears.dense_general(
-          inputs_shape=y.shape,
-          out_features_shape=cfg.vocab_size,
-          weight_dtype=cfg.weight_dtype,
-          dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
-          kernel_axes=("embed", "vocab"),
-          name="logits_dense",
-          matmul_precision=self.config.matmul_precision,
-          parameter_memory_host_offload=cfg.parameter_memory_host_offload,
-      )(
-          y
-      )  # We do not quantize the logits matmul.
-    
-    # Add logical constraints to logits.
+      logits = self.logits_dense(y)
+
     logical_axis_resource = (
        (None, None, "activation_vocab") 
        if model_mode in {MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE} 
        else ("activation_embed_and_logits_batch", "activation_length", "activation_vocab")
     )
-    logits = nn.with_logical_constraint(
-        logits, logical_axis_resource
-    )
+    logits = nn.with_logical_constraint(logits, logical_axis_resource)
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
@@ -618,258 +872,34 @@ class Decoder(nnx.Module):
           bidirectional_mask,
       )
 
-      policy = self.get_remat_policy()
-      RemattedBlockLayers = self.set_remat_policy(self.decoder_layer, policy)
-      # scan does not support kwargs in layer call, passing broadcast_args as positional arg
-      broadcast_args = (
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-      )
-      in_axes_tuple = (nn.broadcast,) * len(broadcast_args)
-
-      if cfg.using_pipeline_parallelism:
-          y = self._run_with_pipeline_parallelism(
-              y, RemattedBlockLayers, broadcast_args, in_axes_tuple,
-          )
-      else:
-          y = self._run_without_pipeline_parallelism(
-              y, RemattedBlockLayers, broadcast_args, in_axes_tuple,
-              previous_chunk, slot, page_state, bidirectional_mask
-          )
-
-      if not isinstance(y, jax.Array):
-        raise TypeError(
-            f"Expected `y` to be a jax.Array, but got {type(y).__name__}."
-        )
-
-      # After the final transformer layer, `y` holds the raw, un-normalized hidden state.
-      hidden_state = y
-
-      logits = self._apply_output_head(hidden_state, deterministic, model_mode)
-
-      # The API of the Decoder is now a tuple, providing both the main output
-      # and the raw hidden state needed for auxiliary tasks.
-      return logits, hidden_state
-
-  def _deepseek_pipeline(self, y:Array, layers: list[Type[nnx.Module]], broadcast_args:tuple[Any,...], in_axes_tuple:tuple[Any,...], partition_spec:dict[str,Any]|None=None)->Array:
-    cfg = self.config
-    mesh = self.mesh
-    if len(layers) != 2:
-      raise ValueError(
-          f"Scanned layers must have a length of 2 when using DeepSeek, "
-          f"but got {len(layers)}."
-      )
-
-    dense_layer, moe_layer = layers
-    num_moe_layers = cfg.num_decoder_layers - cfg.first_num_dense_layers
-    num_moe_layers_outside_pp = num_moe_layers - cfg.pipeline_parallel_layers
-    logical_axis_rules_pp_as_dp = maxtext_utils.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
-
-    with mesh, nn_logical_axis_rules(logical_axis_rules_pp_as_dp):
-        y, _ = self.scan_decoder_layers(
-            cfg, dense_layer, cfg.first_num_dense_layers, "dense_layers", mesh, in_axes_tuple, model_mode=cfg.model_mode
-        )(y, *broadcast_args)
-        if num_moe_layers_outside_pp > 0:
-            y, _ = self.scan_decoder_layers(
-                cfg, moe_layer, num_moe_layers_outside_pp, "moe_layers", mesh, in_axes_tuple, model_mode=cfg.model_mode
-            )(y, *broadcast_args)
-
-    return self.pipeline_module(y, *broadcast_args, partition_spec=partition_spec)
-
-  def _standard_pipeline(self, y: Array, layers: list[Type[nnx.Module]], broadcast_args: tuple[Any,...], in_axes_tuple:tuple[Any,...], partition_spec)->Array:
-    cfg = self.config
-    y = self.pipeline_module(y, *broadcast_args, partition_spec=partition_spec)
-    remaining_layers = cfg.num_decoder_layers - cfg.pipeline_parallel_layers
-    if remaining_layers > 0:
-        logical_axis_rules_pp_as_dp = maxtext_utils.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
-        with self.mesh, nn_logical_axis_rules(logical_axis_rules_pp_as_dp):
-            y, _ = self.scan_decoder_layers(
-                cfg, layers[0], remaining_layers, "layers_outside_pipeline", self.mesh, in_axes_tuple, model_mode=cfg.model_mode
-            )(y, *broadcast_args)
-    return y
-
-  def _run_with_pipeline_parallelism(
-      self, y: Array, RemattedBlockLayers : list[Type[nnx.Module]], broadcast_args: tuple[Any,...], in_axes_tuple:tuple[Any,...], 
-  )->Array:
-    cfg = self.config
-    partition_spec : dict|None = None
-    if cfg.pipeline_fsdp_ag_once:
-        partition_spec = self.pipeline_module.get_weight_sharding(y, *broadcast_args)
-
-    if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
-        return self._deepseek_pipeline(y, RemattedBlockLayers, broadcast_args, in_axes_tuple, partition_spec)
-    return self._standard_pipeline(y, RemattedBlockLayers, broadcast_args, in_axes_tuple, partition_spec)
-
-  def _run_without_pipeline_parallelism(
-      self, y: Array, layers: list[Type[nnx.Module]], broadcast_args:tuple[Any,...], in_axes_tuple:tuple[Any,...],
-      previous_chunk:Optional[Array]=None,
-      slot: Optional[int] = None,
-      page_state: Optional[page_manager.PageState] = None,
-      bidirectional_mask: Optional[Any] = None,
-  )->Array:
-    cfg = self.config
-    if cfg.scan_layers:
-        return self._scanned_layers(y, layers, broadcast_args, in_axes_tuple,
-                                    previous_chunk, slot, page_state, bidirectional_mask)
-    return self._unscanned_layers(y, layers, broadcast_args,
-                                    previous_chunk, slot, page_state, bidirectional_mask)
-
-  def _scanned_layers(self, y: Array, layers: list[Type[nnx.Module]], broadcast_args:tuple[Any,...], in_axes_tuple:tuple[Any,...],
-      previous_chunk:Optional[Array]=None,
-      slot: Optional[int] = None,
-      page_state: Optional[page_manager.PageState] = None,
-      bidirectional_mask: Optional[Any] = None,
-    )->Array:
-    cfg = self.config
-    mesh = self.mesh
-    if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
-        if len(layers) != 2:
-          raise ValueError(
-              f"Scanned layers must have a length of 2 when using DeepSeek, "
-              f"but got {len(layers)}."
-          )
-
-        dense_layer, moe_layer = layers
-        layer_call_kwargs = {"page_state": page_state, "previous_chunk": previous_chunk, "slot": slot}
-        dense_layer.__call__ = functools.partial(dense_layer.__call__, **layer_call_kwargs)
-        y, _ = self.scan_decoder_layers(cfg, dense_layer, cfg.first_num_dense_layers, "dense_layers", mesh, in_axes_tuple, model_mode=cfg.model_mode)(y, *broadcast_args)
-        moe_layer.__call__ = functools.partial(moe_layer.__call__, **layer_call_kwargs)
-        num_moe_layers = cfg.num_decoder_layers - cfg.first_num_dense_layers
-        y, _ = self.scan_decoder_layers(cfg, moe_layer, num_moe_layers, "moe_layers", mesh, in_axes_tuple, model_mode=cfg.model_mode)(y, *broadcast_args)
-
-    elif cfg.decoder_block == DecoderBlockType.GEMMA3:
-        y = self._apply_gemma3_scanned_blocks(y, *broadcast_args, bidirectional_mask, previous_chunk, page_state, slot)
-
-    else:
-        RemattedBlockLayer = layers[0]
-        scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
-        layer_kwargs = {}
-        if cfg.decoder_block == DecoderBlockType.LLAMA4:
-            layer_kwargs = {
-                "nope_layer_interval": cfg.nope_layer_interval,
-                "interleave_moe_layer_step": cfg.interleave_moe_layer_step,
-            }
-            broadcast_args += (bidirectional_mask,)
-        y, _ = self.scan_decoder_layers(cfg, RemattedBlockLayer, scan_length, "layers", mesh, in_axes_tuple, model_mode=cfg.model_mode, **layer_kwargs)(y, *broadcast_args)
-
-    return y
-
-  def _unscanned_layers(self,y: Array, layers: list[Callable[...,Any]], broadcast_args:tuple[Any,...], 
-        previous_chunk:Optional[Array]=None,
-        slot: Optional[int] = None,
-        page_state: Optional[page_manager.PageState] = None,
-        bidirectional_mask: Optional[Any] = None,                  
-      )->Array:
-      cfg = self.config
-      mesh = self.mesh
-
-      if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
-          if len(layers) != 2:
-            raise ValueError(
-              f"Unscanned layers must have a length of 2 when using DeepSeek, but got {len(layers)}."
-            )
-
-          dense_layer, moe_layer = layers
-          layer_groups = [
-              (dense_layer, cfg.first_num_dense_layers, "dense_layers"),
-              (moe_layer, cfg.num_decoder_layers - cfg.first_num_dense_layers, "moe_layers"),
-          ]
-          for layer, num_layers, prefix in layer_groups:
-              for index in range(num_layers):
-                  y = layer(config=cfg, mesh=mesh, name=f"{prefix}_{index}", quant=self.quant, model_mode=cfg.model_mode)(
-                      y, *broadcast_args, previous_chunk=previous_chunk, page_state=page_state, slot=slot
-                  )
-
-      else:
-          for layer_number in range(cfg.num_decoder_layers):
-              RemattedBlockLayer = layers[0]
-              layer_kwargs, call_kwargs = {}, {}
-              if cfg.decoder_block == DecoderBlockType.GEMMA3:
-                  layer_kwargs = {"attention_type": gemma3.get_attention_type(layer_id=layer_number)}
-                  call_kwargs = {"bidirectional_mask": bidirectional_mask}
-              elif cfg.decoder_block == DecoderBlockType.LLAMA4:
-                  layer_kwargs = {
-                      "is_nope_layer": llama4.determine_is_nope_layer(layer_number, cfg.nope_layer_interval),
-                      "is_moe_layer": llama4.determine_is_moe_layer(layer_number, cfg.interleave_moe_layer_step),
-                  }
-                  call_kwargs = {"bidirectional_mask": bidirectional_mask}
-
-              layer = RemattedBlockLayer(config=cfg, mesh=mesh, name=f"layers_{layer_number}", quant=self.quant, model_mode=cfg.model_mode, **layer_kwargs)
-              y = layer(y, *broadcast_args, previous_chunk=previous_chunk, page_state=page_state, slot=slot, **call_kwargs)
-
-      return y
-
-  def _apply_gemma3_scanned_blocks(
-      self,
-      y : Array,
-      decoder_segment_ids:Array,
-      decoder_positions:Array,
-      deterministic:bool,
-      model_mode:str,
-      bidirectional_mask,
-      previous_chunk:Optional[Array] = None,
-      page_state: Optional[page_manager.PageState] = None,
-      slot: Optional[int] = None,
-  ):
-    """Applies Gemma3 scanned decoder blocks, handling main scan and remainders."""
-
-    cfg = self.config
-    mesh = self.mesh
-
-    # Define the repeating pattern length and calculate how many full blocks to scan
-    attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
-    scan_length = cfg.num_decoder_layers // attention_pattern_length
-
-    policy = self.get_remat_policy()
-    RemattedGemma3Block = self.set_remat_policy([gemma3.Gemma3ScannableBlock], policy)[0]
-
-    layer_call_kwargs = {"bidirectional_mask": bidirectional_mask}
-    layer_kwargs = {"num_of_layers": attention_pattern_length}
-
-    # Apply the main scan over the full blocks
-    if scan_length > 0:
-      broadcast_args = (
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-      )
-      y, _ = self.scan_decoder_layers(
-          cfg,
-          RemattedGemma3Block,
-          scan_length,
-          "layers",
-          mesh,
-          in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
-          model_mode=model_mode,
-          **layer_kwargs,
-      )(y, *broadcast_args, **layer_call_kwargs)
-
-    # Apply any remaining layers that did not fit into a full scanned block
-    num_remaining_layers = cfg.num_decoder_layers % attention_pattern_length
-    if num_remaining_layers > 0:
-      # We name the remainder block with a 'remainder' suffix to avoid parameter name collisions
-      rem_layer_kwargs = {"num_of_layers": num_remaining_layers}
-      layer = RemattedGemma3Block(
-          config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode, name="layers_remainder", **rem_layer_kwargs
-      )
-      y, _ = layer(
+      # Broadcast args are the fixed 4-tuple everywhere
+      y = self._exec(
           y,
           decoder_segment_ids,
           decoder_positions,
           deterministic,
           model_mode,
           previous_chunk=previous_chunk,
-          page_state=page_state,
           slot=slot,
-          **layer_call_kwargs,
+          page_state=page_state,
+          bidirectional_mask=bidirectional_mask,
       )
-    return y
+
+      if not isinstance(y, jax.Array):
+        raise TypeError(f"Expected `y` to be a jax.Array, but got {type(y).__name__}.")
+
+      hidden_state = y
+      logits = self._apply_output_head(hidden_state, deterministic, model_mode)
+      return logits, hidden_state
 
   @property
   def pipeline_module(self) -> pipeline.Pipeline:
       if self._pipeline_module is None:
           raise RuntimeError("Pipeline module is not initialized. Set 'ici_pipeline_parallelism' or `dcn_pipeline_parallelism` value larger than 1 in config to enable pipeline parallelism.")
       return self._pipeline_module
+
+  @property
+  def static_pos_embedding(self)->nn.Module:
+    if self._static_pos_embedding is None:
+      raise RuntimeError("Set 'use_untrainable_positional_embedding' in config to enable positional embedding")
+    return self._static_pos_embedding
