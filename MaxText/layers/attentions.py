@@ -505,6 +505,7 @@ class AttentionOp(nnx.Module):
         context_parallel_axis="context",
     )
     # TODO: if is DotProduct
+    """
     if self.attention_type == AttentionType.LOCAL_SLIDING or using_context_parallelism:
       mask_type = "causal"  # SWA and Context Parallelism only work with causal masking
       dummy_attn_mask = None
@@ -512,7 +513,7 @@ class AttentionOp(nnx.Module):
       # generate attn_mask
       mask_type = "padding_causal"  # only padding_causal mask type can take a created mask
       dummy_attn_mask = self.generate_attention_mask(dummy_prefill, dummy_prefill, decoder_segment_ids, model_mode)
-
+    """
 
     dummy_prefill = jnp.zeros((1, config.max_target_length, self.num_query_heads, config.head_dim), dtype=self.dtype)
     dummy_attention_mask = jnp.zeros((1, 1, 1, config.max_target_length, config.max_target_length), dtype=self.dtype)
