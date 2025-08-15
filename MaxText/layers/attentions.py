@@ -446,19 +446,18 @@ class AttentionOp(nnx.Module):
     s_prefill = self.max_prefill_predict_length
     s_ar = self.max_target_length
 
-    # Dummy query/key/value shapes as before...
-    dummy_query_prefill = jnp.zeros((b, t_prefill, n_kv, g, d), dtype=self.dtype)
-    dummy_key_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
-    dummy_query_ar = jnp.zeros((b, t_ar, n_kv, g, d), dtype=self.dtype)
-    dummy_key_ar = jnp.zeros((b, s_ar, n_kv, d), dtype=self.dtype)
-
-    dummy_attn_weights_prefill = jnp.zeros((b, n_kv, g, t_prefill, s_prefill), dtype=jnp.float32)
-    dummy_value_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
-    dummy_attn_weights_ar = jnp.zeros((b, n_kv, g, t_ar, s_ar), dtype=jnp.float32)
-    dummy_value_ar = jnp.zeros((b, s_ar, n_kv, d), dtype=self.dtype)
-
     # qk_product
     if self.kv_quant:
+      # Dummy query/key/value shapes as before...
+      dummy_query_prefill = jnp.zeros((b, t_prefill, n_kv, g, d), dtype=self.dtype)
+      dummy_key_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
+      dummy_query_ar = jnp.zeros((b, t_ar, n_kv, g, d), dtype=self.dtype)
+      dummy_key_ar = jnp.zeros((b, s_ar, n_kv, d), dtype=self.dtype)
+
+      dummy_attn_weights_prefill = jnp.zeros((b, n_kv, g, t_prefill, s_prefill), dtype=jnp.float32)
+      dummy_value_prefill = jnp.zeros((b, s_prefill, n_kv, d), dtype=self.dtype)
+      dummy_attn_weights_ar = jnp.zeros((b, n_kv, g, t_ar, s_ar), dtype=jnp.float32)
+      dummy_value_ar = jnp.zeros((b, s_ar, n_kv, d), dtype=self.dtype)
 
       # Prefill AqtEinsum instances
       self.AqtEinsum_0 = maybe_create_nnx(
@@ -506,8 +505,19 @@ class AttentionOp(nnx.Module):
         context_parallel_axis="context",
     )
     # TODO: if is DotProduct
+    if self.attention_type == AttentionType.LOCAL_SLIDING or using_context_parallelism:
+      mask_type = "causal"  # SWA and Context Parallelism only work with causal masking
+      dummy_attn_mask = None
+    else:
+      # generate attn_mask
+      mask_type = "padding_causal"  # only padding_causal mask type can take a created mask
+      dummy_attn_mask = self.generate_attention_mask(dummy_prefill, dummy_prefill, decoder_segment_ids, model_mode)
+
+
+    dummy_prefill = jnp.zeros((1, config.max_target_length, self.num_query_heads, config.head_dim), dtype=self.dtype)
+    dummy_attention_mask = jnp.zeros((1, 1, 1, config.max_target_length, config.max_target_length), dtype=self.dtype)
     dpa_layer = nnx_wrappers.ToNNX(dpa_layer, rngs=self.rngs)
-    dpa_layer.lazy_init(dummy_query_prefill, dummy_key_prefill, dummy_value_prefill, mask=dummy_attn_weights_prefill)
+    dpa_layer.lazy_init(dummy_prefill, dummy_prefill, dummy_prefill, mask=# dummy_attn_mask)
     self.dpa_layer = dpa_layer
 
   def check_attention_inputs(self, query: Array, key: Array | KVTensor, value: Array | KVTensor) -> None:
