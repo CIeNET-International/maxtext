@@ -517,7 +517,7 @@ class AttentionOp(nnx.Module):
     dummy_prefill = jnp.zeros((1, config.max_target_length, self.num_query_heads, config.head_dim), dtype=self.dtype)
     dummy_attention_mask = jnp.zeros((1, 1, 1, config.max_target_length, config.max_target_length), dtype=self.dtype)
     dpa_layer = nnx_wrappers.ToNNX(dpa_layer, rngs=self.rngs)
-    dpa_layer.lazy_init(dummy_prefill, dummy_prefill, dummy_prefill, mask=# dummy_attn_mask)
+    dpa_layer.lazy_init(dummy_prefill, dummy_prefill, dummy_prefill, mask=None)# dummy_attn_mask)
     self.dpa_layer = dpa_layer
 
   def check_attention_inputs(self, query: Array, key: Array | KVTensor, value: Array | KVTensor) -> None:
