@@ -366,7 +366,7 @@ class Decoder(nnx.Module):
 
     raise ValueError(f"Incorrect decoder_block name: {decoder_type.value}")
 
-  def set_remat_policy(self, block_layers, policy : Callable[..., bool]|None = None)->list[Type[nnx.Modu]]:
+  def set_remat_policy(self, block_layers, policy : Callable[..., bool]|None = None)->list[Type[nnx.Module]]:
     """Set remat policy"""
     RemattedBlockLayers = []
     for block_layer in block_layers:
@@ -871,5 +871,5 @@ class Decoder(nnx.Module):
   @property
   def pipeline_module(self) -> pipeline.Pipeline:
       if self._pipeline_module is None:
-          raise RuntimeError("Pipeline module is not initialized. Set 'using_pipeline_parallelism=True' in config.")
+          raise RuntimeError("Pipeline module is not initialized. Set 'ici_pipeline_parallelism' or `dcn_pipeline_parallelism` value larger than 1 in config to enable pipeline parallelism.")
       return self._pipeline_module
