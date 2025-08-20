@@ -16,7 +16,7 @@
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import jax
 from jax import lax
@@ -37,6 +37,7 @@ from MaxText.layers import quantizations
 from MaxText.layers.attentions import AttentionOp, KVQuant
 from MaxText.layers.initializers import Initializer, NdInitializer, nd_dense_init
 from MaxText.layers.quantizations import AqtQuantization as Quant
+from MaxText.common_types import MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
 
 # -----------------------------------------
 # The Normalization Layer specific for GPT3
