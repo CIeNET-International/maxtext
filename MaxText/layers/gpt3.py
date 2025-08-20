@@ -346,11 +346,20 @@ class Gpt3DecoderLayer(nnx.Module):
     self.mesh = mesh
     self.quant = quant
     self.rngs = rngs
+    batch_size = config.micro_batch_size_to_train_on
 
-    dummy_inputs_shape = (int(config.per_device_batch_size), config.max_target_length, int(config.emb_dim))
+
+    if model_mode == MODEL_MODE_PREFILL:
+      seq_len = config.max_prefill_predict_length
+    elif model_mode == MODEL_MODE_AUTOREGRESSIVE:
+      seq_len = 1
+    else:
+      seq_len = config.max_target_length
+
+    dummy_inputs_shape = (batch_size, seq_len, config.emb_dim)
 
     self.pre_self_attention_norm = Gpt3LayerNorm(
-        num_features=config.emb_dim,
+        num_features=dummy_inputs_shape[-1],
         dtype=config.dtype,
         kernel_axes=("norm",),
         epsilon=config.normalization_layer_epsilon,
@@ -359,7 +368,7 @@ class Gpt3DecoderLayer(nnx.Module):
         rngs=self.rngs,
     )
     self.mlp = MlpBlock(
-        in_features=config.emb_dim,
+        in_features=dummy_inputs_shape[-1],
         intermediate_dim=config.mlp_dim,
         activations=config.mlp_activations,
         intermediate_dropout_rate=config.dropout_rate,
