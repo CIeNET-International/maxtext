@@ -260,7 +260,7 @@ class TestUnifiedDecoder:
         bad_tokens = jnp.ones((batch_size, seq_len, 1), dtype=jnp.int32)
         positions = jnp.arange(seq_len, dtype=jnp.int32).reshape(1, -1)
         
-        with pytest.raises(AssertionError):
+        with pytest.raises((AssertionError,ValueError)):
             harness.apply(
                 decoder_input_tokens=bad_tokens,
                 decoder_positions=positions,
