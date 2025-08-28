@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """ Tests for the quantizations """
+from typing import Any
 import unittest
 import os.path
 import sys
@@ -26,6 +27,7 @@ from jax import random, lax
 from jax.sharding import Mesh
 
 from flax import linen as nn
+from flax import nnx
 
 from aqt.jax.v2 import aqt_tensor
 
@@ -41,6 +43,34 @@ _QUERY_REGEX = ".*/query"
 _VALUE_REGEX = ".*/value"
 
 
+class QuantTestModule(nnx.Module):
+  """Test module for einsum."""
+  def __init__(
+    self,
+    quantization: quantizations.AqtQuantization,
+    data_type: Any,
+    rngs: nnx.Rngs
+  ):
+    self.quantization = quantization
+    self.identity = jnp.identity(2, dtype=data_type)
+    self.einsum = None
+    self.dot_general = None
+
+    if self.quantization:
+      self.einsum = self.quantization.einsum()
+      dot_general_cls = self.quantization.dot_general_cls()
+      self.dot_general = dot_general_cls()
+    else:
+      self.einsum = jnp.einsum
+      self.dot_general = lax.dot_general
+
+  def __call__(self, inputs):
+    # res_einsum = self.einsum("bc,ab->ac", inputs, self.identity)
+    res_dg = self.dot_general(inputs, inputs, (((), ()), ((), ())), precision=None)
+    return res_dg  # res_einsum, res_dg
+
+
+'''
 class QuantTestModule(nn.Module):
   """Test module for einsum."""
 
@@ -58,7 +88,7 @@ class QuantTestModule(nn.Module):
     res_einsum = einsum("bc,ab->ac", inputs, identity)
     res_dg = dot_general(inputs, inputs, (((), ()), ((), ())), precision=None)
     return res_einsum, res_dg
-
+'''
 
 def _configure_quantization(quant_str="", quant_cfg_path="", mode_str="train", replicate_scale=False):
   config = pyconfig.initialize(
@@ -73,12 +103,14 @@ def _configure_quantization(quant_str="", quant_cfg_path="", mode_str="train", r
 
 
 def _apply(quant_str=""):
+  input_shape = (2, 2)
+  inputs = jnp.ones(input_shape)
+  data_type = inputs.dtype
   quant = _configure_quantization(quant_str)
-  test_module = QuantTestModule(quant)
-  rng = random.PRNGKey(0)
-  variables = test_module.init({"params": rng}, jnp.ones((2, 2)))
-  inputs = jnp.ones((2, 2))
-  res_einsum, res_dg = test_module.apply(variables, inputs, rngs={"params": random.PRNGKey(0)})
+  test_module = QuantTestModule(quant, data_type, nnx.Rngs(params=0))
+  # variables = test_module.init({"params": rng}, jnp.ones((2, 2)))
+  # res_einsum, res_dg = test_module.apply(variables, inputs, rngs={"params": random.PRNGKey(0)})
+  res_einsum, res_dg = test_module(inputs)
   return inputs, res_einsum, res_dg
 
 

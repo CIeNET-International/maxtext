@@ -29,6 +29,7 @@ from flax import linen as nn
 from flax.core.scope import FrozenVariableDict
 from flax.linen import Dense
 from flax.training import train_state
+from flax import nnx
 
 import optax
 
@@ -154,7 +155,30 @@ class MaxUtilsInitState(unittest.TestCase):
         max_utils.calculate_num_params_from_pytree(state.params), max_utils.calculate_num_params_from_pytree(self.params)
     )
 
+class SpecialVariable(nnx.Variable): pass
 
+class ModelWithMultipleCollections(nnx.Module):
+  """
+  A simple model that has variables in multiple collections - "params" and "special_variables"
+  """
+  def __init__(self, input_dim: int, rngs: nnx.Rngs):
+    self.dense = nnx.Linear(input_dim, 4, rngs=rngs)
+    self.my_first_kernel = SpecialVariable(jnp.ones((4, 5)))
+
+  def __call__(self, x, y, encoder_images=None):
+    x = self.dense(x)
+    x = x @ self.my_first_kernel.value
+    return x
+
+def ModelWithMultipleCollectionsTest():
+    model = ModelWithMultipleCollections(3, nnx.Rngs(0))
+    linear_variables = nnx.state(model, SpecialVariable)
+    print(model.params)
+    print(jax.tree.map(jnp.shape, linear_variables))
+    tx = optax.adam(learning_rate=0.001)
+
+    maxtext_utils.init_initial_state(model, tx, self.config, is_training, self.key3)
+'''
 class ModelWithMultipleCollections(nn.Module):
   """
   A simple model that has variables in multiple collections - "params" and "special_variables"
@@ -169,14 +193,14 @@ class ModelWithMultipleCollections(nn.Module):
     x = self.dense(x)
     x = x @ self.kernel.value
     return x
-
+'''
 
 class MaxUtilsInitStateWithMultipleCollections(unittest.TestCase):
   """test class for multiple collection state in maxutils"""
 
   def setUp(self):
     self.config = pyconfig.initialize([None, os.path.join(PKG_DIR, "configs", "base.yml")], enable_checkpointing=False)
-    self.model = ModelWithMultipleCollections()
+    self.model = ModelWithMultipleCollections(self.config.max_target_length, nnx.Rngs(0))
     self.key1, self.key2, self.key3 = random.split(random.key(0), num=3)
     self.input = random.normal(self.key1, (self.config.global_batch_size_to_load, self.config.max_target_length))
     self.params = self.model.init(self.key2, self.input, self.input)
@@ -533,4 +557,5 @@ class TestPromptLogprobsFromPackedPrefill(unittest.TestCase):
     self.assertTrue(np.isnan(out_np[0, 7]))
 
 if __name__ == "__main__":
-  unittest.main()
+  ModelWithMultipleCollectionsTest()
+  # unittest.main()
