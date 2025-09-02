@@ -57,17 +57,17 @@ class QuantTestModule(nnx.Module):
     self.dot_general = None
 
     if self.quantization:
-      self.einsum = self.quantization.einsum()
-      dot_general_cls = self.quantization.dot_general_cls()
-      self.dot_general = dot_general_cls()
+      self.einsum = self.quantization.einsum_nnx() # self.quantization.einsum()
+      self.dot_general = self.quantization.dot_general_nnx()  # self.quantization.dot_general_cls()
+      # self.dot_general = dot_general_cls()
     else:
       self.einsum = jnp.einsum
       self.dot_general = lax.dot_general
 
   def __call__(self, inputs):
-    # res_einsum = self.einsum("bc,ab->ac", inputs, self.identity)
+    res_einsum = self.einsum("bc,ab->ac", inputs, self.identity)
     res_dg = self.dot_general(inputs, inputs, (((), ()), ((), ())), precision=None)
-    return res_dg  # res_einsum, res_dg
+    return res_einsum, res_dg
 
 
 '''
@@ -103,8 +103,7 @@ def _configure_quantization(quant_str="", quant_cfg_path="", mode_str="train", r
 
 
 def _apply(quant_str=""):
-  input_shape = (2, 2)
-  inputs = jnp.ones(input_shape)
+  inputs = jnp.ones((2, 2))
   data_type = inputs.dtype
   quant = _configure_quantization(quant_str)
   test_module = QuantTestModule(quant, data_type, nnx.Rngs(params=0))
