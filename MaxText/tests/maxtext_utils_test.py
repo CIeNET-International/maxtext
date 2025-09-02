@@ -155,7 +155,8 @@ class MaxUtilsInitState(unittest.TestCase):
         max_utils.calculate_num_params_from_pytree(state.params), max_utils.calculate_num_params_from_pytree(self.params)
     )
 
-class SpecialVariable(nnx.Variable): pass
+
+class SpecialVariables(nnx.Variable): pass
 
 class ModelWithMultipleCollections(nnx.Module):
   """
@@ -163,21 +164,13 @@ class ModelWithMultipleCollections(nnx.Module):
   """
   def __init__(self, input_dim: int, rngs: nnx.Rngs):
     self.dense = nnx.Linear(input_dim, 4, rngs=rngs)
-    self.my_first_kernel = SpecialVariable(jnp.ones((4, 5)))
+    self.my_first_kernel = SpecialVariables(jnp.ones((4, 5)))
 
   def __call__(self, x, y, encoder_images=None):
     x = self.dense(x)
-    x = x @ self.my_first_kernel.value
+    x = x @ self.my_first_kernel
     return x
 
-def ModelWithMultipleCollectionsTest():
-    model = ModelWithMultipleCollections(3, nnx.Rngs(0))
-    linear_variables = nnx.state(model, SpecialVariable)
-    print(model.params)
-    print(jax.tree.map(jnp.shape, linear_variables))
-    tx = optax.adam(learning_rate=0.001)
-
-    maxtext_utils.init_initial_state(model, tx, self.config, is_training, self.key3)
 '''
 class ModelWithMultipleCollections(nn.Module):
   """
@@ -203,13 +196,22 @@ class MaxUtilsInitStateWithMultipleCollections(unittest.TestCase):
     self.model = ModelWithMultipleCollections(self.config.max_target_length, nnx.Rngs(0))
     self.key1, self.key2, self.key3 = random.split(random.key(0), num=3)
     self.input = random.normal(self.key1, (self.config.global_batch_size_to_load, self.config.max_target_length))
-    self.params = self.model.init(self.key2, self.input, self.input)
+
+    # self.params = self.model.init(self.key2, self.input, self.input)
+    # print(self.params)
     self.tx = optax.adam(learning_rate=0.001)
 
   def _test_init_initial_state_driver(self, is_training):
+    if is_training:
+      self.model.train()
+    else:
+      self.model.eval()
+
+    self.graphdef, self.params = nnx.split(self.model)
+
     """test initiating of the initial state driver"""
-    state_under_test = maxtext_utils.init_initial_state(self.model, self.tx, self.config, is_training, self.key3)
-    self.assertEqual(state_under_test.apply_fn, self.model.apply)
+    state_under_test = maxtext_utils.init_initial_state_nnx(self.graphdef, self.params, self.tx, self.config, is_training, self.key3)
+    self.assertEqual(state_under_test.apply_fn, self.graphdef.apply)
     if is_training:
       self.assertEqual(state_under_test.tx, self.tx)
       self.assertNotEqual(state_under_test.opt_state, {})
@@ -221,7 +223,10 @@ class MaxUtilsInitStateWithMultipleCollections(unittest.TestCase):
         max_utils.calculate_num_params_from_pytree(self.params),
     )
     self.assertEqual(len(self.params), len(state_under_test.params))
-    self.assertIn("special_variables", state_under_test.params)
+    breakpoint()
+    # self.assertIn("SpecialVariables", state_under_test.other_variables)
+    self.assertTrue(hasattr(state_under_test.other_variables, 'SpecialVariables'))
+
     self.assertIn("params", state_under_test.params)
 
   def test_initial_train_state(self):
