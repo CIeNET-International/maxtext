@@ -225,9 +225,9 @@ class MaxUtilsInitStateWithMultipleCollections(unittest.TestCase):
     self.assertEqual(len(self.params), len(state_under_test.params))
     breakpoint()
     # self.assertIn("SpecialVariables", state_under_test.other_variables)
-    self.assertTrue(hasattr(state_under_test.other_variables, 'SpecialVariables'))
+    self.assertIsInstance(state_under_test.params["my_first_kernel"], SpecialVariables)
 
-    self.assertIn("params", state_under_test.params)
+    self.assertTrue(hasattr(state_under_test, "params"))
 
   def test_initial_train_state(self):
     self._test_init_initial_state_driver(True)
