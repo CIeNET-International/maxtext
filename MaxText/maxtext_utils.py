@@ -884,9 +884,9 @@ def init_decode_state(apply_fn, params) -> train_state.TrainState:
   state = train_state.TrainState(step=0, apply_fn=apply_fn, params=params, tx=None, opt_state={})  # type: ignore
   return state
 
-def init_decode_state_nnx(apply_fn, params) -> train_state.TrainState:
+def init_decode_state_nnx(apply_fn, params, other_variables) -> train_state.TrainState:
   """Init train state with null opt state for decode."""
-  state = TrainState(step=0, apply_fn=apply_fn, params=params, other_variables=None, tx=None, opt_state={})  # type: ignore
+  state = TrainState(step=0, apply_fn=apply_fn, params=params, other_variables=other_variables, tx=None, opt_state={})  # type: ignore
   return state
 
 
@@ -895,10 +895,10 @@ def init_training_state(apply_fn, params, tx):
   state = train_state.TrainState.create(apply_fn=apply_fn, params=params, tx=tx)
   return state
 
-def init_training_state_nnx(apply_fn, params, tx):
+def init_training_state_nnx(apply_fn, params, other_variables, tx):
   """Init train state with null opt state for decode."""
 
-  state = TrainState.create(apply_fn=apply_fn, params=params, other_variables=None, tx=tx)
+  state = TrainState.create(apply_fn=apply_fn, params=params, other_variables=other_variables, tx=tx)
   return state
 
 
@@ -923,7 +923,7 @@ def init_initial_state(model, tx, config, is_training, key):
     return init_training_state(model.apply, model_vars, tx)
   return init_decode_state(model.apply, model_vars)
 
-def init_initial_state_nnx(graphdef, params, tx, config, is_training, key):
+def init_initial_state_nnx(graphdef, params, other_variables, tx, config, is_training, key):
   """
   We pass in "static" objects like model, tx, config as JAX compares them by
   object hash, and instantiating them inside causes pjit top-level annotations
@@ -939,8 +939,8 @@ def init_initial_state_nnx(graphdef, params, tx, config, is_training, key):
   graphdef, params, other_variables = nnx.split(model, nnx.Param, ...)
   '''
   if is_training:
-    return init_training_state_nnx(graphdef.apply, params, tx)
-  return init_decode_state_nnx(graphdef.apply, params)
+    return init_training_state_nnx(graphdef.apply, params, other_variables, tx)
+  return init_decode_state_nnx(graphdef.apply, params, other_variables)
 
 def setup_decode_state(model, config, rng, mesh, checkpoint_manager):
   """Setup decode state by loading params from a checkpoint.

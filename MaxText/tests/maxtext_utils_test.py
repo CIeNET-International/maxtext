@@ -207,11 +207,11 @@ class MaxUtilsInitStateWithMultipleCollections(unittest.TestCase):
     else:
       self.model.eval()
 
-    self.graphdef, self.params = nnx.split(self.model)
+    graphdef, params, other_variables = nnx.split(self.model, nnx.Param, ...)
 
     """test initiating of the initial state driver"""
-    state_under_test = maxtext_utils.init_initial_state_nnx(self.graphdef, self.params, self.tx, self.config, is_training, self.key3)
-    self.assertEqual(state_under_test.apply_fn, self.graphdef.apply)
+    state_under_test = maxtext_utils.init_initial_state_nnx(graphdef, params, other_variables, self.tx, self.config, is_training, self.key3)
+    self.assertEqual(state_under_test.apply_fn, graphdef.apply)
     if is_training:
       self.assertEqual(state_under_test.tx, self.tx)
       self.assertNotEqual(state_under_test.opt_state, {})
@@ -220,13 +220,10 @@ class MaxUtilsInitStateWithMultipleCollections(unittest.TestCase):
       self.assertEqual(state_under_test.opt_state, {})
     self.assertEqual(
         max_utils.calculate_num_params_from_pytree(state_under_test.params),
-        max_utils.calculate_num_params_from_pytree(self.params),
+        max_utils.calculate_num_params_from_pytree(params),
     )
-    self.assertEqual(len(self.params), len(state_under_test.params))
-    breakpoint()
-    # self.assertIn("SpecialVariables", state_under_test.other_variables)
-    self.assertIsInstance(state_under_test.params["my_first_kernel"], SpecialVariables)
-
+    self.assertEqual(len(params), len(state_under_test.params))
+    self.assertIsInstance(state_under_test.other_variables["my_first_kernel"], SpecialVariables)
     self.assertTrue(hasattr(state_under_test, "params"))
 
   def test_initial_train_state(self):
