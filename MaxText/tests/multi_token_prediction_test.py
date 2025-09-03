@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from flax import linen as nn
+from flax import nnx
 
 from MaxText.common_types import Config
 from MaxText import max_logging, pyconfig
@@ -28,6 +29,7 @@ from MaxText.globals import PKG_DIR
 from MaxText.layers.decoders import Decoder, DecoderLayer
 from MaxText.layers import multi_token_prediction  # The class under test
 from MaxText.layers import embeddings
+from MaxText.layers import nnx_wrappers
 
 TEST_LAYER_NUM = 1
 
@@ -120,30 +122,37 @@ class MultiTokenPredictionLayerTest(unittest.TestCase):
 
 
 # A lightweight wrapper model for robustly testing the MTPBlock.
-class MTPBlockTestModel(nn.Module):
+class MTPBlockTestModel(nnx.Module):
   """A lightweight wrapper model for testing the MTPBlock."""
 
-  config: Config
-  mesh: Mesh
+  def __init__(
+      self,
+      config: Config
+      mesh: Mesh
+  ):
+    self.config = config
+    self.mesh = mesh
 
   def setup(self):
     """Initializes the MTP block and its dependencies for the test."""
-    self.shared_embedding = embeddings.embed_as_linen(
-        num_embeddings=self.config.vocab_size,
-        num_features=self.config.base_emb_dim,
-        config=self.config,
-        name="shared_embedding",
+    self.shared_embedding = embeddings.Embed(
+      num_embeddings=self.config.vocab_size,
+      num_features=self.config.base_emb_dim,
+      config=self.config,
     )
-    self.decoder = Decoder(
+    decoder = Decoder(
         config=self.config, mesh=self.mesh, name="decoder_for_mtp"
     )
-    self.mtp_block = multi_token_prediction.MultiTokenPredictionBlock(
-        config=self.config,
-        mesh=self.mesh,
-        name="mtp_block",
-        transformer_layer_module=DecoderLayer,
-        decoder=self.decoder,
+    self.decoder_for_mtp = nnx_wrappers.ToNNX(decoder, rngs=nnx.Rngs(params=0))
+
+    multi_token_prediction_block = multi_token_prediction.MultiTokenPredictionBlock(
+      config=self.config,
+      mesh=self.mesh,
+      name="mtp_block",
+      transformer_layer_module=DecoderLayer,
+      decoder=self.decoder,
     )
+    self.mtp_block = nnx_wrappers.ToNNX(multi_token_prediction_block, rngs=nnx.Rngs(params=0))
 
   def __call__(
       self, main_hidden_state, input_ids, target_ids, target_mask, position_ids, decoder_segment_ids, deterministic
