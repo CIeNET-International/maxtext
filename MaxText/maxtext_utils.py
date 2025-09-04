@@ -21,6 +21,7 @@ import pickle
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
+from flax import nnx
 
 import numpy as np
 
@@ -248,9 +249,7 @@ def calculate_llama4_attention_tflops(config):
   num_chunked_layers = num_layers - num_global_layers
 
   # FLOPs for a single global attention layer (full attention, non-causal)
-  global_attention_flops_per_layer = (
-      4 * config.per_device_batch_size * seq_len**2 * config.num_query_heads * config.head_dim
-  )
+  global_attention_flops_per_layer = 4 * config.per_device_batch_size * seq_len**2 * config.num_query_heads * config.head_dim
 
   # FLOPs for a single chunked attention layer (non-causal)
   chunked_attention_flops_per_layer = _calculate_chunked_attention_flops_per_layer(config, seq_len, chunk_size)
@@ -277,9 +276,7 @@ def calculate_mla_tflops_per_device(config):
   else:
     # calculate query down and up flops
     q_flops = (
-        2
-        * batch_len
-        * (config.emb_dim * config.q_lora_rank + config.q_lora_rank * config.num_query_heads * qk_head_dim_sum)
+        2 * batch_len * (config.emb_dim * config.q_lora_rank + config.q_lora_rank * config.num_query_heads * qk_head_dim_sum)
     )
   # calculate mla kv projection with down and up flops
   kv_flops = (
@@ -292,9 +289,7 @@ def calculate_mla_tflops_per_device(config):
   )
   qkv_flops = q_flops + kv_flops
 
-  attention_flops = (
-      2 * batch_len * config.max_target_length * config.num_query_heads * (qk_head_dim_sum + config.v_head_dim)
-  )
+  attention_flops = 2 * batch_len * config.max_target_length * config.num_query_heads * (qk_head_dim_sum + config.v_head_dim)
   projection_flops = 2 * batch_len * config.emb_dim * config.num_query_heads * config.v_head_dim
   return qkv_flops, attention_flops, projection_flops
 
@@ -531,7 +526,7 @@ def calculate_tflops_training_per_device(config, log=True):
         config, total_ffn_flops, qkv_flops, projection_flops, embedding_flops
     )
   elif config.decoder_block == DecoderBlockType.GEMMA3:
-    attention_tflops, learnable_weight_tflops = calculate_mixed_attention_model_tflops_training_per_device (
+    attention_tflops, learnable_weight_tflops = calculate_mixed_attention_model_tflops_training_per_device(
         config, total_ffn_flops, qkv_flops, projection_flops, embedding_flops, attention_pattern_length=6
     )
   elif config.decoder_block == DecoderBlockType.GPT_OSS:
@@ -876,15 +871,32 @@ def get_nested_value(dictionary, nested_key, default=None):
   return current_level
 
 
+class TrainState(train_state.TrainState):
+  other_variables: nnx.State
+
+
 def init_decode_state(apply_fn, params) -> train_state.TrainState:
   """Init train state with null opt state for decode."""
   state = train_state.TrainState(step=0, apply_fn=apply_fn, params=params, tx=None, opt_state={})  # type: ignore
   return state
 
 
+def init_decode_state_nnx(apply_fn, params, other_variables) -> train_state.TrainState:
+  """Init train state with null opt state for decode."""
+  state = TrainState(step=0, apply_fn=apply_fn, params=params, other_variables=other_variables, tx=None, opt_state={})  # type: ignore
+  return state
+
+
 def init_training_state(apply_fn, params, tx):
   """Init train state with null opt state for decode."""
   state = train_state.TrainState.create(apply_fn=apply_fn, params=params, tx=tx)
+  return state
+
+
+def init_training_state_nnx(apply_fn, params, other_variables, tx):
+  """Init train state with null opt state for decode."""
+
+  state = TrainState.create(apply_fn=apply_fn, params=params, other_variables=other_variables, tx=tx)
   return state
 
 
@@ -908,6 +920,26 @@ def init_initial_state(model, tx, config, is_training, key):
   if is_training:
     return init_training_state(model.apply, model_vars, tx)
   return init_decode_state(model.apply, model_vars)
+
+
+def init_initial_state_nnx(graphdef, params, other_variables, tx, config, is_training, key):
+  """
+  We pass in "static" objects like model, tx, config as JAX compares them by
+  object hash, and instantiating them inside causes pjit top-level annotations
+  to fail to match as pytree prefixes if we re-instantiate.
+
+  Args: model, tx, config, is_training, key
+  """
+  """
+  if is_training:
+    model.train()
+  else:
+    model.eval()
+  graphdef, params, other_variables = nnx.split(model, nnx.Param, ...)
+  """
+  if is_training:
+    return init_training_state_nnx(graphdef.apply, params, other_variables, tx)
+  return init_decode_state_nnx(graphdef.apply, params, other_variables)
 
 
 def setup_decode_state(model, config, rng, mesh, checkpoint_manager):
