@@ -145,17 +145,23 @@ class MTPBlockTestModel(nnx.Module):
     )
     # decoder_for_mtp = nnx_wrappers.ToNNX(decoder, rngs=rngs)
 
-    multi_token_prediction_block = multi_token_prediction.MultiTokenPredictionBlock(
+    self.multi_token_prediction_block = multi_token_prediction.MultiTokenPredictionBlock(
       config=self.config,
       mesh=self.mesh,
       name="mtp_block",
       transformer_layer_module=DecoderLayer,
       decoder=decoder_for_mtp
     )
-    self.mtp_block = nnx_wrappers.ToNNX(multi_token_prediction_block, rngs=nnx.Rngs(params=0))
+    self.mtp_block = nnx_wrappers.ToNNX(self.multi_token_prediction_block, rngs=nnx.Rngs(params=0))
 
   def __call__(
-      self, main_hidden_state, input_ids, target_ids, target_mask, position_ids, decoder_segment_ids, deterministic
+      self,
+      main_hidden_state,
+      input_ids, target_ids,
+      target_mask, position_ids,
+      decoder_segment_ids,
+      deterministic,
+      mutable
   ):
     return self.mtp_block(
         self.shared_embedding,
@@ -166,6 +172,7 @@ class MTPBlockTestModel(nnx.Module):
         position_ids,
         decoder_segment_ids,
         deterministic,
+        mutable=mutable
     )
 
 
@@ -195,8 +202,20 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
     self.decoder_segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
 
     self.test_model = MTPBlockTestModel(config=self.cfg, mesh=self.mesh)
-    _, self.variables, self.other_variables = nnx.split(self.test_model, nnx.Param, ...)
 
+    self.test_model = nnx.bridge.lazy_init(
+        self.test_model,
+        self.main_hidden_state,
+        self.input_ids,
+        self.target_ids,
+        self.target_mask,
+        self.position_ids,
+        self.decoder_segment_ids,
+        deterministic=True,
+        mutable=None
+    )
+
+    _, self.variables, self.other_variables = nnx.split(self.test_model, nnx.Param, ...)
     '''
     self.variables = self.test_model.init(
         {"params": self.init_rng, "dropout": self.init_rng},
@@ -225,7 +244,8 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
         mutable=["mtp_losses"],
     )
     '''
-    _, captured_vars = self.test_model(
+
+    self.test_model(
         self.main_hidden_state,
         self.input_ids,
         self.target_ids,
@@ -233,7 +253,9 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
         self.position_ids,
         self.decoder_segment_ids,
         deterministic=True,
+        mutable=["mtp_losses"]
     )
+    breakpoint()
     self.assertIn("mtp_losses", captured_vars)
     sown_data = maxtext_utils.get_nested_value(captured_vars, ("mtp_losses", "mtp_block"), {})
     self.assertIn("losses", sown_data)
