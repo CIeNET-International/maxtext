@@ -253,8 +253,6 @@ class MultiTokenPredictionBlock(nn.Module):
           self.sow("mtp_acceptance", "mtp_preds", mtp_top_1_pred)
           self.sow("mtp_acceptance", "mtp_mask", rolled_target_mask)
 
-        breakpoint()
-
         # For training, save the loss components for this MTP head.
         # This is only active during a training run.
         if self.is_mutable_collection("mtp_losses"):

@@ -128,31 +128,60 @@ class MTPBlockTestModel(nnx.Module):
   def __init__(
       self,
       config: Config,
-      mesh: Mesh
+      mesh: Mesh,
+      main_hidden_state: jnp.ndarray,
+      input_ids: jnp.ndarray,
+      target_ids: jnp.ndarray,
+      target_mask: jnp.ndarray,
+      position_ids: jnp.ndarray,
+      decoder_segment_ids: jnp.ndarray,
+      rngs: nnx.Rngs | None = None,
   ):
+    """Initializes the MTP block and its dependencies for the test."""
     self.config = config
     self.mesh = mesh
-    """Initializes the MTP block and its dependencies for the test."""
-    rngs = nnx.Rngs(params=0)
+
+    self.main_hidden_state = main_hidden_state
+    self.input_ids = input_ids
+    self.target_ids = target_ids
+    self.target_mask = target_mask
+    self.position_ids = position_ids
+    self.decoder_segment_ids = decoder_segment_ids
+
+    self.rngs = nnx.Rngs(params=0) if rngs is None else rngs
     self.shared_embedding = embeddings.Embed(
       num_embeddings=self.config.vocab_size,
       num_features=self.config.base_emb_dim,
       config=self.config,
-      rngs=rngs
+      rngs=self.rngs
     )
     decoder_for_mtp = Decoder(
         config=self.config, mesh=self.mesh, name="decoder_for_mtp"
     )
     # decoder_for_mtp = nnx_wrappers.ToNNX(decoder, rngs=rngs)
 
-    self.multi_token_prediction_block = multi_token_prediction.MultiTokenPredictionBlock(
-      config=self.config,
-      mesh=self.mesh,
-      name="mtp_block",
-      transformer_layer_module=DecoderLayer,
-      decoder=decoder_for_mtp
+    self.mtp_block = nnx_wrappers.ToNNX(
+      multi_token_prediction.MultiTokenPredictionBlock(
+        config=self.config,
+        mesh=self.mesh,
+        name="mtp_block",
+        transformer_layer_module=DecoderLayer,
+        decoder=decoder_for_mtp
+      ),
+      rngs=self.rngs
     )
-    self.mtp_block = nnx_wrappers.ToNNX(self.multi_token_prediction_block, rngs=nnx.Rngs(params=0))
+    
+    # self.mtp_block = nnx.bridge.lazy_init(
+    #     nnx.bridge.ToNNX(self.multi_token_prediction_block, rngs=self.rngs),
+    #     self.shared_embedding,
+    #     self.main_hidden_state,
+    #     self.input_ids,
+    #     self.target_ids,
+    #     self.target_mask,
+    #     self.position_ids,
+    #     self.decoder_segment_ids,
+    #     deterministic=True,
+    # )
 
   def __call__(
       self,
@@ -201,18 +230,14 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
     self.position_ids = jnp.arange(self.seq_len, dtype=jnp.int32).reshape(1, -1)
     self.decoder_segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
 
-    self.test_model = MTPBlockTestModel(config=self.cfg, mesh=self.mesh)
-
-    self.test_model = nnx.bridge.lazy_init(
-        self.test_model,
-        self.main_hidden_state,
-        self.input_ids,
-        self.target_ids,
-        self.target_mask,
-        self.position_ids,
-        self.decoder_segment_ids,
-        deterministic=True,
-        mutable=None
+    self.test_model = MTPBlockTestModel(
+      config=self.cfg, mesh=self.mesh,
+      main_hidden_state=self.main_hidden_state,
+      input_ids=self.input_ids,
+      target_ids=self.target_ids,
+      target_mask=self.target_mask,
+      position_ids=self.position_ids,
+      decoder_segment_ids=self.decoder_segment_ids,
     )
 
     _, self.variables, self.other_variables = nnx.split(self.test_model, nnx.Param, ...)
@@ -255,11 +280,10 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
         deterministic=True,
         mutable=["mtp_losses"]
     )
-    breakpoint()
-    self.assertIn("mtp_losses", captured_vars)
-    sown_data = maxtext_utils.get_nested_value(captured_vars, ("mtp_losses", "mtp_block"), {})
-    self.assertIn("losses", sown_data)
-    self.assertEqual(len(sown_data["losses"]), self.cfg.mtp_num_layers)
+
+    self.assertTrue(hasattr(self.test_model.mtp_block, "losses"))
+    self.assertTrue(type(self.test_model.mtp_block.losses).__name__, "mtp_losses")
+    self.assertEqual(len(self.test_model.mtp_block.losses), self.cfg.mtp_num_layers)
 
   def test_no_sow_during_init(self):
     """Verifies no losses are sown during model initialization."""
@@ -273,8 +297,8 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
     to ensure the final loss calculation is correct.
     """
     # 1. Run the forward pass and capture the sown variables.
-    _, captured_vars = self.test_model.apply(
-        self.variables,
+
+    self.test_model(
         self.main_hidden_state,
         self.input_ids,
         self.target_ids,
@@ -283,7 +307,6 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
         self.decoder_segment_ids,
         deterministic=False,
         mutable=["mtp_losses"],
-        rngs={"dropout": self.rng},
     )
 
     # This section of the test now *becomes* the logic from train.py
@@ -291,18 +314,15 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
     final_loss_for_gradient = 100.0  # A dummy main loss
     mtp_loss_for_logging = 0.0
 
-    # 2. Define the exact path to retrieve the sown variables.
-    losses_path = ("mtp_losses", "mtp_block", "losses")
-    weights_path = ("mtp_losses", "mtp_block", "weights")
+  
+    # 2. Get the data.
+    mtp_losses = self.test_model.mtp_block.losses.value
+    mtp_weights = self.test_model.mtp_block.weights.value
 
-    # 3. Use the standard utility to get the data.
-    mtp_losses = maxtext_utils.get_nested_value(captured_vars, losses_path, default=())
-    mtp_weights = maxtext_utils.get_nested_value(captured_vars, weights_path, default=())
-
-    # 4. Perform the aggregation logic exactly as in `loss_fn`.
+    # 3. Perform the aggregation logic exactly as in `loss_fn`.
     if mtp_losses:
-      sum_of_all_mtp_losses = jnp.sum(jnp.array(mtp_losses))
-      sum_of_all_mtp_weights = jnp.sum(jnp.array(mtp_weights))
+      sum_of_all_mtp_losses = jnp.sum(jnp.array(mtp_losses)).item()
+      sum_of_all_mtp_weights = jnp.sum(jnp.array(mtp_weights)).item()
 
       self.assertGreater(sum_of_all_mtp_weights, 0)
 
@@ -313,7 +333,7 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
       mtp_loss_for_logging = scaled_mtp_loss
     # -------------------------------------------------------------
 
-    # 5. Assert that the final values are correct.
+    # 4. Assert that the final values are correct.
     # The final loss should have increased from its base value.
     self.assertGreater(final_loss_for_gradient, 100.0)
     # The logged MTP loss should be a valid, positive number.
