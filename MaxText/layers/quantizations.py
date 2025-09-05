@@ -181,8 +181,6 @@ class AqtQuantization:
     rhs_axis_metadata_wrapper = self._get_rhs_axis_metadata_wrapper(
         mesh_axes, is_tiled, replicate_scale=self.replicate_scale
     )
-    # module_path = "/".join(nn.module._context.module_stack[-1].path)
-    # print(f"quant_dg: {quant_dg}, is_tiled: {is_tiled}, module_path: {module_path}")
     aqt_dg_cls = aqt_flax.AqtDotGeneral(
         quant_dg,
         rhs_quant_mode=self.quant_mode,
@@ -721,10 +719,10 @@ def get_quantization_rule(config: Config):
           bwd_calibration_method=config.quantization_calibration_method,
           op_names=("dot_general",),
           additional_qt_config={
-              "dlhs_lhs_qtype": jnp.float8_e5m2,
-              "dlhs_rhs_qtype": jnp.float8_e4m3fn,
-              "drhs_lhs_qtype": jnp.float8_e4m3fn,
-              "drhs_rhs_qtype": jnp.float8_e5m2,
+            "dlhs_lhs_qtype": jnp.float8_e5m2,
+            "dlhs_rhs_qtype": jnp.float8_e4m3fn,
+            "drhs_lhs_qtype": jnp.float8_e4m3fn,
+            "drhs_rhs_qtype": jnp.float8_e5m2,
           },
       )
     case "fp8_gpu":

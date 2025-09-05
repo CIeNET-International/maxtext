@@ -209,9 +209,9 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
         mutable=["mtp_losses"],
     )
     self.assertTrue(hasattr(self.test_model.mtp_block, "losses"))
-    mtp_loss = self.test_model.mtp_block.losses
-    self.assertTrue(type(self.test_model.mtp_block.losses).__name__, "mtp_losses")
-    self.assertEqual(len(mtp_loss), self.cfg.mtp_num_layers)
+    mtp_losses = self.test_model.mtp_block.losses
+    self.assertTrue(type(mtp_losses).__name__, "mtp_losses")
+    self.assertEqual(len(mtp_losses), self.cfg.mtp_num_layers)
 
   def test_no_sow_during_init(self):
     """Verifies no losses are sown during model initialization."""
