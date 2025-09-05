@@ -930,13 +930,6 @@ def init_initial_state_nnx(graphdef, params, other_variables, tx, config, is_tra
 
   Args: model, tx, config, is_training, key
   """
-  """
-  if is_training:
-    model.train()
-  else:
-    model.eval()
-  graphdef, params, other_variables = nnx.split(model, nnx.Param, ...)
-  """
   if is_training:
     return init_training_state_nnx(graphdef.apply, params, other_variables, tx)
   return init_decode_state_nnx(graphdef.apply, params, other_variables)
