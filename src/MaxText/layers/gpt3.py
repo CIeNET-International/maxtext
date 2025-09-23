@@ -347,16 +347,8 @@ class Gpt3DecoderLayer(nnx.Module):
     self.mesh = mesh
     self.quant = quant
     self.rngs = rngs
-    batch_size = config.micro_batch_size_to_train_on
 
-
-    if model_mode == MODEL_MODE_PREFILL:
-      seq_len = config.max_prefill_predict_length
-    elif model_mode == MODEL_MODE_AUTOREGRESSIVE:
-      seq_len = 1
-    else:
-      seq_len = config.max_target_length
-
+    batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(config, model_mode)
     dummy_inputs_shape = (batch_size, seq_len, config.emb_dim)
 
     self.pre_self_attention_norm = Gpt3LayerNorm(
@@ -368,6 +360,7 @@ class Gpt3DecoderLayer(nnx.Module):
         use_bias=True,
         rngs=self.rngs,
     )
+
     self.mlp = MlpBlock(
         in_features=dummy_inputs_shape[-1],
         intermediate_dim=config.mlp_dim,
@@ -406,6 +399,11 @@ class Gpt3DecoderLayer(nnx.Module):
 
     self.dropout = nnx.Dropout(rate=config.dropout_rate, broadcast_dims=(-2,), rngs=self.rngs)
 
+    if model_mode == MODEL_MODE_PREFILL:
+      self.activation_axis_names = ("activation_batch", "prefill_activation_norm_length", "activation_embed")
+    else:
+      self.activation_axis_names = ("activation_batch", "activation_norm_length", "activation_embed")
+
   def __call__(
       self,
       inputs,
@@ -417,11 +415,11 @@ class Gpt3DecoderLayer(nnx.Module):
       page_state=None,
       slot=None,
   ):
-    inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_norm_length", "activation_embed"))
+    inputs = nn.with_logical_constraint(inputs, self.activation_axis_names)
     inputs = checkpoint_name(inputs, "decoder_layer_input")
     lnx = self.pre_self_attention_norm(inputs)
 
-    lnx = nn.with_logical_constraint(lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
+    lnx = nn.with_logical_constraint(lnx, self.activation_axis_names)
 
     # Self-attention block
     assert (
@@ -433,21 +431,16 @@ class Gpt3DecoderLayer(nnx.Module):
     )
 
     attention_lnx = nn.with_logical_constraint(
-        attention_lnx, ("activation_batch", "activation_norm_length", "activation_embed")
+        attention_lnx, self.activation_axis_names
     )
     attention_lnx += inputs
     # MLP block.
     mlp_lnx = self.mlp(attention_lnx, deterministic=deterministic)
-    mlp_lnx = nn.with_logical_constraint(mlp_lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
+    mlp_lnx = nn.with_logical_constraint(mlp_lnx, self.activation_axis_names)
 
     layer_output = attention_lnx + mlp_lnx
-
     layer_output = self.dropout(layer_output, deterministic=deterministic)
-
-    layer_output = nn.with_logical_constraint(
-        layer_output,
-        ("activation_batch", "activation_norm_length", "activation_embed"),
-    )
+    layer_output = nn.with_logical_constraint(layer_output, self.activation_axis_names)
 
     if self.config.record_internal_nn_metrics:
       self.sow("intermediates", "activation_mean", jnp.mean(layer_output))
