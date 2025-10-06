@@ -34,8 +34,8 @@ from MaxText.layers.decoders import Decoder
 from MaxText.layers.embeddings import Embed, embed_as_linen
 from MaxText.layers.encoders import VisionEncoder
 from MaxText.layers.quantizations import AqtQuantization as Quant
-from MaxText.layers.multi_token_prediction import MultiTokenPredictionBlock
-from MaxText.sharding import all_gather_over_fsdp
+from MaxText.layers.multi_token_prediction import MultiTokenPredictionBlock, multi_token_prediction_block_as_linen
+from MaxText.maxtext_utils import all_gather_over_fsdp
 
 # ------------------------------------------------------------------------------
 # The network: Transformer Definitions
@@ -55,7 +55,9 @@ class TransformerLinenPure(nn.Module):
   # We generally use MaxText.common_types.MODEL_MODE_TRAIN or
   # MaxText.common_types.MODEL_MODE_PREFILL for initializations here.
   # TODO: Make model_mode required after confirming no users are affected.
-  model_mode: str = MODEL_MODE_TRAIN  # May be different than the model_mode passed to __call__
+  model_mode: str = (
+      MODEL_MODE_TRAIN  # May be different than the model_mode passed to __call__
+  )
   # pylint: enable=attribute-defined-outside-init
 
   def init(self, *args, model_mode: str = MODEL_MODE_TRAIN, **kwargs):
@@ -79,14 +81,20 @@ class TransformerLinenPure(nn.Module):
         num_embeddings=cfg.vocab_size,
         num_features=cfg.emb_dim,
         dtype=cfg.dtype,
-        attend_dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
+        attend_dtype=jnp.float32
+        if cfg.logits_dot_in_fp32
+        else cfg.dtype,  # for logit training stability
         embedding_init=nn.initializers.normal(stddev=1.0),
         name="token_embedder",
         config=cfg,
         mesh=self.mesh,
     )
-    self.vision_encoder = VisionEncoder(config=cfg, mesh=mesh) if cfg.use_multimodal else None
-    self.decoder = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode)
+    self.vision_encoder = (
+        VisionEncoder(config=cfg, mesh=mesh) if cfg.use_multimodal else None
+    )
+    self.decoder = Decoder(
+        config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode
+    )
     # If MTP is enabled via config, set up the MTP block.
     if self.config.mtp_num_layers > 0:
       # Get the list of layer blueprints for the current model.
@@ -94,8 +102,12 @@ class TransformerLinenPure(nn.Module):
       # For MTP, we use the DecoderLayer blueprint to ensure architectural consistency.
       # By convention, this is the last layer in the list.
       mtp_layer = layer_types[-1]
-      self.mtp_block = MultiTokenPredictionBlock(
-          config=self.config, mesh=self.mesh, name="mtp_block", transformer_layer_module=mtp_layer, decoder=self.decoder
+      self.mtp_block = multi_token_prediction_block_as_linen(
+          config=self.config,
+          mesh=self.mesh,
+          transformer_layer_module=mtp_layer,
+          decoder=self.decoder,
+          rngs=self.make_rng("mtp_block"),
       )
 
   def logits_from_hidden_states(self, hidden_states, deterministic, model_mode):
@@ -103,7 +115,7 @@ class TransformerLinenPure(nn.Module):
     Compute logits from hidden states (wrapping decoder.apply_output_head).
     This function is only used for vocabulary tiling.
     """
-    logits = self.decoder.apply_output_head(
+    logits = self.decoder.apply_output_head(  # pylint: disable=protected-access
         shared_embedding=self.shared_embedding,
         y=hidden_states,
         deterministic=deterministic,
@@ -147,14 +159,20 @@ class TransformerLinenPure(nn.Module):
     bidirectional_mask = None
     image_embeddings = None
     if self.config.use_multimodal and encoder_images is not None:
-      image_embeddings = self.vision_encoder(input_images=encoder_images, deterministic=not enable_dropout)
+      image_embeddings = self.vision_encoder(
+          input_images=encoder_images, deterministic=not enable_dropout
+      )
 
       if self.config.decoder_block == DecoderBlockType.GEMMA3:
-        bidirectional_mask = decoder_input_tokens == multimodal_utils.GEMMA_TOKEN_PLACEHOLDER
+        bidirectional_mask = (
+            decoder_input_tokens == multimodal_utils.GEMMA_TOKEN_PLACEHOLDER
+        )
       elif self.config.decoder_block == DecoderBlockType.LLAMA4:
         bidirectional_mask = decoder_input_tokens == multimodal_utils.LLAMA4_PATCH_TOKEN
       elif self.config.decoder_block == DecoderBlockType.QWEN3_MOE:
-        bidirectional_mask = decoder_input_tokens == multimodal_utils.QWEN3_OMNI_IMAGE_TOKEN
+        bidirectional_mask = (
+            decoder_input_tokens == multimodal_utils.QWEN3_OMNI_IMAGE_TOKEN
+        )
 
     logits, hidden_state, kv_caches = self.decoder(
         shared_embedding=self.shared_embedding,
@@ -285,7 +303,15 @@ class Transformer(nnx.Module):
   # Make new attributes required, so that all Transformer dependencies (train, decode,
   # compile, etc) will error instead of silently use defaults.
   # pylint: disable=attribute-defined-outside-init
-  def __init__(self, config: Config, mesh: Mesh, quant: Quant, *, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rngs):
+  def __init__(
+      self,
+      config: Config,
+      mesh: Mesh,
+      quant: Quant,
+      *,
+      model_mode: str = MODEL_MODE_TRAIN,
+      rngs: nnx.Rngs,
+  ):
     """Initialize shared_embedding & decoder layers."""
     self.config = config
     self.mesh = mesh
@@ -299,18 +325,26 @@ class Transformer(nnx.Module):
         num_embeddings=cfg.vocab_size,
         num_features=cfg.emb_dim,
         dtype=cfg.dtype,
-        attend_dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
+        attend_dtype=jnp.float32
+        if cfg.logits_dot_in_fp32
+        else cfg.dtype,  # for logit training stability
         embedding_init=nn.initializers.normal(stddev=1.0),
         config=cfg,
         rngs=rngs,
     )
-    self.vision_encoder = VisionEncoder(config=cfg, mesh=mesh) if cfg.use_multimodal else None
+    self.vision_encoder = (
+        VisionEncoder(config=cfg, mesh=mesh) if cfg.use_multimodal else None
+    )
 
-    decoder_linen = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode)
+    decoder_linen = Decoder(
+        config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode
+    )
     self.decoder = nnx_wrappers.ToNNX(decoder_linen, rngs=rngs)
     self.hidden_states = None
 
-    batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(config=cfg, model_mode=model_mode)
+    batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(
+        config=cfg, model_mode=model_mode
+    )
     dummy_decoder_input_tokens = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
     dummy_decoder_positions = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
 
@@ -347,14 +381,19 @@ class Transformer(nnx.Module):
       # For MTP, we use the DecoderLayer blueprint to ensure architectural consistency.
       # By convention, this is the last layer in the list.
       mtp_layer = layer_types[-1]
-      mtp_block_linen = MultiTokenPredictionBlock(
-          config=self.config, mesh=self.mesh, name="mtp_block", transformer_layer_module=mtp_layer, decoder=self.decoder
+      self.mtp_block = MultiTokenPredictionBlock(
+          config=self.config,
+          mesh=self.mesh,
+          transformer_layer_module=mtp_layer,
+          decoder=self.decoder,
+          rngs=rngs,
       )
-      self.mtp_block = nnx_wrappers.ToNNX(mtp_block_linen, rngs=rngs)
 
       self.mtp_block.lazy_init(
           shared_embedding=self.token_embedder,
-          main_hidden_state=jnp.ones((1, 1, self.config.emb_dim), dtype=self.config.dtype),
+          main_hidden_state=jnp.ones(
+              (1, 1, self.config.emb_dim), dtype=self.config.dtype
+          ),
           input_ids=jnp.ones((1, 1), dtype=jnp.int32),
           target_ids=jnp.ones((1, 1), dtype=jnp.int32),
           target_mask=jnp.ones((1, 1), dtype=jnp.int32),
@@ -433,14 +472,20 @@ class Transformer(nnx.Module):
     bidirectional_mask = None
     image_embeddings = None
     if self.config.use_multimodal and encoder_images is not None:
-      image_embeddings = self.vision_encoder(input_images=encoder_images, deterministic=not enable_dropout)
+      image_embeddings = self.vision_encoder(
+          input_images=encoder_images, deterministic=not enable_dropout
+      )
 
       if self.config.decoder_block == DecoderBlockType.GEMMA3:
-        bidirectional_mask = decoder_input_tokens == multimodal_utils.GEMMA_TOKEN_PLACEHOLDER
+        bidirectional_mask = (
+            decoder_input_tokens == multimodal_utils.GEMMA_TOKEN_PLACEHOLDER
+        )
       elif self.config.decoder_block == DecoderBlockType.LLAMA4:
         bidirectional_mask = decoder_input_tokens == multimodal_utils.LLAMA4_PATCH_TOKEN
       elif self.config.decoder_block == DecoderBlockType.QWEN3_MOE:
-        bidirectional_mask = decoder_input_tokens == multimodal_utils.QWEN3_OMNI_IMAGE_TOKEN
+        bidirectional_mask = (
+            decoder_input_tokens == multimodal_utils.QWEN3_OMNI_IMAGE_TOKEN
+        )
 
     logits, hidden_state, kv_caches = self.decoder(
         shared_embedding=self.token_embedder,
@@ -525,7 +570,9 @@ class ZeroOneTransformer(nn.Module):
   # We generally use MaxText.common_types.MODEL_MODE_TRAIN or
   # MaxText.common_types.MODEL_MODE_PREFILL for initializations here.
   # TODO: Make model_mode required after confirming no users are affected.
-  model_mode: str = MODEL_MODE_TRAIN  # May be different than the model_mode passed to __call__
+  model_mode: str = (
+      MODEL_MODE_TRAIN  # May be different than the model_mode passed to __call__
+  )
 
   def setup(self):
     """Sets up the underlying Transformer model.
@@ -533,7 +580,9 @@ class ZeroOneTransformer(nn.Module):
     This method initializes the `self.model` attribute by calling the
     `transformer_as_linen` factory function.
     """
-    self.model = transformer_as_linen(self.config, self.mesh, self.quant, self.model_mode)
+    self.model = transformer_as_linen(
+        self.config, self.mesh, self.quant, self.model_mode
+    )
 
   def __call__(
       self,
@@ -593,7 +642,10 @@ class ZeroOneTransformer(nn.Module):
           page_state=page_state,
       )
     all_model_weights = all_gather_over_fsdp(
-        self.model.variables, partition_spec, mesh=self.mesh, logical_axis_rules=self.config.logical_axis_rules
+        self.model.variables,
+        partition_spec,
+        mesh=self.mesh,
+        logical_axis_rules=self.config.logical_axis_rules,
     )
 
     return self.model.apply(
