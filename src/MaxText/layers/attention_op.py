@@ -1272,6 +1272,9 @@ class AttentionOp(nnx.Module):
       dummy_attn_mask = jnp.zeros((1, 1, 1, self.config.max_target_length, self.config.max_target_length), dtype=jnp.uint8)
       attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
 
+    if attn_mask is not None:
+      attn_mask = jnp.where((attn_mask >= DEFAULT_MASK_VALUE * 0.5), 0, 1)
+
     dpa_layer = DotProductAttention(
         head_dim=head_dim,
         num_attention_heads=self.num_query_heads,
