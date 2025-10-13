@@ -467,6 +467,7 @@ class AttentionOp(nnx.Module):
     self.chunk_attn_window_size = chunk_attn_window_size
     self.use_ragged_attention = use_ragged_attention
     self.ragged_block_size = ragged_block_size
+    self.rngs = rngs
 
     def maybe_create_nnx(einsum, *args):
       if isinstance(einsum, nn.Module):
