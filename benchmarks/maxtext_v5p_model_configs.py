@@ -281,6 +281,9 @@ gpt_3_175b_v5p_128_sc = _add_to_model_dictionary(
         xla_flags=(
             xla_flags_library.DATA_PARALLEL_OVERLAP + xla_flags_library.ENABLE_SPARSECORE_OFFLOADING_FOR_ALL_GATHER
         ),
+        pathways_xla_flag_options={
+            xla_flags_library.REMOVE: ["--2a886c8_chip_config_name=megachip_tccontrol"],
+        },
     ),
 )
 
