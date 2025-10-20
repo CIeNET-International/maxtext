@@ -15,18 +15,29 @@
 """Transformer model definition."""
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
+
 from typing import Optional
+
+from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import Mesh
+import jax.numpy as jnp
+
 from flax import linen as nn
 from flax import nnx
-from jax.ad_checkpoint import checkpoint_name
-import jax.numpy as jnp
-from jax.sharding import Mesh
+
 from MaxText import max_utils
-from MaxText.common_types import Config, MODEL_MODE_PREFILL
+from MaxText.common_types import Config
+from MaxText.common_types import MODEL_MODE_PREFILL
 from MaxText.inference import page_manager
-from MaxText.layers import attention_mla, initializers, linears, moe, nnx_wrappers, quantizations
+from MaxText.layers import attention_mla
+from MaxText.layers import initializers
+from MaxText.layers import linears
+from MaxText.layers import moe
+from MaxText.layers import nnx_wrappers
+from MaxText.layers import quantizations
 from MaxText.layers.linears import Dropout
 from MaxText.layers.normalizations import RMSNorm
+
 # -----------------------------------------
 # The Decoder Layer for DeepSeek v3
 # -----------------------------------------
@@ -54,9 +65,7 @@ class DeepSeekGenericLayer(nnx.Module):
     self.quant = quant
     self.rngs = rngs
 
-    batch_size, sequence_length = max_utils.get_batch_seq_len_for_mode(
-        self.config, self.model_mode
-    )
+    batch_size, sequence_length = max_utils.get_batch_seq_len_for_mode(self.config, self.model_mode)
     self.dummy_inputs_shape = (batch_size, sequence_length, self.config.emb_dim)
 
     self.pre_self_attention_layer_norm = RMSNorm(
@@ -108,9 +117,7 @@ class DeepSeekGenericLayer(nnx.Module):
         rngs=rngs,
     )
 
-    self.dropout = Dropout(
-        rate=self.config.dropout_rate, broadcast_dims=(-2,), rngs=self.rngs
-    )
+    self.dropout = Dropout(rate=self.config.dropout_rate, broadcast_dims=(-2,), rngs=self.rngs)
 
   def __call__(
       self,
@@ -151,9 +158,7 @@ class DeepSeekGenericLayer(nnx.Module):
     return nn.with_logical_constraint(x, self.logical_axis_names)
 
   def dropout_op(self, x, deterministic):
-    return self.with_logical_constraint(
-        self.dropout(x, deterministic=deterministic)
-    )
+    return self.with_logical_constraint(self.dropout(x, deterministic=deterministic))
 
   def pre_attention_norm_op(self, x):
     return self.with_logical_constraint(self.pre_self_attention_layer_norm(x))
@@ -300,9 +305,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     self.DeepSeekMoeBlock_0 = moe.RoutedAndSharedMoE(
         config=self.config,
         mesh=mesh,
-        kernel_init=initializers.nd_dense_init(
-            1.0, "fan_in", "truncated_normal"
-        ),
+        kernel_init=initializers.nd_dense_init(1.0, "fan_in", "truncated_normal"),
         kernel_axes=("embed", None),
         dtype=self.config.dtype,
         weight_dtype=self.config.weight_dtype,
