@@ -282,46 +282,70 @@ class DeepSeekMoELayer(DeepSeekBatchSplitGenericLayer):
     x = self.with_logical_constraint(inputs)
     x = jax.ad_checkpoint.checkpoint_name(x, "decoder_layer_input")
 
-    def _split(x):
-      return jnp.split(x, split_factor, axis=0) if x is not None else [None] * split_factor
+    batch_dim = inputs.shape[0] if inputs is not None else 0
+    # Apply batch splitting only if the batch size is positive and evenly divisible by split_factor.
+    apply_batch_split = self.config.use_batch_split_schedule and batch_dim > 0 and batch_dim % split_factor == 0
 
-    def _merge(x):
-      return jnp.concatenate(x, axis=0)
+    if not apply_batch_split:
 
-    # Split the inputs into micro-batches.
-    x_split = _split(x)
-    dpos_split = _split(decoder_positions)
-    dseg_split = _split(decoder_segment_ids)
-
-    x_out = []
-    # Calculate micro_batch_size from the original inputs shape
-    global_batch_size = self.dummy_inputs_shape[0]
-    micro_batch_size = global_batch_size // split_factor
-
-    for i, (xi, yi, zi) in enumerate(zip(x_split, dseg_split, dpos_split)):
-      start_idx = i * micro_batch_size
-      end_idx = (i + 1) * micro_batch_size
-      batch_slice = (start_idx, end_idx)
-
-      # Attention operation on micro-batch
-      attn_output = self.attention_op(
-          self.pre_attention_norm_op(xi),
-          yi,  # decoder_segment_ids for this micro-batch
-          zi,  # decoder_positions for this micro-batch
+      # If not applying batch split, run as a single batch.
+      # The attention_op and mlp_op should handle the full input batch.
+      x = x + self.attention_op(
+          self.pre_attention_norm_op(x),
+          decoder_segment_ids,
+          decoder_positions,
           deterministic,
           previous_chunk,
           page_state,
           slot,
-          batch_slice=batch_slice, # Pass batch_slice
+          batch_slice=None,
       )
-      x_out.append(xi + attn_output)
+      x = x + self.mlp_op(self.post_attention_norm_op(x), deterministic)
 
-    x = _merge(x_out)
+    else:
 
-    # Mixture-of-experts. This operates on the *merged* batch.
-    x = x + self.mlp_op(self.post_attention_norm_op(x), deterministic)
+      def _split(x):
+        return jnp.split(x, split_factor, axis=0) if x is not None else [None] * split_factor
+
+      def _merge(x):
+        return jnp.concatenate(x, axis=0)
+
+      # Split the inputs into micro-batches.
+      x_split = _split(x)
+      dpos_split = _split(decoder_positions)
+      dseg_split = _split(decoder_segment_ids)
+
+      x_out = []
+      # Calculate micro_batch_size from the original inputs shape
+      global_batch_size = self.dummy_inputs_shape[0]
+      micro_batch_size = global_batch_size // split_factor
+
+      for i, (xi, yi, zi) in enumerate(zip(x_split, dseg_split, dpos_split)):
+        start_idx = i * micro_batch_size
+        end_idx = (i + 1) * micro_batch_size
+        batch_slice = (start_idx, end_idx)
+
+        # Attention operation on micro-batch
+        attn_output = self.attention_op(
+            self.pre_attention_norm_op(xi),
+            yi,  # decoder_segment_ids for this micro-batch
+            zi,  # decoder_positions for this micro-batch
+            deterministic,
+            previous_chunk,
+            page_state,
+            slot,
+            batch_slice=batch_slice, # Pass batch_slice
+        )
+        x_out.append(xi + attn_output)
+
+      x = _merge(x_out)
+
+      # Mixture-of-experts. This operates on the *merged* batch.
+      x = x + self.mlp_op(self.post_attention_norm_op(x), deterministic)
+    
     x = self.dropout_op(x, deterministic)
     return self.post_process(x)
+  
   def mlp_op(self, x, _):
     return self.with_logical_constraint(self.DeepSeekMoeBlock_0(x))
 
