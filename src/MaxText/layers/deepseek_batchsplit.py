@@ -57,6 +57,8 @@ class DeepSeekBatchSplitGenericLayer(nnx.Module):
     batch_size, sequence_length = max_utils.get_batch_seq_len_for_mode(self.config, model_mode)
     self.dummy_inputs_shape = (batch_size, sequence_length, self.config.emb_dim)
 
+    self.is_single_batch = batch_size == 1
+
     self.pre_attention_layer_norm = normalizations.RMSNorm(
         num_features=self.dummy_inputs_shape[-1],
         dtype=config.dtype,
@@ -150,6 +152,28 @@ class DeepSeekBatchSplitGenericLayer(nnx.Module):
           "activation_norm_length",
           "activation_embed",
       )
+
+  @property
+  def logical_axis_names(self):
+    if self.model_mode == common_types.MODEL_MODE_PREFILL:
+      if self.is_single_batch:
+        return (
+            "activation_batch_replicated",
+            "prefill_activation_norm_length",
+            "activation_embed",
+        )
+      else:
+        return (
+            "activation_batch",
+            "prefill_activation_norm_length",
+            "activation_embed",
+        )
+    return (
+        "activation_batch",
+        "activation_norm_length",
+        "activation_embed",
+    )
+
 
   def with_logical_constraint(self, x):
     return nn.with_logical_constraint(x, self.logical_axis_names)
