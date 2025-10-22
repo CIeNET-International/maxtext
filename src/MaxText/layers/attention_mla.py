@@ -588,7 +588,7 @@ class MLA(Attention):
         rngs=self.rngs,
     )
 
-  def update_mla_kv_caches(self, low_rank_main, key_rope, decoder_segment_ids, model_mode, previous_chunk=None):
+  def update_mla_kv_caches(self, low_rank_main, key_rope, decoder_segment_ids, model_mode, previous_chunk=None,batch_slice=None):
     """Updates the MLA (Multi-Head Latent Attention) KV caches.
 
     This method is specific to the MLA attention mechanism. It calls the
@@ -622,6 +622,11 @@ class MLA(Attention):
 
     if prefill_mla_cache:
       low_rank_main, key_rope, decoder_segment_ids = prefill_mla_cache
+      if batch_slice:
+        start, end = batch_slice
+        low_rank_main = low_rank_main[start:end]
+        key_rope = key_rope[start:end]
+        decoder_segment_ids = decoder_segment_ids[start:end]
       key, value = self.mla_get_key_value(low_rank_main, key_rope, model_mode)
       prefill_kv_cache = key, value, decoder_segment_ids
     else:
@@ -629,13 +634,19 @@ class MLA(Attention):
 
     if ar_mla_cache:
       low_rank_main, key_rope, decoder_segment_ids, lengths = ar_mla_cache
+      if batch_slice:
+        start, end = batch_slice
+        low_rank_main = low_rank_main[start:end]
+        key_rope = key_rope[start:end]
+        decoder_segment_ids = decoder_segment_ids[start:end]
+        lengths = lengths[start:end]
       key, value = self.mla_get_key_value(low_rank_main, key_rope, model_mode)
       ar_kv_cache = key, value, decoder_segment_ids, lengths
     else:
       ar_kv_cache = None
     return [prefill_kv_cache, ar_kv_cache]
 
-  def mla_kv_projection(self, inputs: Array, inputs_positions: Array, decoder_segment_ids, model_mode, previous_chunk):
+  def mla_kv_projection(self, inputs: Array, inputs_positions: Array, decoder_segment_ids, model_mode, previous_chunk, batch_slice=None):
     """MLA key/value projection with integrated rotary embedding."""
     low_rank = self.wkv_a(inputs)
     low_rank_main, low_rank_rope = jnp.split(low_rank, [self.kv_lora_rank], axis=-1)
@@ -652,7 +663,8 @@ class MLA(Attention):
         cached_values = self.update_kv_caches(key, value, decoder_segment_ids, model_mode, previous_chunk)
       else:
         cached_values = self.update_mla_kv_caches(
-            low_rank_main, key_rope, decoder_segment_ids, model_mode, previous_chunk
+            low_rank_main, key_rope, decoder_segment_ids, model_mode, previous_chunk,
+            batch_slice=batch_slice
         )
 
     return key, value, cached_values
@@ -670,6 +682,8 @@ class MLA(Attention):
       slot: Optional[int] = None,
       page_state: Optional[page_manager.PageState] = None,
       bidirectional_mask: Optional[Any] = None,
+      batch_slice: None | tuple[int, int] = None,
+
   ) -> Array:
     """Forward pass for MLA, reusing `AttentionOp` for the actual attention.
 
@@ -701,7 +715,8 @@ class MLA(Attention):
 
     query = self.mla_query_projection(inputs_q, inputs_positions, model_mode)
     key, value, cached_values = self.mla_kv_projection(
-        inputs_kv, inputs_positions, decoder_segment_ids, model_mode, previous_chunk
+        inputs_kv, inputs_positions, decoder_segment_ids, model_mode, previous_chunk,
+        batch_slice=batch_slice
     )
 
     query = checkpoint_name(query, "query_proj")
