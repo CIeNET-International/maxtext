@@ -40,7 +40,9 @@ from typing import Sequence
 from absl import app
 import os
 import jax
+import jax.numpy as jnp
 import pathwaysutils
+from flax import nnx
 
 from flax.linen import partitioning as nn_partitioning
 
@@ -137,12 +139,92 @@ def use_maxtext_loss_function(trainer, mt_config):
   return trainer
 
 
-def setup_trainer_state(mt_config, goodput_recorder=None):
-  """Set up prerequisites for training loop."""
+def apply_lora_to_model(base_model, mesh, mt_config, quantize=False):
+  """Applies LoRA to the base model.
+
+  Args:
+    base_model: The base MaxText model to apply LoRA to.
+    mesh: The device mesh for sharding.
+    mt_config: MaxText config containing LoRA parameters.
+    quantize: Whether to use quantized LoRA (NF4).
+
+  Returns:
+    The model with LoRA applied and properly sharded.
+  """
+  # Extract LoRA parameters from config
+  rank = getattr(mt_config, 'lora_rank', 8)
+  alpha = getattr(mt_config, 'lora_alpha', 16)
+  
+  # Define which modules to apply LoRA to
+  module_path = ".*q_einsum|.*kv_einsum|.*gate_proj|.*down_proj|.*up_proj"
+  
+  if quantize:
+    lora_provider = qwix.LoraProvider(
+        module_path=module_path,
+        rank=rank,
+        alpha=alpha,
+        weight_qtype="nf4",
+        tile_size=256,
+    )
+  else:
+    lora_provider = qwix.LoraProvider(
+        module_path=module_path,
+        rank=rank,
+        alpha=alpha,
+    )
+
+  # Create dummy inputs for LoRA tracing using the same method as Transformer.__init__().
+  # qwix.apply_lora_to_model() needs model inputs for NNX models to trace the computation graph.
+  # We use the same utility function that the Transformer model uses internally during initialization.
+  batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(
+      config=base_model.config, 
+      model_mode=base_model.model_mode
+  )
+  
+  dummy_decoder_input_tokens = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+  dummy_decoder_positions = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+  dummy_decoder_segment_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+
+  # Create model_input dictionary to be unpacked as keyword arguments
+  model_input = {
+      'decoder_input_tokens': dummy_decoder_input_tokens,
+      'decoder_positions': dummy_decoder_positions,
+      'decoder_segment_ids': dummy_decoder_segment_ids
+  }
+
+  # Apply LoRA to the model, unpacking model_input as keyword arguments
+  lora_model = qwix.apply_lora_to_model(base_model, lora_provider, **model_input)
+
+  # Apply sharding constraints
+  with mesh:
+    state = nnx.state(lora_model)
+    pspecs = nnx.get_partition_spec(state)
+    sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
+    nnx.update(lora_model, sharded_state)
+
+  return lora_model
+
+
+def train(mt_config, goodput_recorder=None):
+  """Runs the SFT training loop.
+
+  Args:
+    mt_config: MaxText config.
+    goodput_recorder: An optional GoodputRecorder to record performance metrics.
+  """
   tunix_config = get_tunix_config(mt_config)
 
   with maybe_record_goodput(goodput_recorder, GoodputEvent.TPU_INIT):
     model, mesh = model_creation_utils.create_nnx_model(mt_config)
+    
+    # Apply LoRA if enabled
+    use_lora = getattr(mt_config, 'use_lora', False)
+    if use_lora:
+      max_logging.log("Applying LoRA to the model...")
+      quantize_lora = getattr(mt_config, 'quantize_lora', False)
+      model = apply_lora_to_model(model, mesh, mt_config, quantize=quantize_lora)
+      max_logging.log("LoRA applied successfully")
+    
     learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(mt_config)
     optimizer = optimizers.get_optimizer(mt_config, learning_rate_schedule)
 
