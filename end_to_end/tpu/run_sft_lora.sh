@@ -69,7 +69,7 @@ if [ -z "${PRE_TRAINED_MODEL_CKPT_PATH}" ]; then
       hf_access_token=${HF_TOKEN} \
       base_output_directory=${CONVERTED_CKPT_DIR} \
       scan_layers=True
-  export PRE_TRAINED_MODEL_CKPT_PATH=${CONVERTED_CKPT_DIR}/0.orbax-checkpoint-tmp/items
+  export PRE_TRAINED_MODEL_CKPT_PATH=${CONVERTED_CKPT_DIR}/0/items
 fi
 echo "Running LoRA fine-tuning on checkpoint: ${PRE_TRAINED_MODEL_CKPT_PATH}"
 
