@@ -52,6 +52,7 @@ set -xe
 RUN_NAME=$(date +%Y-%m-%d-%H-%M-%S)
 PRE_TRAINED_MODEL=llama3.1-8b
 PRE_TRAINED_MODEL_TOKENIZER=meta-llama/Llama-3.1-8B-Instruct
+PER_DEVICE_BATCH_SIZE=1
 
 # Set default LoRA parameters if not provided
 LORA_RANK=${LORA_RANK:-8}
@@ -68,7 +69,7 @@ if [ -z "${PRE_TRAINED_MODEL_CKPT_PATH}" ]; then
       hf_access_token=${HF_TOKEN} \
       base_output_directory=${CONVERTED_CKPT_DIR} \
       scan_layers=True
-  export PRE_TRAINED_MODEL_CKPT_PATH=${CONVERTED_CKPT_DIR}/0/items
+  export PRE_TRAINED_MODEL_CKPT_PATH=${CONVERTED_CKPT_DIR}/0.orbax-checkpoint-tmp/items
 fi
 echo "Running LoRA fine-tuning on checkpoint: ${PRE_TRAINED_MODEL_CKPT_PATH}"
 
