@@ -138,6 +138,27 @@ def use_maxtext_loss_function(trainer, mt_config):
   trainer = trainer.with_loss_fn(loss_func, has_aux=True)
   return trainer
 
+def gen_model_input_for_lora(x):
+  """Transform training batch to model input format for LoRA training.
+  
+  Converts Tunix training input to MaxText model input format.
+  This is necessary for LoRA training because the frozen base model
+  requires properly formatted inputs to work with the adapters.
+  
+  Args:
+    x: Tunix TrainingInput containing input_tokens and other fields.
+    
+  Returns:
+    Dictionary with keys matching the model's __call__ signature.
+  """
+  return {
+      'input_tokens': x.input_tokens,
+      'input_position': x.input_positions if hasattr(x, 'input_positions') else jnp.arange(x.input_tokens.shape[1])[None, :],
+      'input_segmentation': x.input_segmentation if hasattr(x, 'input_segmentation') else jnp.ones_like(x.input_tokens),
+      'target_tokens': x.target_tokens if hasattr(x, 'target_tokens') else x.input_tokens,
+      'target_position': x.target_positions if hasattr(x, 'target_positions') else jnp.arange(x.input_tokens.shape[1])[None, :],
+      'target_segmentation': x.target_segmentation if hasattr(x, 'target_segmentation') else jnp.ones_like(x.input_tokens),
+  }
 
 def create_model_input_for_lora(base_model):
   """Creates dummy model input for LoRA tracing.
@@ -254,20 +275,31 @@ def train(mt_config, goodput_recorder=None):
       quantize_lora = getattr(mt_config, "quantize_lora", False)
       model = apply_lora_to_model(model, mesh, mt_config, quantize=quantize_lora)
       max_logging.log("LoRA applied successfully")
-    
+      nnx.display(model)
+
+
     learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(mt_config)
     optimizer = optimizers.get_optimizer(mt_config, learning_rate_schedule)
 
   with maybe_record_goodput(goodput_recorder, GoodputEvent.TRAINING_PREPARATION):
     training_hooks = hooks.SFTTrainingHooks(mt_config, mesh, learning_rate_schedule, goodput_recorder)
     data_hooks = hooks.SFTDataHooks(mt_config, mesh, goodput_recorder)
+    
+    lora_enabled = utils.is_lora_enabled(model)
+    max_logging.log(f"LoRA enabled: {lora_enabled}")
 
     trainer = peft_trainer.PeftTrainer(model, optimizer, tunix_config)
     trainer.with_training_hooks(training_hooks)
     trainer.with_data_hooks(data_hooks)
+
+    if lora_enabled:
+      trainer.with_gen_model_input_fn(gen_model_input_for_lora)
+
     trainer = use_maxtext_loss_function(trainer, mt_config)
 
-  return trainer, mesh
+
+  with mesh, nn_partitioning.axis_rules(mt_config.logical_axis_rules):
+    trainer.train(data_hooks.train_data_iterator, data_hooks.eval_data_iterator)
 
 
 def train_model(mt_config, trainer, mesh):
