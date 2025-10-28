@@ -231,8 +231,9 @@ def apply_lora_to_model(base_model, mesh, mt_config, quantize=False):
   alpha = getattr(mt_config, "lora_alpha", 16)
   
   # Define which modules to apply LoRA to
-  module_path = ".*q_einsum|.*kv_einsum|.*gate_proj|.*down_proj|.*up_proj"
-  
+  # module_path = ".*q_einsum|.*kv_einsum|.*gate_proj|.*down_proj|.*up_proj"
+  module_path = ".*query|.*key|.*value|.*wi_0|.*wi_1|.*wo|.*self_attention/out"
+
   if quantize:
     lora_provider = qwix.LoraProvider(
         module_path=module_path,
