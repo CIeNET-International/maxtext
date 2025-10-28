@@ -19,6 +19,7 @@ use_sft: True
 sft_train_on_completion_only: True
 packing: True
 learning_rate: 2.e-5
+learning_rate_schedule_steps: 10000
 
 # -------------- HF pipeline --------------
 dataset_type: hf
