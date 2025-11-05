@@ -31,6 +31,7 @@ from orbax import checkpoint as ocp
 from functools import partial
 from etils import epath
 
+
 def from_config(
     config: pyconfig.HyperParameters,
     devices: Sequence[jax.Device] | None = None,
@@ -74,9 +75,7 @@ def from_config(
   return model
 
 
-def get_transformer_model(
-    config, mesh, quant, rngs: nnx.Rngs, model_mode: str = MODEL_MODE_TRAIN
-) -> nn.Module:
+def get_transformer_model(config, mesh, quant, rngs: nnx.Rngs, model_mode: str = MODEL_MODE_TRAIN) -> nn.Module:
   """Returns the transformer model based on the configuration."""
   if config.model_fsdp_ag_once:
     return models.ZeroOneTransformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
@@ -94,6 +93,7 @@ def create_model(config, mesh, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rng
 
 def create_nnx_model(config, mesh=None, devices=None, model_mode=MODEL_MODE_TRAIN, rng_key=None):
   """Creates a NNX model with sharded parameters, possibly loading from a checkpoint."""
+
   def _create_model(mesh: Mesh | None = None, model_mode: str = MODEL_MODE_TRAIN, rng_key: jax.Array | None = None):
     if rng_key is None:
       rng_key = jax.random.PRNGKey(config.init_weights_seed)
