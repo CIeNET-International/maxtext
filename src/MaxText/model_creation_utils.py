@@ -94,9 +94,13 @@ def get_transformer_model(config, mesh, quant, rngs: nnx.Rngs | None = None, mod
   """Returns the transformer model based on the configuration."""
   # TODO: use nnx model instead of flax linen model
 
-  rngs = rngs or nnx.Rngs(params=jax.random.PRNGKey(config.init_weights_seed), dropout=1)
   if config.model_fsdp_ag_once:
+    if rngs is not None:
+      return models.ZeroOneTransformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
     return models.zero_one_transformer_as_linen(config, mesh, quant=quant, model_mode=model_mode,rngs=rngs)
+  else:
+    if rngs is not None:
+      return models.Transformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
   return models.transformer_as_linen(config, mesh, quant=quant,model_mode=model_mode,rngs=rngs)
 
 
