@@ -19,6 +19,7 @@ import functools
 import pickle
 
 from flax import linen as nn
+from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
 
@@ -294,9 +295,7 @@ def calculate_llama4_attention_tflops(config):
   num_chunked_layers = num_layers - num_global_layers
 
   # FLOPs for a single global attention layer (full attention, non-causal)
-  global_attention_flops_per_layer = (
-      4 * config.per_device_batch_size * seq_len**2 * config.num_query_heads * config.head_dim
-  )
+  global_attention_flops_per_layer = 4 * config.per_device_batch_size * seq_len**2 * config.num_query_heads * config.head_dim
 
   # FLOPs for a single chunked attention layer (non-causal)
   chunked_attention_flops_per_layer = _calculate_chunked_attention_flops_per_layer(config, seq_len, chunk_size)
@@ -323,9 +322,7 @@ def calculate_mla_tflops_per_device(config):
   else:
     # calculate query down and up flops
     q_flops = (
-        2
-        * batch_len
-        * (config.emb_dim * config.q_lora_rank + config.q_lora_rank * config.num_query_heads * qk_head_dim_sum)
+        2 * batch_len * (config.emb_dim * config.q_lora_rank + config.q_lora_rank * config.num_query_heads * qk_head_dim_sum)
     )
   # calculate mla kv projection with down and up flops
   kv_flops = (
@@ -338,9 +335,7 @@ def calculate_mla_tflops_per_device(config):
   )
   qkv_flops = q_flops + kv_flops
 
-  attention_flops = (
-      2 * batch_len * config.max_target_length * config.num_query_heads * (qk_head_dim_sum + config.v_head_dim)
-  )
+  attention_flops = 2 * batch_len * config.max_target_length * config.num_query_heads * (qk_head_dim_sum + config.v_head_dim)
   projection_flops = 2 * batch_len * config.emb_dim * config.num_query_heads * config.v_head_dim
   return qkv_flops, attention_flops, projection_flops
 
@@ -721,33 +716,34 @@ def init_decode_state(apply_fn, params) -> train_state.TrainState:
 
 
 def init_training_state(apply_fn, params, tx):
-  """Init train state with null opt state for decode."""
+  """Init train state for training."""
   state = train_state.TrainState.create(apply_fn=apply_fn, params=params, tx=tx)
   return state
 
 
 def init_initial_state(model, tx, config, is_training, key):
-  """
-  We pass in "static" objects like model, tx, config as JAX compares them by
-  object hash, and instantiating them inside causes pjit top-level annotations
-  to fail to match as pytree prefixes if we re-instantiate.
+  """Initialize training or decode state from an NNX model.
 
-  Args: model, tx, config, is_training, key
+  Args:
+    model: NNX model (already initialized)
+    tx: Optax optimizer transformation
+    config: Configuration object
+    is_training: True for training, False for decode
+    key: PRNG key (unused, kept for API compatibility)
+
+  Returns:
+    TrainState with model parameters and optimizer state.
+
+  Note:
+    Extracts only trainable parameters from the NNX model. The model structure
+    and RNG state are discarded as they're managed by the model object itself.
   """
-  input_shape = (config.micro_batch_size_to_train_on, config.max_target_length)
-  image_shape = multimodal_utils.get_dummy_image_shape_for_init(
-      config.model_name, batch_size=config.micro_batch_size_to_train_on
-  )
-  model_vars = model.init(
-      {"params": key, "dropout": key, "aqt": key},
-      np.ones(input_shape, dtype=jnp.int32),
-      np.ones(input_shape, dtype=jnp.int32),
-      encoder_images=np.ones(image_shape, dtype=jnp.int32) if config.use_multimodal else None,
-      # nnx_method="no_op",
-  )
+  # Extract only trainable parameters; discard structure and RNG state
+  _, params, _ = nnx.split(model, nnx.Param, ...)
+
   if is_training:
-    return init_training_state(model.apply, model_vars, tx)
-  return init_decode_state(model.apply, model_vars)
+    return init_training_state(None, params, tx)
+  return init_decode_state(None, params)
 
 
 def setup_decode_state(model, config, rng, mesh, checkpoint_manager):
@@ -887,7 +883,24 @@ def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
   with nn_partitioning.axis_rules(config.logical_axis_rules):
     abstract_state = jax.eval_shape(init_state_partial)
 
-  state_logical_annotations = nn.get_partition_spec(abstract_state)
+  # For NNX models, get partition specs from the model's NNX parameters
+  # The model has nnx.Param(..., sharding=...) annotations that we need to preserve
+  graphdef, model_params_state, model_other_vars = nnx.split(model, nnx.Param, ...)
+  param_partition_specs = nnx.get_partition_spec(model_params_state)
+
+  # Extract PartitionSpec values from the NNX State structure
+  param_logical_annotations = jax.tree.map(
+      lambda x: x.value if isinstance(x, nnx.VariableState) else x,
+      param_partition_specs,
+      is_leaf=lambda x: isinstance(x, nnx.VariableState),
+  )
+
+  # Get partition specs for the entire state (to handle opt_state, step, etc.)
+  # This will return None for fields without annotations
+  full_state_logical_annotations = nn.get_partition_spec(abstract_state)
+
+  # Replace just the params field with NNX partition specs
+  state_logical_annotations = full_state_logical_annotations.replace(params=param_logical_annotations)
 
   state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
   if is_training and config.shard_optimizer_over_data:

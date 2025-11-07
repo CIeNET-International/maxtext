@@ -90,18 +90,20 @@ def from_config(
   return model
 
 
-def get_transformer_model(config, mesh, quant, rngs: nnx.Rngs | None = None, model_mode: str = MODEL_MODE_TRAIN)->nn.Module:
+def get_transformer_model(
+    config, mesh, quant, rngs: nnx.Rngs | None = None, model_mode: str = MODEL_MODE_TRAIN
+) -> nn.Module:
   """Returns the transformer model based on the configuration."""
   # TODO: use nnx model instead of flax linen model
 
   if config.model_fsdp_ag_once:
     if rngs is not None:
       return models.ZeroOneTransformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
-    return models.zero_one_transformer_as_linen(config, mesh, quant=quant, model_mode=model_mode,rngs=rngs)
+    return models.zero_one_transformer_as_linen(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
   else:
     if rngs is not None:
       return models.Transformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
-  return models.transformer_as_linen(config, mesh, quant=quant,model_mode=model_mode,rngs=rngs)
+  return models.transformer_as_linen(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
 
 
 def create_model(config, mesh, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rngs | None = None):
