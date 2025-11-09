@@ -149,7 +149,7 @@ class LayerwiseQuantization:
 
   def _load_layer(self, layer_name):
     """Loads a specific layer's parameters from the checkpoint."""
-
+    breakpoint()
     config = self.config
     with nn_partitioning.axis_rules(config.logical_axis_rules):
       params = checkpointing.load_params_from_path(
@@ -172,8 +172,19 @@ class LayerwiseQuantization:
         A new abstract params structure with ocp.PLACEHOLDER for skipped nodes.
     """
 
+    def _get_key_string(key_obj):
+      # 1. Try '.name' (common for GetAttrKey/NNX)
+      if hasattr(key_obj, "name"):
+        return key_obj.name
+      # 2. Try '.key' (common for DictKey/legacy structures)
+      if hasattr(key_obj, "key"):
+        return key_obj.key
+      # 3. Fallback to string coercion and remove leading special chars (e.g., '.step')
+      s = str(key_obj)
+      return s.lstrip(".")
+
     def _should_keep(path, _):
-      if layer in [x.key for x in path]:
+      if layer in [_get_key_string(x) for x in path]:
         return True
       return False
 

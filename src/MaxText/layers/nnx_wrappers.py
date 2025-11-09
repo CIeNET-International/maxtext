@@ -351,6 +351,9 @@ def _fix_for_qwix_quantization(module: Module):
       nn_module.scope.path += (name,)
       try:
         return call_fn(*args, **kwargs)
+      except Exception as e:
+        breakpoint()
+        raise RuntimeError(f"Failed to call module at path {nn_module.scope.path} : {e}") from e
       finally:
         nn_module.scope.path = old_path
 
@@ -359,13 +362,18 @@ def _fix_for_qwix_quantization(module: Module):
   for path, node in nnx.iter_graph(module):
     # Only enable it on non-root nnx modules.
     if path and isinstance(node, nnx.Module):
-      node.__class__ = type(
-          node.__class__.__name__,
-          (node.__class__,),
-          {
-              "__call__": wrap(node.__class__.__call__, str(path[-1])),
-          },
-      )
+      try:
+
+        node.__class__ = type(
+            node.__class__.__name__,
+            (node.__class__,),
+            {
+                "__call__": wrap(node.__class__.__call__, str(path[-1])),
+            },
+        )
+      except Exception as e:
+        breakpoint()
+        raise RuntimeError(f"Failed to wrap __call__ of module at path {path}.") from e
 
   # Set the correct weight names. We call QtProvider.process_model_inputs here
   # to avoid using Qwix internal APIs.
