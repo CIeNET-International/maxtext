@@ -37,6 +37,7 @@ from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 from absl import app
+from aqt.jax.v2 import aqt_tensor
 
 from flax.linen import partitioning as nn_partitioning
 from flax import nnx
@@ -52,6 +53,64 @@ import orbax.checkpoint as ocp
 
 IGNORE = ocp.PLACEHOLDER
 PRNGKeyType = Any
+
+
+def get_param_paths_to_remove(aqt_vars_layer):
+  """
+  Identifies paths in the original parameter tree that correspond to
+  QTensor leaves in the aqt_vars_layer tree.
+  """
+  if not isinstance(aqt_vars_layer, dict):
+    return []
+
+  try:
+    aqt_flat, _ = jax.tree_util.tree_flatten_with_path(
+        aqt_vars_layer, is_leaf=lambda x: isinstance(x, aqt_tensor.QTensor)
+    )
+  except Exception as e:
+    print(f"Error flattening aqt_vars_layer: {e}")
+    return []
+
+  param_paths = []
+  for aqt_k, value in aqt_flat:
+    if not isinstance(value, aqt_tensor.QTensor):
+      continue
+
+    aqt_specific_index = -1
+    for idx, key_item in enumerate(aqt_k):
+      if isinstance(key_item, jax.tree_util.DictKey) and (
+          key_item.key.startswith("Aqt") or key_item.key in ["qrhs", "qlhs", "frozen", "scale"]
+      ):
+        aqt_specific_index = idx
+        break
+
+    if aqt_specific_index != -1:
+      param_prefix = aqt_k[:aqt_specific_index]
+      # Assuming the quantized parameter in the original model is always named 'kernel'
+      param_k = param_prefix + (jax.tree_util.DictKey(key="kernel"),)
+      param_paths.append(tuple(param_k))
+    else:
+      print(f"Warning: No AQT specific key found in QTensor path: {aqt_k}")
+
+  return list(set(param_paths))  # Return unique paths
+
+
+def remove_paths_from_params(params_dict, paths_to_remove):
+  """
+  Replaces the values at the specified paths in params_dict with {}.
+  """
+  if not paths_to_remove:
+    return params_dict
+
+  path_set = set(paths_to_remove)
+
+  def _map_fn(path, value):
+    current_path = tuple(path)
+    if current_path in path_set:
+      return {}  # Replace with empty dict to save memory
+    return value
+
+  return jax.tree_util.tree_map_with_path(_map_fn, params_dict)
 
 
 class LayerwiseQuantization:
@@ -132,10 +191,20 @@ class LayerwiseQuantization:
 
         _, new_vars = model_apply(params, rng_quant_params, layer)
 
-        quantized_params["aqt"]["decoder"][layer_name] = new_vars["aqt"]
-        quantized_params["params"]["decoder"][layer_name] = quantizations.remove_quantized_params(
-            params["params"], new_vars["aqt"]
-        )
+        # quantized_params["aqt"]["decoder"][layer_name] = new_vars["aqt"]
+        # quantized_params["params"]["decoder"][layer_name] = quantizations.remove_quantized_params(
+        #     params["params"], new_vars["aqt"]
+        # )
+
+        aqt_vars_this_layer = new_vars.get("aqt", {})
+        quantized_params["aqt"]["decoder"][layer_name] = aqt_vars_this_layer
+
+        # Use the new functions to find paths and remove them
+        paths_to_prune = get_param_paths_to_remove(aqt_vars_this_layer)
+        print(f"Paths to prune for layer {layer_name}: {paths_to_prune}")
+
+        pruned_params = remove_paths_from_params(params["params"], paths_to_prune)
+        quantized_params["params"]["decoder"][layer_name] = pruned_params
 
     # Load and save the layers that should not be quantized.
     unquantized_layers = ["decoder_norm", "logits_dense"]
