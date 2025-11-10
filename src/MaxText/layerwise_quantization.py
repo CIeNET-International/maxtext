@@ -149,7 +149,6 @@ class LayerwiseQuantization:
 
   def _load_layer(self, layer_name):
     """Loads a specific layer's parameters from the checkpoint."""
-    breakpoint()
     config = self.config
     with nn_partitioning.axis_rules(config.logical_axis_rules):
       params = checkpointing.load_params_from_path(
@@ -172,42 +171,23 @@ class LayerwiseQuantization:
         A new abstract params structure with ocp.PLACEHOLDER for skipped nodes.
     """
 
-    # def _get_key_string(key_obj):
-    #   # 1. Try '.name' (common for GetAttrKey/NNX)
-    #   if hasattr(key_obj, "name"):
-    #     return key_obj.name
-    #   # 2. Try '.key' (common for DictKey/legacy structures)
-    #   if hasattr(key_obj, "key"):
-    #     return key_obj.key
-    #   # 3. Fallback to string coercion and remove leading special chars (e.g., '.step')
-    #   s = str(key_obj)
-    #   return s.lstrip(".")
-
     def _should_keep(path, _):
+      # True if the layer name is part of the path
       return any(isinstance(key, jax.tree_util.DictKey) and key.key == layer for key in path)
 
     def _map_fn(path, value):
       if _should_keep(path, value):
-        # Check if the last part of the path is a dictionary key named 'scale'
-        is_scale_key = path and isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "scale"
-
-        # Check if the value is an instance of jax.ShapeDtypeStruct
-        is_shape_dtype_struct = isinstance(value, jax.ShapeDtypeStruct)
-
-        if is_scale_key and is_shape_dtype_struct:
-          # Calculate the total number of elements using jnp.prod
-          # Convert shape tuple to jnp.array for jnp.prod
-          num_elements = jnp.prod(jnp.array(value.shape))
-          # Convert the JAX scalar array to a Python int
-          return int(num_elements)
+        if isinstance(value, jax.ShapeDtypeStruct):
+          # Replace ShapeDtypeStruct with a concrete array of zeros
+          # Sharding information is not used here, but could be if needed for jax.device_put
+          return jnp.zeros(value.shape, value.dtype)
         else:
-          # Return the original value
+          # Keep other value types as is
           return value
       # Return IGNORE if not kept
       return IGNORE
 
     result = jax.tree_util.tree_map_with_path(_map_fn, abstract_unboxed_params)
-    breakpoint()
     return result
 
 
