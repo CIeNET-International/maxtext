@@ -401,8 +401,8 @@ class Decoder(nn.Module):
           ]
         else:
           return [
-              deepseek.DeepSeekDenseLayerToLinen,
-              deepseek.DeepSeekMoELayerToLinen,
+              deepseek.DeepSeekDenseLayerPureLinen,
+              deepseek.DeepSeekMoELayerPureLinen,
           ]
       case DecoderBlockType.GEMMA:
         return [gemma.GemmaDecoderLayerToLinen]
