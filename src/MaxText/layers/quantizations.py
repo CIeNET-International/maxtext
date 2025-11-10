@@ -560,35 +560,64 @@ def configure_quantization(config: Config, quant_mode_str: str = "train"):
     return AqtQuantization(quant_dg=quant_cfg, quant_mode=quant_mode, replicate_scale=replicate_scale)
   return None
 
-
 def match_aqt_and_unquantized_param(aqt_params, params):
   """match aqt and unquantized params"""
   aqt_param_flat, aqt_tree_def = jax.tree_util.tree_flatten_with_path(
       aqt_params, is_leaf=lambda x: isinstance(x, aqt_tensor.QTensor)
   )
   param_tree_flat, _ = jax.tree_util.tree_flatten_with_path(params)
-  aqt_paths = []
-  # Original path of quantized AQT param path.
-  param_paths = []
 
-  for aqt_k, _ in aqt_param_flat:
-    index = None
+  param_paths = []
+  unmatched_aqt_keys = []
+
+  print(f"Number of QTensor leaves in aqt_params: {len(aqt_param_flat)}")
+  print(f"Number of leaves in params: {len(param_tree_flat)}")
+
+  for i, (aqt_k, _) in enumerate(aqt_param_flat):
+    found_index = -1
+    matched_k = None
+
     for index, (k, _) in enumerate(param_tree_flat):
       path_depth = len(k)
-      # every quantized parameter has AQT.. as the leaf node
-      # AqtDotGeneral and AqtEinsum replace leaf node.
-      # Therefore, leaf node should be ignored for path matching
-      # Note: Aqt only operates on kernels so don't pop bias parameters.
-      # Ref: https://github.com/AI-Hypercomputer/maxtext/compare/main...quantize_r1
-      if k[: path_depth - 1] == aqt_k[: path_depth - 1] and k[-1].key != "bias":
-        aqt_paths.append(aqt_k)
-        param_paths.append(k)
-        break
-    assert index is not None
-    # since the parameter is already added, we can delete it.
-    param_tree_flat.pop(index)
-  return jax.tree_util.tree_unflatten(aqt_tree_def, param_paths)
+      if len(aqt_k) != path_depth:
+          continue
 
+      # Check if paths match up to the last element
+      if k[: path_depth - 1] == aqt_k[: path_depth - 1] and k[-1].key != "bias":
+        aqt_leaf_key = aqt_k[-1].key
+        param_leaf_key = k[-1].key
+
+        # IMPROVED CHECK: Ensure leaf keys are related
+        # Example: 'kernel_q' in aqt_params vs 'kernel' in params
+        if param_leaf_key == aqt_leaf_key or \
+           aqt_leaf_key.startswith(param_leaf_key) or \
+           param_leaf_key.startswith(aqt_leaf_key): # Adjust this heuristic
+
+          found_index = index
+          matched_k = k
+          break # Found a match for this aqt_k
+
+    if found_index != -1:
+      print(f"[{i}] Match: {aqt_k} -> {matched_k}")
+      param_paths.append(matched_k)
+      param_tree_flat.pop(found_index)
+    else:
+      print(f"[{i}] NO MATCH for aqt_k: {aqt_k}")
+      unmatched_aqt_keys.append(aqt_k)
+
+  if unmatched_aqt_keys:
+    print(f"Error: {len(unmatched_aqt_keys)} aqt paths had no match in params:")
+    for key in unmatched_aqt_keys:
+      print(f"  - {key}")
+    # Optional: print remaining paths in param_tree_flat to see available options
+    # print("Remaining paths in params:")
+    # for k, _ in param_tree_flat:
+    #     print(f"  - {k}")
+    raise ValueError(f"Failed to match all aqt params. Unmatched count: {len(unmatched_aqt_keys)}")
+
+  print(f"Number of paths collected for unflatten: {len(param_paths)}")
+
+  return jax.tree_util.tree_unflatten(aqt_tree_def, param_paths)
 
 def _get_aqt_key_paths(aqt_vars, params):
   """Generate a list of paths which have aqt state"""
