@@ -395,7 +395,9 @@ class DummyLoRAModel(nnx.Module):
   def __init__(self, rngs: nnx.Rngs):
     self.layer = nnx.Embed(num_embeddings=5, features=3, rngs=nnx.Rngs(0))
 
-  def __call__(self, x):
+  def __call__(self, decoder_input_tokens, decoder_positions):
+    x = jnp.ones((5), dtype=jnp.int32)
+
     return self.layer(x)
 
 
