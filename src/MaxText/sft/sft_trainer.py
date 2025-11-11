@@ -391,6 +391,30 @@ def log_model_comparison(base_model, lora_model, mt_config):
   
   max_logging.log("="*80 + "\n")
 
+class DummyLoRAModel(nnx.Model):
+  def __init__(self, rngs: nnx.Rngs):
+    self.layer = nnx.Embed(num_embeddings=5, features=3, rngs=rngs)
+
+  def __call__(self, x):
+    return self.layer(x)
+
+
+def train_dummy(mt_config, goodput_recorder=None):
+  tunix_config = get_tunix_config(mt_config)
+
+  init_rng = jax.random.PRNGKey(mt_config.init_weights_seed)
+
+  model = DummyLoRAModel(init_rng)
+
+  abstract_model = nnx.eval_shape(model)
+  graphdef, abstract_state = nnx.split(abstract_model)
+  specs = nnx.get_partition_spec(abstract_state)
+  mesh = abstract_model.mesh
+  quantize_lora = getattr(mt_config, "quantize_lora", False)
+
+  model = apply_lora_to_model(model, mesh, mt_config, quantize=quantize_lora)
+  lora_enabled = utils.is_lora_enabled(model)
+  print(f'lora_enabled: {lora_enabled}')
 
 def train(mt_config, goodput_recorder=None):
   """Runs the SFT training loop.
@@ -436,7 +460,8 @@ def train(mt_config, goodput_recorder=None):
     data_hooks = hooks.SFTDataHooks(mt_config, mesh, goodput_recorder)
 
     lora_enabled = utils.is_lora_enabled(model)
-    
+    assert(lora_enabled == use_lora), "LoRA enabled state mismatch between model and config"
+
     # Log LoRA training configuration
     max_logging.log("\n" + "="*80)
     max_logging.log("TRAINING CONFIGURATION")
@@ -505,8 +530,8 @@ def main(argv: Sequence[str]) -> None:
   goodput_recorder = create_goodput_recorder(mt_config)
 
   with maybe_record_goodput(goodput_recorder, GoodputEvent.JOB):
-    train(mt_config, goodput_recorder)
-
+    # train(mt_config, goodput_recorder)
+    train_dummy(mt_config, goodput_recorder)
 
 if __name__ == "__main__":
   app.run(main)
