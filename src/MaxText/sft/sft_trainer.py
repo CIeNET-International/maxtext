@@ -391,7 +391,7 @@ def log_model_comparison(base_model, lora_model, mt_config):
   
   max_logging.log("="*80 + "\n")
 
-class DummyLoRAModel(nnx.Model):
+class DummyLoRAModel(nnx.Module):
   def __init__(self, rngs: nnx.Rngs):
     self.layer = nnx.Embed(num_embeddings=5, features=3, rngs=rngs)
 
