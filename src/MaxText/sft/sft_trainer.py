@@ -393,7 +393,7 @@ def log_model_comparison(base_model, lora_model, mt_config):
 
 class DummyLoRAModel(nnx.Module):
   def __init__(self, rngs: nnx.Rngs):
-    self.layer = nnx.Embed(num_embeddings=5, features=3, rngs=rngs)
+    self.layer = nnx.Embed(num_embeddings=5, features=3, rngs=nnx.Rngs(0))
 
   def __call__(self, x):
     return self.layer(x)
