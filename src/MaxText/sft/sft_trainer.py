@@ -96,7 +96,7 @@ def get_tunix_config(mt_config):
         log_dir=mt_config.tensorboard_dir,
         skip_first_n_steps=mt_config.skip_first_n_steps_for_profiler,
         profiler_steps=mt_config.profiler_steps,
-        set_profile_options=set_profile_options,
+        # set_profile_options=set_profile_options,
     )
 
   return peft_trainer.TrainingConfig(
