@@ -883,25 +883,9 @@ def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
   with nn_partitioning.axis_rules(config.logical_axis_rules):
     abstract_state = jax.eval_shape(init_state_partial)
 
-  # For NNX models, get partition specs from the model's NNX parameters
-  # The model has nnx.Param(..., sharding=...) annotations that we need to preserve
-  graphdef, model_params_state, model_other_vars = nnx.split(model, nnx.Param, ...)
-  param_partition_specs = nnx.get_partition_spec(model_params_state)
+  state_logical_annotations = nnx.get_partition_spec(abstract_state)
 
-  # Extract PartitionSpec values from the NNX State structure
-  param_logical_annotations = jax.tree.map(
-      lambda x: x.value if isinstance(x, nnx.VariableState) else x,
-      param_partition_specs,
-      is_leaf=lambda x: isinstance(x, nnx.VariableState),
-  )
-
-  # Get partition specs for the entire state (to handle opt_state, step, etc.)
-  # This will return None for fields without annotations
-  full_state_logical_annotations = nn.get_partition_spec(abstract_state)
-
-  # Replace just the params field with NNX partition specs
-  state_logical_annotations = full_state_logical_annotations.replace(params=param_logical_annotations)
-
+  # Convert logical axis names to physical mesh axes (framework-agnostic utility, no NNX equivalent)
   state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
   if is_training and config.shard_optimizer_over_data:
     # Add data to sharding for optimizer state
