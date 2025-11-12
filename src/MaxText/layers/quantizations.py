@@ -575,6 +575,11 @@ def match_aqt_and_unquantized_param(aqt_params, params):
   # Original path of quantized AQT param path.
   param_paths = []
 
+  aqt_keys_set = set(jax.tree_util.keystr(k) for k, _ in aqt_param_flat)
+  param_keys_set = set(jax.tree_util.keystr(k) for k, _ in param_tree_flat)
+
+  print(f"DEBUG: AQT QTensor paths: {aqt_keys_set}")
+  print(f"DEBUG: Params paths: {param_keys_set}")
   for aqt_k, _ in aqt_param_flat:
     index = None
     for index, (k, _) in enumerate(param_tree_flat):
