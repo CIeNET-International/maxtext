@@ -54,6 +54,66 @@ IGNORE = ocp.PLACEHOLDER
 PRNGKeyType = Any
 
 
+def set_nnx_param(model: nnx.Module, path: tuple, value: jax.Array):
+    module = model
+    keys = []
+    for p in path:
+        if isinstance(p, jax.tree_util.DictKey):
+            keys.append(p.key)
+        elif isinstance(p, jax.tree_util.SequenceKey):
+            keys.append(p.idx)
+        elif isinstance(p, jax.tree_util.GetAttrKey):
+            keys.append(p.name)
+        else:
+            raise TypeError(f"Unsupported path key type: {type(p)} in {jax.tree_util.keystr(path)}")
+
+    current_path_str = "model"
+    for _, key in enumerate(keys[:-1]):
+        key_str = str(key)
+        if isinstance(module, nnx.Dict) and key in module:
+            module = module[key]
+            current_path_str += f"['{key_str}']"
+        elif hasattr(module, key_str):
+            module = getattr(module, key_str)
+            current_path_str += f".{key_str}"
+        else:
+            raise AttributeError(f"Module {type(module).__name__} at path '{current_path_str}' has no attribute or key '{key_str}'. Path: {jax.tree_util.keystr(path)}")
+
+    param_name = str(keys[-1])
+    if not hasattr(module, param_name):
+        raise AttributeError(f"Module {type(module).__name__} at path '{current_path_str}' has no attribute '{param_name}'. Path: {jax.tree_util.keystr(path)}")
+
+    param_attr = getattr(module, param_name)
+
+    if not isinstance(param_attr, (nnx.Param, nnx.Variable)):
+        raise TypeError(f"Attribute '{param_name}' at path {current_path_str}.{param_name} is not an nnx.Param or nnx.Variable, got {type(param_attr)}")
+    if param_attr.value.shape != value.shape:
+          print(f"Warning: Shape mismatch for {jax.tree_util.keystr(path)}: NNX has {param_attr.value.shape}, loading {value.shape}")
+    param_attr.value = value
+
+def load_weights_into_deepseek_moe_layer(nnx_model: deepseek.DeepSeekMoELayer, loaded_params: dict[str, Any]):
+    """
+    Loads weights from a Linen-style parameter dictionary into an NNX DeepSeekMoELayer.
+
+    Args:
+        nnx_model: An instance of the DeepSeekMoELayer.
+        loaded_params: A nested dictionary containing the weights, matching the
+                       structure expected by the nnx_model's attributes.
+                       This should be the part of the checkpoint corresponding to 'params'.
+    """
+    print("Starting weight loading process...")
+
+    def _load_leaf(path, leaf_array):
+        if not isinstance(leaf_array, (jax.Array, jnp.ndarray)):
+            return
+
+        try:
+            set_nnx_param(nnx_model, path, leaf_array)
+        except (AttributeError, TypeError, KeyError) as e:
+            print(f"Error loading {jax.tree_util.keystr(path)}: {e}")
+
+    jax.tree_util.tree_map_with_path(_load_leaf, loaded_params)
+    print("Weight loading process finished.")
 class LayerwiseQuantization:
   """
   Layerwise quantization for large models.
