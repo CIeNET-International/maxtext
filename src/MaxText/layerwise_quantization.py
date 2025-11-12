@@ -246,13 +246,16 @@ class LayerwiseQuantization:
 
     def _map_fn(path, value):
       if _should_keep(path, value):
-        if isinstance(value, jax.ShapeDtypeStruct):
-          # Replace ShapeDtypeStruct with a concrete array of zeros
-          # Sharding information is not used here, but could be if needed for jax.device_put
-          return jnp.zeros(value.shape, value.dtype)
-        else:
+        if not isinstance(value, jax.ShapeDtypeStruct):
           # Keep other value types as is
           return value
+
+        # Create a zeros array with the same shape and dtype
+        zeros_array = jnp.zeros(value.shape, value.dtype)
+        if hasattr(zeros_array, "sharding") and zeros_array.sharding is not None:
+          return jax.device_put(zeros_array, value.sharding)
+        return zeros_array
+
       # Return IGNORE if not kept
       return IGNORE
 
