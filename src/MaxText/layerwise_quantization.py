@@ -126,12 +126,22 @@ class LayerwiseQuantization:
         print(f"Quantizing layer {layer_prefix}_{index}")
 
         layer_name = f"{layer_prefix}_{index}"
+        print(f"\nDEBUG: --- Processing layer: {layer_name} ---")
+
+        print(f"DEBUG: Loading params for {layer_name}...")
+        
         params = self._load_layer(layer_name)
+        params["params"] = params["params"]["decoder"][layer_name]  
+        
+        print(f"DEBUG: Loaded params shapes for {layer_name}:")
+        jax.tree_util.tree_map_with_path(
+            lambda path, x: print(f"  {jax.tree_util.keystr(path)}: {x.shape}"), params["params"]
+        )
 
-        params["params"] = params["params"]["decoder"][layer_name]
+        #params["params"] = params["params"]["decoder"][layer_name]
 
-        _, new_vars = model_apply(params, rng_quant_params, layer)
-
+        #_, new_vars = model_apply(params, rng_quant_params, layer)
+        breakpoint()
         quantized_params["aqt"]["decoder"][layer_name] = new_vars["aqt"]
         quantized_params["params"]["decoder"][layer_name] = quantizations.remove_quantized_params(
             params["params"], new_vars["aqt"]
