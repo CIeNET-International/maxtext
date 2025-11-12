@@ -98,16 +98,16 @@ class LayerwiseQuantization:
     rngs = nnx.Rngs(rng)
 
     layers = [
-        deepseek.DeepSeekDenseLayerToLinen(
+        deepseek.DeepSeekDenseLayer(
             config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=rngs
         ),
-        deepseek.DeepSeekMoELayerToLinen(
+        deepseek.DeepSeekMoELayer(
             config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=rngs
         ),
-    ]
-    layer_prefixes = ["dense_layers", "moe_layers"]
+    ][::-1]
+    layer_prefixes = ["dense_layers", "moe_layers"][::-1]
     num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
-    num_layers_list = [config.first_num_dense_layers, num_moe_layers]
+    num_layers_list = [config.first_num_dense_layers, num_moe_layers][::-1]
 
     def model_apply(_p, _rng, layer):
       return layer.apply(
@@ -173,15 +173,22 @@ class LayerwiseQuantization:
     """
 
     def _should_keep(path, _):
-      if layer in [x.key for x in path]:
-        return True
-      return False
+      # True if the layer name is part of the path
+      return any(isinstance(key, jax.tree_util.DictKey) and key.key == layer for key in path)
 
     def _map_fn(path, value):
-      if _should_keep(path, value):
-        return value
-      return IGNORE
-
+      if not _should_keep(path, value):
+        return IGNORE
+      if isinstance(value, jax.ShapeDtypeStruct):
+        zeros_array = jnp.zeros(value.shape, value.dtype)
+        if value.sharding is not None:
+          try:
+            return jax.device_put(zeros_array, value.sharding)
+          except Exception as e:
+            print(f"Error applying sharding for path {path}: {e}")
+            return zeros_array
+        return zeros_array
+      return value
     return jax.tree_util.tree_map_with_path(_map_fn, abstract_unboxed_params)
 
 
