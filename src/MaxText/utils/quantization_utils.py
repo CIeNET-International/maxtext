@@ -17,18 +17,20 @@ from typing import Any, Tuple
 def get_abstract_state_nnx(model: Transformer, config: Config, mesh: Mesh) -> Tuple[Any, Any, Any]:
   """Get a shaped abstraction of the state for an NNX model (inference mode)."""
 
-  # 1. Get the abstract state tree from the initialized NNX model
-  abstract_state_tree = jax.eval_shape(lambda: nnx.state(model))
+  # 1. Get the full state tree from the model
+  state_tree = nnx.state(model)
 
   # 2. Function to extract PartitionSpec from NNX Variable metadata
-  def extract_pspec(variable: nnx.Variable) -> PartitionSpec:
-    if hasattr(variable, "sharding") and isinstance(variable.sharding, PartitionSpec):
-      return variable.sharding
+  def extract_pspec(variable: Any) -> PartitionSpec:
+    if isinstance(variable, nnx.Variable):
+      sharding = variable.sharding
+      if isinstance(sharding, PartitionSpec):
+        return sharding
     return PartitionSpec()  # Default to Replicated
 
   # 3. Map over the state tree to get PartitionSpec for each leaf
   state_logical_annotations = jax.tree_util.tree_map(
-      extract_pspec, abstract_state_tree, is_leaf=lambda x: isinstance(x, nnx.Variable)
+      extract_pspec, state_tree, is_leaf=lambda x: isinstance(x, nnx.Variable)
   )
 
   # 4. Convert PartitionSpecs to NamedShardings using the mesh
@@ -38,13 +40,16 @@ def get_abstract_state_nnx(model: Transformer, config: Config, mesh: Mesh) -> Tu
   if config.parameter_memory_host_offload:
     assert config.param_scan_axis == 0, "You must set the scan axis 0 to enable parameter offloading."
 
-    def move_to_host(path, sharding: NamedSharding) -> NamedSharding:
+    def move_to_host(sharding: NamedSharding) -> NamedSharding:
       # print(f"NNX: Applying pinned_host memory kind to {jax.tree_util.keystr(path)}")
       return sharding.with_memory_kind(kind="pinned_host")
 
     state_mesh_shardings = jax.tree_util.tree_map_with_path(
         move_to_host, state_mesh_shardings, is_leaf=lambda x: isinstance(x, NamedSharding)
     )
+
+  # Get the abstract values (shapes and dtypes) from the state tree
+  abstract_state_tree = jax.eval_shape(lambda: state_tree)
 
   # 6. Create abstract sharded state with ShapeDtypeStruct
   def create_sharded_aval(tensor_shape: jax.ShapeDtypeStruct, sharding: NamedSharding) -> jax.ShapeDtypeStruct:
