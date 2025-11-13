@@ -100,12 +100,14 @@ def set_nnx_param(model: nnx.Module, path: tuple, value: jax.Array):
   param_attr.value = value
 
 
-def load_weights_into_deepseek_moe_layer(nnx_model: deepseek.DeepSeekMoELayer, loaded_params: dict[str, Any]):
+def load_weights_into_deepseek_layer(
+    nnx_model: deepseek.DeepSeekMoELayer | deepseek.DeepSeekDenseLayer, loaded_params: dict[str, Any]
+):
   """
-  Loads weights from a Linen-style parameter dictionary into an NNX DeepSeekMoELayer.
+  Loads weights from a Linen-style parameter dictionary into deepseek nnx layer.
 
   Args:
-      nnx_model: An instance of the DeepSeekMoELayer.
+      nnx_model: An instance of the DeepSeekMoELayer or DeepSeekDenseLayer.
       loaded_params: A nested dictionary containing the weights, matching the
                      structure expected by the nnx_model's attributes.
                      This should be the part of the checkpoint corresponding to 'params'.
@@ -123,6 +125,51 @@ def load_weights_into_deepseek_moe_layer(nnx_model: deepseek.DeepSeekMoELayer, l
 
   jax.tree_util.tree_map_with_path(_load_leaf, loaded_params)
   print("Weight loading process finished.")
+
+
+def validate_loaded_params(nnx_model: nnx.Module, loaded_params: dict[str, Any]):
+  """Compares loaded_params structure and shapes/dtypes with the nnx_model's expected nnx.Params."""
+  expected_state = nnx.state(nnx_model, nnx.Param)
+
+  expected_leaves = {
+      jax.tree_util.keystr(path): leaf for path, leaf in jax.tree_util.tree_leaves_with_path(expected_state)
+  }
+  loaded_leaves = {
+      jax.tree_util.keystr(path): leaf
+      for path, leaf in jax.tree_util.tree_leaves_with_path(loaded_params)
+      if isinstance(leaf, (jax.Array, jnp.ndarray))
+  }
+
+  expected_paths = set(expected_leaves.keys())
+  loaded_paths = set(loaded_leaves.keys())
+
+  missing_from_loaded = expected_paths - loaded_paths
+  if missing_from_loaded:
+    print(f"ERROR: Parameters expected by model but not found in loaded_params: {missing_from_loaded}")
+
+  extra_in_loaded = loaded_paths - expected_paths
+  if extra_in_loaded:
+    print(f"WARNING: Parameters found in loaded_params but not expected as nnx.Param in model: {extra_in_loaded}")
+
+  common_paths = expected_paths.intersection(loaded_paths)
+  for path_str in common_paths:
+    expected_leaf = expected_leaves[path_str]
+    loaded_leaf = loaded_leaves[path_str]
+
+    if not isinstance(expected_leaf, (nnx.Param, nnx.Variable)):
+      print(f"INTERNAL WARNING: Expected leaf at {path_str} is not nnx.Param/Variable: {type(expected_leaf)}")
+      continue
+
+    expected_shape = expected_leaf.value.shape
+    loaded_shape = loaded_leaf.shape
+    if expected_shape != loaded_shape:
+      print(f"WARNING: Shape mismatch at {path_str}: " f"Model expects {expected_shape}, loaded has {loaded_shape}")
+
+    expected_dtype = expected_leaf.value.dtype
+    loaded_dtype = loaded_leaf.dtype
+    if expected_dtype != loaded_dtype:
+      print(f"WARNING: Dtype mismatch at {path_str}: " f"Model expects {expected_dtype}, loaded has {loaded_dtype}")
+  print("Validation complete.")
 
 
 class LayerwiseQuantization:
@@ -191,20 +238,6 @@ class LayerwiseQuantization:
         # The quantization will be handled separately in the layerwise approach
         layer = layer_class(config=config, mesh=self._mesh, quant=None, model_mode=model_mode, rngs=layer_rngs)
 
-        print(f"DEBUG: Loading params for {layer_name}...")
-
-        # Load checkpoint params
-        params = self._load_layer(layer_name)
-        layer_params = params["params"]["decoder"][layer_name]
-
-        print(f"DEBUG: Loaded params shapes for {layer_name}:")
-        jax.tree_util.tree_map_with_path(
-            lambda path, x: print(f"  {jax.tree_util.keystr(path)}: {x.shape}"), layer_params
-        )
-
-        # Load the checkpoint weights into the NNX module
-        load_weights_into_deepseek_moe_layer(layer, layer_params)
-
         # Call the layer directly (NNX style) - this will quantize the weights
         _ = layer(
             inputs=dummy_inputs,
@@ -220,6 +253,22 @@ class LayerwiseQuantization:
 
         # Extract params (excluding AQT-related variables)
         params_only = nnx.state(layer, nnx.Param)
+
+        print(f"DEBUG: Loading params for {layer_name}...")
+
+        # Load checkpoint params
+        params = self._load_layer(layer_name)
+        layer_params = params["params"]["decoder"][layer_name]
+
+        print(f"DEBUG: Loaded params shapes for {layer_name}:")
+        jax.tree_util.tree_map_with_path(
+            lambda path, x: print(f"  {jax.tree_util.keystr(path)}: {x.shape}"), layer_params
+        )
+
+        validate_loaded_params(layer, layer_params)
+
+        # Load the checkpoint weights into the NNX module
+        load_weights_into_deepseek_layer(layer, layer_params)
 
         # For now, extract the full params
         # The quantizations.remove_quantized_params function will handle filtering
