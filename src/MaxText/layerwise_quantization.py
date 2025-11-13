@@ -127,8 +127,46 @@ def load_weights_into_deepseek_layer(
   print("Weight loading process finished.")
 
 
+def pytree_has_arrays(tree: Any) -> bool:
+  """Checks if any leaf in the PyTree is a JAX or NumPy array."""
+  found = False
+  for x in jax.tree_util.tree_leaves(tree):
+    if isinstance(x, (jax.Array, jnp.ndarray)):
+      found = True
+      break
+  return found
+
+
 def validate_loaded_params_v3(nnx_model: nnx.Module, loaded_params: dict[str, Any]):
   print("--- Validating if loaded_params can be applied to nnx_model ---")
+  if not loaded_params:
+    print("ERROR: loaded_params dictionary is empty.")
+    print("--- Validation complete ---")
+    return
+
+  has_loaded_arrays = pytree_has_arrays(loaded_params)
+  if not has_loaded_arrays:
+    print("WARNING: No jax.Array or jnp.ndarray found in loaded_params.")
+
+  expected_state = nnx.state(nnx_model, nnx.Param)
+  model_has_params = bool(expected_state) and bool(jax.tree_util.tree_leaves(expected_state))
+
+  if not model_has_params:
+    print("WARNING: NNX model appears to have no nnx.Param attributes.")
+
+  if not has_loaded_arrays and not model_has_params:
+    print("INFO: Both loaded_params (arrays) and model (nnx.Params) are empty. Validation is trivial.")
+    print("--- Validation complete ---")
+    return
+  elif not has_loaded_arrays:
+    print("ERROR: loaded_params has no arrays, but model expects params.")
+    print("--- Validation complete ---")
+    return
+  elif not model_has_params:
+    print("ERROR: Model has no nnx.Param attributes, but loaded_params contains arrays.")
+    print("--- Validation complete ---")
+    return
+
   has_errors = False
   loaded_array_paths = set()
 
@@ -189,7 +227,6 @@ def validate_loaded_params_v3(nnx_model: nnx.Module, loaded_params: dict[str, An
   jax.tree_util.tree_map_with_path(check_leaf, loaded_params)
 
   # Check for params in model not present in loaded_params
-  expected_state = nnx.state(nnx_model, nnx.Param)
   model_param_paths = set()
   for path, leaf in jax.tree_util.tree_leaves_with_path(expected_state):
     if isinstance(leaf, nnx.Param):
@@ -221,6 +258,34 @@ def validate_post_load(nnx_model: nnx.Module, loaded_params: dict[str, Any], rto
   Call this *after* loading weights into the nnx_model.
   """
   print("--- Validating NNX Model State Against Loaded Params Dict ---")
+  if not loaded_params:
+    print("ERROR: loaded_params dictionary is empty.")
+    print("--- Validation complete ---")
+    return
+
+  has_loaded_arrays = pytree_has_arrays(loaded_params)
+  if not has_loaded_arrays:
+    print("WARNING: No jax.Array or jnp.ndarray found in loaded_params.")
+
+  expected_state = nnx.state(nnx_model, nnx.Param)
+  model_has_params = bool(expected_state) and bool(jax.tree_util.tree_leaves(expected_state))
+
+  if not model_has_params:
+    print("WARNING: NNX model appears to have no nnx.Param attributes.")
+
+  if not has_loaded_arrays and not model_has_params:
+    print("INFO: Both loaded_params (arrays) and model (nnx.Params) are empty. Validation is trivial.")
+    print("--- Validation complete ---")
+    return
+  elif not has_loaded_arrays:
+    print("ERROR: loaded_params has no arrays, but model expects params.")
+    print("--- Validation complete ---")
+    return
+  elif not model_has_params:
+    print("ERROR: Model has no nnx.Param attributes, but loaded_params contains arrays.")
+    print("--- Validation complete ---")
+    return
+
   has_errors = False
   has_warnings = False
   loaded_array_paths = set()
@@ -287,7 +352,6 @@ def validate_post_load(nnx_model: nnx.Module, loaded_params: dict[str, Any], rto
 
       # Numerical Value Validation
       if jnp.array_equal(model_array, loaded_array):
-        # print(f"  OK: Path {path_str}: Weights match exactly.")
         pass
       elif jnp.allclose(model_array, loaded_array, rtol=rtol, atol=atol):
         print(f"  OK: Path {path_str}: Weights allclose (rtol={rtol}, atol={atol}).")
@@ -306,7 +370,6 @@ def validate_post_load(nnx_model: nnx.Module, loaded_params: dict[str, Any], rto
   print(f"--- Finished comparing {len(loaded_array_paths)} array paths from loaded_params. ---")
 
   # Check for any nnx.Param in the model that WASN'T in loaded_params
-  expected_state = nnx.state(nnx_model, nnx.Param)
   model_param_paths = set()
   for path, leaf in jax.tree_util.tree_leaves_with_path(expected_state):
     if not isinstance(leaf, nnx.Param):
