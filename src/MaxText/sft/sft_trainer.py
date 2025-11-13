@@ -43,12 +43,16 @@ import jax
 import jax.numpy as jnp
 import pathwaysutils
 from flax import nnx
+import flax.linen as nn
 
 from flax.linen import partitioning as nn_partitioning
+from jax.sharding import Mesh
 
 from orbax import checkpoint as ocp
 
-from tunix.sft import metrics_logger, peft_trainer, profiler
+from tunix.sft import peft_trainer, profiler, utils
+import qwix
+from functools import partial
 
 from MaxText import max_utils
 from MaxText import max_logging
@@ -392,31 +396,56 @@ def log_model_comparison(base_model, lora_model, mt_config):
   max_logging.log("="*80 + "\n")
 
 class DummyLoRAModel(nnx.Module):
-  def __init__(self, rngs: nnx.Rngs):
+  def __init__(self, config, mesh, rngs: nnx.Rngs, model_mode="train"):
     self.layer = nnx.Embed(num_embeddings=5, features=3, rngs=nnx.Rngs(0))
-
+    self.mesh = mesh
+    self.config = config
+    self.model_mode = model_mode
   def __call__(self, decoder_input_tokens, decoder_positions):
     x = jnp.ones((5), dtype=jnp.int32)
-
     return self.layer(x)
-
 
 def train_dummy(mt_config, goodput_recorder=None):
   tunix_config = get_tunix_config(mt_config)
 
   init_rng = jax.random.PRNGKey(mt_config.init_weights_seed)
 
-  model = DummyLoRAModel(init_rng)
+  # model = DummyLoRAModel(init_rng)
+    
+  devices = None
+  def get_dummy_model():
+    rngs = nnx.Rngs(0)
+    devices_array = maxtext_utils.create_device_mesh(mt_config, devices)
+    mesh = Mesh(devices_array, mt_config.mesh_axes)
+    return DummyLoRAModel(mt_config, mesh, rngs)
 
-  abstract_model = nnx.eval_shape(model)
+
+  # breakpoint()
+  abstract_model = nnx.eval_shape(get_dummy_model) # model, jnp.ones((5), dtype=jnp.int32))
   graphdef, abstract_state = nnx.split(abstract_model)
   specs = nnx.get_partition_spec(abstract_state)
   mesh = abstract_model.mesh
   quantize_lora = getattr(mt_config, "quantize_lora", False)
 
-  model = apply_lora_to_model(model, mesh, mt_config, quantize=quantize_lora)
-  lora_enabled = utils.is_lora_enabled(model)
-  print(f'lora_enabled: {lora_enabled}')
+  #with nn.logical_axis_rules(mt_config.logical_axis_rules):
+  #  out_shardings = nn.logical_to_mesh_sharding(specs, mesh)
+
+  @partial(jax.jit) #, out_shardings=out_shardings)
+  def create_sharded_state():
+    # This will be JIT-compiled. JAX knows the output sharding and can
+    # initialize the parameters directly on the target devices in a sharded way.
+    model = get_dummy_model() 
+    return nnx.state(model)
+  breakpoint()
+  with mesh:
+    # Create the model with sharded parameters.
+    sharded_state = create_sharded_state()
+    model = nnx.merge(graphdef, sharded_state)
+
+
+    model = apply_lora_to_model(model, mesh, mt_config, quantize=quantize_lora)
+    lora_enabled = utils.is_lora_enabled(model)
+    print(f'lora_enabled: {lora_enabled}')
 
 def train(mt_config, goodput_recorder=None):
   """Runs the SFT training loop.
@@ -429,7 +458,7 @@ def train(mt_config, goodput_recorder=None):
 
   with maybe_record_goodput(goodput_recorder, GoodputEvent.TPU_INIT):
     model, mesh = model_creation_utils.create_nnx_model(mt_config)
-    
+    breakpoint()
     # Keep a reference to the base model for comparison
     base_model = model
     lora_model = None

@@ -118,7 +118,7 @@ def create_nnx_model(config, devices=None):
   def _create_model():
     init_rng = jax.random.PRNGKey(config.init_weights_seed)
     return from_config(config, devices, rngs=nnx.Rngs(params=init_rng, dropout=1))
-
+  breakpoint()
   abstract_model = nnx.eval_shape(_create_model)
   graphdef, abstract_state = nnx.split(abstract_model)
   specs = nnx.get_partition_spec(abstract_state)
