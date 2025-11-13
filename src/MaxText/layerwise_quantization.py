@@ -65,6 +65,7 @@ class LayerwiseQuantization:
 
   def __init__(self, config: Any, rngs: nnx.Rngs) -> None:
     self.config = config
+    self.rngs = rngs
 
     # TODO(ranlihao): Remove this assertion once the Layerwise quantization is supported for other decoder blocks.
     assert (
@@ -79,7 +80,7 @@ class LayerwiseQuantization:
     # Model and quantization config
     self.quant = quantizations.configure_quantization(config)
     model = models.Transformer(
-        config=config, mesh=self._mesh, quant=self.quant, model_mode=common_types.MODEL_MODE_TRAIN, rngs=rngs
+        config=config, mesh=self._mesh, quant=self.quant, model_mode=common_types.MODEL_MODE_TRAIN, rngs=self.rngs
     )
     self.unboxed_abstract_state, _, _ = get_abstract_state_nnx(model, self.config, self._mesh)
 
@@ -121,7 +122,7 @@ class LayerwiseQuantization:
         # Create a new layer instance (NNX modules are stateful)
         # Note: Don't pass quant to layer creation to avoid unbound Linen module errors
         # The quantization will be handled separately in the layerwise approach
-        layer = layer_class(config=config, mesh=self._mesh, quant=None, model_mode=model_mode, rngs=layer_rngs)
+        layer = layer_class(config=config, mesh=self._mesh, quant=None, model_mode=model_mode, rngs=self.rngs)
 
         # Convert NNX state to a format compatible with the checkpoint saving
         # The state_dict contains both Param and other Variable types
