@@ -55,65 +55,76 @@ PRNGKeyType = Any
 
 
 def set_nnx_param(model: nnx.Module, path: tuple, value: jax.Array):
-    module = model
-    keys = []
-    for p in path:
-        if isinstance(p, jax.tree_util.DictKey):
-            keys.append(p.key)
-        elif isinstance(p, jax.tree_util.SequenceKey):
-            keys.append(p.idx)
-        elif isinstance(p, jax.tree_util.GetAttrKey):
-            keys.append(p.name)
-        else:
-            raise TypeError(f"Unsupported path key type: {type(p)} in {jax.tree_util.keystr(path)}")
+  module = model
+  keys = []
+  for p in path:
+    if isinstance(p, jax.tree_util.DictKey):
+      keys.append(p.key)
+    elif isinstance(p, jax.tree_util.SequenceKey):
+      keys.append(p.idx)
+    elif isinstance(p, jax.tree_util.GetAttrKey):
+      keys.append(p.name)
+    else:
+      raise TypeError(f"Unsupported path key type: {type(p)} in {jax.tree_util.keystr(path)}")
 
-    current_path_str = "model"
-    for _, key in enumerate(keys[:-1]):
-        key_str = str(key)
-        if isinstance(module, nnx.Dict) and key in module:
-            module = module[key]
-            current_path_str += f"['{key_str}']"
-        elif hasattr(module, key_str):
-            module = getattr(module, key_str)
-            current_path_str += f".{key_str}"
-        else:
-            raise AttributeError(f"Module {type(module).__name__} at path '{current_path_str}' has no attribute or key '{key_str}'. Path: {jax.tree_util.keystr(path)}")
+  current_path_str = "model"
+  for _, key in enumerate(keys[:-1]):
+    key_str = str(key)
+    if isinstance(module, nnx.Dict) and key in module:
+      module = module[key]
+      current_path_str += f"['{key_str}']"
+    elif hasattr(module, key_str):
+      module = getattr(module, key_str)
+      current_path_str += f".{key_str}"
+    else:
+      raise AttributeError(
+          f"Module {type(module).__name__} at path '{current_path_str}' has no attribute or key '{key_str}'. Path: {jax.tree_util.keystr(path)}"
+      )
 
-    param_name = str(keys[-1])
-    if not hasattr(module, param_name):
-        raise AttributeError(f"Module {type(module).__name__} at path '{current_path_str}' has no attribute '{param_name}'. Path: {jax.tree_util.keystr(path)}")
+  param_name = str(keys[-1])
+  if not hasattr(module, param_name):
+    raise AttributeError(
+        f"Module {type(module).__name__} at path '{current_path_str}' has no attribute '{param_name}'. Path: {jax.tree_util.keystr(path)}"
+    )
 
-    param_attr = getattr(module, param_name)
+  param_attr = getattr(module, param_name)
 
-    if not isinstance(param_attr, (nnx.Param, nnx.Variable)):
-        raise TypeError(f"Attribute '{param_name}' at path {current_path_str}.{param_name} is not an nnx.Param or nnx.Variable, got {type(param_attr)}")
-    if param_attr.value.shape != value.shape:
-          print(f"Warning: Shape mismatch for {jax.tree_util.keystr(path)}: NNX has {param_attr.value.shape}, loading {value.shape}")
-    param_attr.value = value
+  if not isinstance(param_attr, (nnx.Param, nnx.Variable)):
+    raise TypeError(
+        f"Attribute '{param_name}' at path {current_path_str}.{param_name} is not an nnx.Param or nnx.Variable, got {type(param_attr)}"
+    )
+  if param_attr.value.shape != value.shape:
+    print(
+        f"Warning: Shape mismatch for {jax.tree_util.keystr(path)}: NNX has {param_attr.value.shape}, loading {value.shape}"
+    )
+  param_attr.value = value
+
 
 def load_weights_into_deepseek_moe_layer(nnx_model: deepseek.DeepSeekMoELayer, loaded_params: dict[str, Any]):
-    """
-    Loads weights from a Linen-style parameter dictionary into an NNX DeepSeekMoELayer.
+  """
+  Loads weights from a Linen-style parameter dictionary into an NNX DeepSeekMoELayer.
 
-    Args:
-        nnx_model: An instance of the DeepSeekMoELayer.
-        loaded_params: A nested dictionary containing the weights, matching the
-                       structure expected by the nnx_model's attributes.
-                       This should be the part of the checkpoint corresponding to 'params'.
-    """
-    print("Starting weight loading process...")
+  Args:
+      nnx_model: An instance of the DeepSeekMoELayer.
+      loaded_params: A nested dictionary containing the weights, matching the
+                     structure expected by the nnx_model's attributes.
+                     This should be the part of the checkpoint corresponding to 'params'.
+  """
+  print("Starting weight loading process...")
 
-    def _load_leaf(path, leaf_array):
-        if not isinstance(leaf_array, (jax.Array, jnp.ndarray)):
-            return
+  def _load_leaf(path, leaf_array):
+    if not isinstance(leaf_array, (jax.Array, jnp.ndarray)):
+      return
 
-        try:
-            set_nnx_param(nnx_model, path, leaf_array)
-        except (AttributeError, TypeError, KeyError) as e:
-            print(f"Error loading {jax.tree_util.keystr(path)}: {e}")
+    try:
+      set_nnx_param(nnx_model, path, leaf_array)
+    except (AttributeError, TypeError, KeyError) as e:
+      print(f"Error loading {jax.tree_util.keystr(path)}: {e}")
 
-    jax.tree_util.tree_map_with_path(_load_leaf, loaded_params)
-    print("Weight loading process finished.")
+  jax.tree_util.tree_map_with_path(_load_leaf, loaded_params)
+  print("Weight loading process finished.")
+
+
 class LayerwiseQuantization:
   """
   Layerwise quantization for large models.
@@ -140,7 +151,7 @@ class LayerwiseQuantization:
     rng = jax.random.PRNGKey(1234)
     self.unboxed_abstract_state, _, _ = maxtext_utils.get_abstract_state(model, None, self.config, rng, self._mesh, False)
 
-  def load_and_quantize(self, rng: None | PRNGKeyType = None) -> None:
+  def load_and_quantize(self, layer_rngs: nnx.Rngs) -> None:
     """
     Load parameters layer by layer and quantize them.
     """
@@ -154,7 +165,6 @@ class LayerwiseQuantization:
     self.quant.quant_mode = quantizations.get_quant_mode("convert")
 
     model_mode = common_types.MODEL_MODE_PREFILL
-    _, rng_quant_params = jax.random.split(rng)
 
     # Layer configurations
     layer_configs = [
@@ -163,7 +173,9 @@ class LayerwiseQuantization:
     ]
 
     # Prepare dummy inputs for quantization
-    dummy_inputs = jnp.ones((1, self.config.max_prefill_predict_length, self.config.base_emb_dim), dtype=self.config.dtype)
+    dummy_inputs = jnp.ones(
+        (1, self.config.max_prefill_predict_length, self.config.base_emb_dim), dtype=self.config.dtype
+    )
     dummy_decoder_segment_ids = jnp.zeros((1, self.config.max_prefill_predict_length), dtype=jnp.int32)
     dummy_positions = None
 
@@ -174,16 +186,10 @@ class LayerwiseQuantization:
         layer_name = f"{layer_prefix}_{index}"
         print(f"\nDEBUG: --- Processing layer: {layer_name} ---")
 
-        # Create a fresh RNG and layer instance for each quantization
-        layer_rng = jax.random.fold_in(rng, index)
-        layer_rngs = nnx.Rngs(layer_rng)
-
         # Create a new layer instance (NNX modules are stateful)
         # Note: Don't pass quant to layer creation to avoid unbound Linen module errors
         # The quantization will be handled separately in the layerwise approach
-        layer = layer_class(
-            config=config, mesh=self._mesh, quant=None, model_mode=model_mode, rngs=layer_rngs
-        )
+        layer = layer_class(config=config, mesh=self._mesh, quant=None, model_mode=model_mode, rngs=layer_rngs)
 
         print(f"DEBUG: Loading params for {layer_name}...")
 
@@ -201,16 +207,12 @@ class LayerwiseQuantization:
 
         # Call the layer directly (NNX style) - this will quantize the weights
         _ = layer(
-          inputs=dummy_inputs,
-          decoder_segment_ids=dummy_decoder_segment_ids,
-          decoder_positions=dummy_positions,
-          deterministic=True,
-          model_mode=model_mode,
+            inputs=dummy_inputs,
+            decoder_segment_ids=dummy_decoder_segment_ids,
+            decoder_positions=dummy_positions,
+            deterministic=True,
+            model_mode=model_mode,
         )
-
-        # Extract quantized params and AQT state from the NNX module
-        # Get all variables from the NNX module
-        graphdef, state_dict = nnx.split(layer)
 
         # Convert NNX state to a format compatible with the checkpoint saving
         # The state_dict contains both Param and other Variable types
@@ -219,18 +221,14 @@ class LayerwiseQuantization:
         # Extract params (excluding AQT-related variables)
         params_only = nnx.state(layer, nnx.Param)
 
-        # Extract all state to check for AQT-related variables
-        # AQT state is typically stored in separate variables or attributes
-        full_state = state_dict
-
         # For now, extract the full params
         # The quantizations.remove_quantized_params function will handle filtering
-        layer_params_dict = jax.tree_util.tree_map(lambda x: x.value if hasattr(x, 'value') else x, params_only)
+        layer_params_dict = jax.tree_util.tree_map(lambda x: x.value if hasattr(x, "value") else x, params_only)
 
         # Try to extract AQT state if it exists
         # AQT state might be stored in a separate collection or as specific attributes
         aqt_state = {}
-        if hasattr(layer, 'aqt'):
+        if hasattr(layer, "aqt"):
           aqt_state = nnx.state(layer.aqt) if isinstance(layer.aqt, nnx.Module) else {}
 
         # Use the existing helper to remove quantized params and get clean params
@@ -291,6 +289,7 @@ class LayerwiseQuantization:
             return zeros_array
         return zeros_array
       return value
+
     return jax.tree_util.tree_map_with_path(_map_fn, abstract_unboxed_params)
 
 
@@ -303,7 +302,7 @@ def main(argv: Sequence[str]) -> None:
   max_utils.print_system_information()
 
   quantization = LayerwiseQuantization(config)
-  rng = jax.random.PRNGKey(1234)
+  rng = nnx.Rngs(jax.random.PRNGKey(1234))
 
   # load_and_quantize will load a checkpoint and quantize if the following parameters are set:
   # quantization=$valid_quantization_type \
