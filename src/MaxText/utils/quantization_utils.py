@@ -28,7 +28,8 @@ def get_abstract_state_nnx(model: Transformer, config: Config, mesh: Mesh) -> Tu
         return sharding
     return PartitionSpec()  # Default to Replicated
 
-  # 3. Map over the state tree to get PartitionSpec for each leaf
+  # 3. Map over the state tree to get PartitionSpec for each Variable.
+  #    Treat nnx.Variable instances as leaves for this mapping.
   state_logical_annotations = jax.tree_util.tree_map(
       extract_pspec, state_tree, is_leaf=lambda x: isinstance(x, nnx.Variable)
   )
@@ -41,21 +42,36 @@ def get_abstract_state_nnx(model: Transformer, config: Config, mesh: Mesh) -> Tu
     assert config.param_scan_axis == 0, "You must set the scan axis 0 to enable parameter offloading."
 
     def move_to_host(sharding: NamedSharding) -> NamedSharding:
-      # print(f"NNX: Applying pinned_host memory kind to {jax.tree_util.keystr(path)}")
       return sharding.with_memory_kind(kind="pinned_host")
 
-    state_mesh_shardings = jax.tree_util.tree_map_with_path(
+    state_mesh_shardings = jax.tree_util.tree_map(
         move_to_host, state_mesh_shardings, is_leaf=lambda x: isinstance(x, NamedSharding)
     )
 
-  # Get the abstract values (shapes and dtypes) from the state tree
+  # 6. Get the abstract values (shapes and dtypes) within the Variable containers
+  # abstract_state_tree is a tree of nnx.Variable objects,
+  # where variable.value is a ShapeDtypeStruct.
   abstract_state_tree = jax.eval_shape(lambda: state_tree)
 
-  # 6. Create abstract sharded state with ShapeDtypeStruct
-  def create_sharded_aval(tensor_shape: jax.ShapeDtypeStruct, sharding: NamedSharding) -> jax.ShapeDtypeStruct:
-    return jax.ShapeDtypeStruct(tensor_shape.shape, tensor_shape.dtype, sharding=sharding)
+  # 7. Create abstract sharded state with ShapeDtypeStruct leaves
+  def create_sharded_aval(abs_var: nnx.Variable, sharding: NamedSharding) -> jax.ShapeDtypeStruct:
+    val = abs_var.value
+    if not isinstance(val, jax.ShapeDtypeStruct):
+      raise TypeError(f"Expected ShapeDtypeStruct inside abstract nnx.Variable, got {type(val)}")
+    return jax.ShapeDtypeStruct(val.shape, val.dtype, sharding=sharding)
 
-  abstract_sharded_state = jax.tree_util.tree_map(create_sharded_aval, abstract_state_tree, state_mesh_shardings)
+  # It tells tree_map to stop traversing when it encounters
+  # an nnx.Variable in abstract_state_tree or a NamedSharding in state_mesh_shardings.
+  is_leaf_func = lambda x: isinstance(x, nnx.Variable) or isinstance(x, NamedSharding)
+
+  abstract_sharded_state = jax.tree_util.tree_map(
+      create_sharded_aval,
+      abstract_state_tree,
+      state_mesh_shardings,
+      is_leaf=is_leaf_func,
+  )
+  # The result abstract_sharded_state is a tree where the leaves are ShapeDtypeStruct,
+  # reflecting the structure of nnx.state().
 
   return (abstract_sharded_state, state_logical_annotations, state_mesh_shardings)
 
