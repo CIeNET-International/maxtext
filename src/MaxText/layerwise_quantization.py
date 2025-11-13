@@ -127,49 +127,204 @@ def load_weights_into_deepseek_layer(
   print("Weight loading process finished.")
 
 
-def validate_loaded_params(nnx_model: nnx.Module, loaded_params: dict[str, Any]):
-  """Compares loaded_params structure and shapes/dtypes with the nnx_model's expected nnx.Params."""
+def validate_loaded_params_v3(nnx_model: nnx.Module, loaded_params: dict[str, Any]):
+  print("--- Validating if loaded_params can be applied to nnx_model ---")
+  has_errors = False
+  loaded_array_paths = set()
+
+  def check_leaf(path, loaded_array):
+    nonlocal has_errors
+    if not isinstance(loaded_array, (jax.Array, jnp.ndarray)):
+      return  # Skip non-arrays
+
+    path_str = jax.tree_util.keystr(path)
+    loaded_array_paths.add(path_str)
+    module = nnx_model
+    keys = []
+    try:
+      # Recreate path parts from jax.tree_util.PathKey
+      for p in path:
+        if isinstance(p, jax.tree_util.DictKey):
+          keys.append(p.key)
+        elif isinstance(p, jax.tree_util.SequenceKey):
+          keys.append(p.idx)
+        elif isinstance(p, jax.tree_util.GetAttrKey):
+          keys.append(p.name)
+        else:
+          raise TypeError(f"Unsupported path key type: {type(p)}")
+
+      current_path_str = "model"
+      # Navigate to the parent module
+      for key in keys[:-1]:
+        key_str = str(key)
+        if isinstance(module, nnx.Dict) and key in module:
+          module = module[key]
+        elif hasattr(module, key_str):
+          module = getattr(module, key_str)
+        else:
+          raise AttributeError(f"Module at path '{current_path_str}' has no attribute/key '{key_str}'")
+        current_path_str += f"['{key_str}']" if isinstance(key, (int, str)) else f".{key_str}"
+
+      param_name = str(keys[-1])
+      if not hasattr(module, param_name):
+        raise AttributeError(f"Module at path '{current_path_str}' has no attribute '{param_name}'")
+
+      param_attr = getattr(module, param_name)
+
+      if not isinstance(param_attr, nnx.Param):
+        print(f"ERROR: Path {path_str}: Attribute '{param_name}' is not an nnx.Param, got {type(param_attr).__name__}")
+        has_errors = True
+        return
+
+      expected_array = param_attr.value
+      if expected_array.shape != loaded_array.shape:
+        print(f"  WARNING: Path {path_str}: Shape mismatch. Model: {expected_array.shape}, Loaded: {loaded_array.shape}")
+      if expected_array.dtype != loaded_array.dtype:
+        print(f"  WARNING: Path {path_str}: Dtype mismatch. Model: {expected_array.dtype}, Loaded: {loaded_array.dtype}")
+
+    except Exception as e:
+      print(f"ERROR: Path {path_str}: Cannot access/validate in nnx_model: {e}")
+      has_errors = True
+
+  jax.tree_util.tree_map_with_path(check_leaf, loaded_params)
+
+  # Check for params in model not present in loaded_params
   expected_state = nnx.state(nnx_model, nnx.Param)
+  model_param_paths = set()
+  for path, leaf in jax.tree_util.tree_leaves_with_path(expected_state):
+    if isinstance(leaf, nnx.Param):
+      # Path to the nnx.Param object itself
+      model_param_paths.add(jax.tree_util.keystr(path))
+    elif isinstance(leaf, (jax.Array, jnp.ndarray)):
+      # This case happens if jax.tree_util descends into nnx.Param
+      # We need to remove the '.value' part from the path
+      if path and isinstance(path[-1], jax.tree_util.GetAttrKey) and path[-1].name == "value":
+        model_param_paths.add(jax.tree_util.keystr(path[:-1]))
+      else:
+        # Should not happen if leaf is an array from nnx.state(..., nnx.Param)
+        print(f"UNEXPECTED: Array leaf at {jax.tree_util.keystr(path)} not from a .value attribute")
 
-  expected_leaves = {
-      jax.tree_util.keystr(path): leaf for path, leaf in jax.tree_util.tree_leaves_with_path(expected_state)
-  }
-  loaded_leaves = {
-      jax.tree_util.keystr(path): leaf
-      for path, leaf in jax.tree_util.tree_leaves_with_path(loaded_params)
-      if isinstance(leaf, (jax.Array, jnp.ndarray))
-  }
-
-  expected_paths = set(expected_leaves.keys())
-  loaded_paths = set(loaded_leaves.keys())
-
-  missing_from_loaded = expected_paths - loaded_paths
+  missing_from_loaded = model_param_paths - loaded_array_paths
   if missing_from_loaded:
-    print(f"ERROR: Parameters expected by model but not found in loaded_params: {missing_from_loaded}")
+    print(f"\nWARNING: nnx.Param paths in model not found in loaded_params arrays: {sorted(list(missing_from_loaded))}")
 
-  extra_in_loaded = loaded_paths - expected_paths
-  if extra_in_loaded:
-    print(f"WARNING: Parameters found in loaded_params but not expected as nnx.Param in model: {extra_in_loaded}")
+  if not has_errors:
+    print("\nSUCCESS: loaded_params structure seems compatible with nnx_model for assignment.")
+  else:
+    print("\nValidation finished with potential issues.")
+  print("--- Validation complete ---")
 
-  common_paths = expected_paths.intersection(loaded_paths)
-  for path_str in common_paths:
-    expected_leaf = expected_leaves[path_str]
-    loaded_leaf = loaded_leaves[path_str]
 
-    if not isinstance(expected_leaf, (nnx.Param, nnx.Variable)):
-      print(f"INTERNAL WARNING: Expected leaf at {path_str} is not nnx.Param/Variable: {type(expected_leaf)}")
+def validate_post_load(nnx_model: nnx.Module, loaded_params: dict[str, Any], rtol=1e-6, atol=1e-6):
+  """
+  Validates that the nnx.Param values in nnx_model match the arrays in loaded_params.
+  Call this *after* loading weights into the nnx_model.
+  """
+  print("--- Validating NNX Model State Against Loaded Params Dict ---")
+  has_errors = False
+  has_warnings = False
+  loaded_array_paths = set()
+
+  def check_leaf(path, loaded_array):
+    nonlocal has_errors, has_warnings
+    if not isinstance(loaded_array, (jax.Array, jnp.ndarray)):
+      return  # Skip non-arrays
+
+    path_str = jax.tree_util.keystr(path)
+    loaded_array_paths.add(path_str)
+    module = nnx_model
+    keys = []
+    try:
+      # Build keys list from path
+      for p in path:
+        if isinstance(p, jax.tree_util.DictKey):
+          keys.append(p.key)
+        elif isinstance(p, jax.tree_util.SequenceKey):
+          keys.append(p.idx)
+        elif isinstance(p, jax.tree_util.GetAttrKey):
+          keys.append(p.name)
+        else:
+          raise TypeError(f"Unsupported path key type: {type(p)}")
+
+      # Navigate to the parent module
+      current_path_str = "model"
+      for key in keys[:-1]:
+        key_str = str(key)
+        if isinstance(module, nnx.Dict) and key in module:
+          module = module[key]
+        elif hasattr(module, key_str):
+          module = getattr(module, key_str)
+        else:
+          raise AttributeError(f"Module at '{current_path_str}' has no attribute/key '{key_str}'")
+        current_path_str += f"['{key_str}']" if isinstance(key, (int, str)) else f".{key_str}"
+
+      param_name = str(keys[-1])
+      if not hasattr(module, param_name):
+        raise AttributeError(f"Module at '{current_path_str}' has no attribute '{param_name}'")
+
+      param_attr = getattr(module, param_name)
+
+      if not isinstance(param_attr, nnx.Param):
+        print(
+            f"ERROR: Path {path_str}: Attribute '{param_name}' in model is not an nnx.Param, got {type(param_attr).__name__}"
+        )
+        has_errors = True
+        return
+
+      model_array = param_attr.value  # This is the array *after* assignment
+
+      # Shape Check
+      if model_array.shape != loaded_array.shape:
+        print(f"  ERROR: Path {path_str}: Shape mismatch. Model: {model_array.shape}, Loaded: {loaded_array.shape}.")
+        has_errors = True
+        return
+      # Dtype Check
+      if model_array.dtype != loaded_array.dtype:
+        print(
+            f"  WARNING: Path {path_str}: Dtype mismatch. Model: {model_array.dtype}, Loaded: {loaded_array.dtype}. Assignment might involve cast."
+        )
+        has_warnings = True
+
+      # Numerical Value Validation
+      if jnp.array_equal(model_array, loaded_array):
+        # print(f"  OK: Path {path_str}: Weights match exactly.")
+        pass
+      elif jnp.allclose(model_array, loaded_array, rtol=rtol, atol=atol):
+        print(f"  OK: Path {path_str}: Weights allclose (rtol={rtol}, atol={atol}).")
+      else:
+        diff = jnp.abs(model_array - loaded_array)
+        print(f"  ERROR: Path {path_str}: Numerical difference detected between model array and loaded array!")
+        print(f"    Max absolute difference: {jnp.max(diff)}")
+        print(f"    Mean absolute difference: {jnp.mean(diff)}")
+        has_errors = True
+
+    except Exception as e:
+      print(f"ERROR: Path {path_str}: Exception during validation: {e}")
+      has_errors = True
+
+  jax.tree_util.tree_map_with_path(check_leaf, loaded_params)
+  print(f"--- Finished comparing {len(loaded_array_paths)} array paths from loaded_params. ---")
+
+  # Check for any nnx.Param in the model that WASN'T in loaded_params
+  expected_state = nnx.state(nnx_model, nnx.Param)
+  model_param_paths = set()
+  for path, leaf in jax.tree_util.tree_leaves_with_path(expected_state):
+    if not isinstance(leaf, nnx.Param):
       continue
+    model_param_paths.add(jax.tree_util.keystr(path))
 
-    expected_shape = expected_leaf.value.shape
-    loaded_shape = loaded_leaf.shape
-    if expected_shape != loaded_shape:
-      print(f"WARNING: Shape mismatch at {path_str}: " f"Model expects {expected_shape}, loaded has {loaded_shape}")
+  missing_from_loaded = model_param_paths - loaded_array_paths
+  if missing_from_loaded:
+    print(f"\nWARNING: nnx.Param paths in model not found in loaded_params arrays: {sorted(list(missing_from_loaded))}")
+    has_warnings = True
 
-    expected_dtype = expected_leaf.value.dtype
-    loaded_dtype = loaded_leaf.dtype
-    if expected_dtype != loaded_dtype:
-      print(f"WARNING: Dtype mismatch at {path_str}: " f"Model expects {expected_dtype}, loaded has {loaded_dtype}")
-  print("Validation complete.")
+  if not has_errors and not has_warnings:
+    print("\nSUCCESS: NNX model weights are consistent with the loaded_params dictionary.")
+  elif not has_errors:
+    print("\nValidation finished with warnings.")
+  else:
+    print("\nValidation finished with ERRORS.")
+  print("--- Validation complete ---")
 
 
 class LayerwiseQuantization:
@@ -238,21 +393,9 @@ class LayerwiseQuantization:
         # The quantization will be handled separately in the layerwise approach
         layer = layer_class(config=config, mesh=self._mesh, quant=None, model_mode=model_mode, rngs=layer_rngs)
 
-        # Call the layer directly (NNX style) - this will quantize the weights
-        _ = layer(
-            inputs=dummy_inputs,
-            decoder_segment_ids=dummy_decoder_segment_ids,
-            decoder_positions=dummy_positions,
-            deterministic=True,
-            model_mode=model_mode,
-        )
-
         # Convert NNX state to a format compatible with the checkpoint saving
         # The state_dict contains both Param and other Variable types
         # We need to separate params from AQT quantization state
-
-        # Extract params (excluding AQT-related variables)
-        params_only = nnx.state(layer, nnx.Param)
 
         print(f"DEBUG: Loading params for {layer_name}...")
 
@@ -265,10 +408,25 @@ class LayerwiseQuantization:
             lambda path, x: print(f"  {jax.tree_util.keystr(path)}: {x.shape}"), layer_params
         )
 
-        validate_loaded_params(layer, layer_params)
+        # Validate structure before loading
+        validate_loaded_params_v3(layer, layer_params)
 
         # Load the checkpoint weights into the NNX module
         load_weights_into_deepseek_layer(layer, layer_params)
+
+        validate_post_load(layer, layer_params)
+
+        # Call the layer directly AFTER weights are loaded to perform quantization
+        _ = layer(
+            inputs=dummy_inputs,
+            decoder_segment_ids=dummy_decoder_segment_ids,
+            decoder_positions=dummy_positions,
+            deterministic=True,
+            model_mode=model_mode,
+        )
+
+        # Extract params (excluding AQT-related variables)
+        params_only = nnx.state(layer, nnx.Param)
 
         # For now, extract the full params
         # The quantizations.remove_quantized_params function will handle filtering
