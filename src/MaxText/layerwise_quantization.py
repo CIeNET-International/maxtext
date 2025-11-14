@@ -137,7 +137,8 @@ def pytree_has_arrays(tree: Any) -> bool:
   return found
 
 
-def validate_loaded_params_v3(nnx_model: nnx.Module, loaded_params: dict[str, Any]):
+def validate_loaded_params(nnx_model: nnx.Module, loaded_params: dict[str, Any]):
+  """Validates if loaded_params can be applied to nnx_model without errors."""
   print("--- Validating if loaded_params can be applied to nnx_model ---")
   if not loaded_params:
     print("ERROR: loaded_params dictionary is empty.")
@@ -147,7 +148,7 @@ def validate_loaded_params_v3(nnx_model: nnx.Module, loaded_params: dict[str, An
   has_loaded_arrays = pytree_has_arrays(loaded_params)
   if not has_loaded_arrays:
     print("WARNING: No jax.Array or jnp.ndarray found in loaded_params.")
-
+  
   expected_state = nnx.state(nnx_model, nnx.Param)
   model_has_params = bool(expected_state) and bool(jax.tree_util.tree_leaves(expected_state))
 
@@ -472,7 +473,7 @@ class LayerwiseQuantization:
         )
 
         # Validate structure before loading
-        validate_loaded_params_v3(layer, layer_params)
+        validate_loaded_params(layer, layer_params)
 
         # Load the checkpoint weights into the NNX module
         load_weights_into_deepseek_layer(layer, layer_params)
