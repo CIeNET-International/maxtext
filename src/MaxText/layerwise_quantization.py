@@ -148,7 +148,7 @@ def validate_loaded_params(nnx_model: nnx.Module, loaded_params: dict[str, Any])
   has_loaded_arrays = pytree_has_arrays(loaded_params)
   if not has_loaded_arrays:
     print("WARNING: No jax.Array or jnp.ndarray found in loaded_params.")
-  
+
   expected_state = nnx.state(nnx_model, nnx.Param)
   model_has_params = bool(expected_state) and bool(jax.tree_util.tree_leaves(expected_state))
 
@@ -411,9 +411,7 @@ class LayerwiseQuantization:
 
     # Model and quantization config
     self.quant = quantizations.configure_quantization(config)
-    model = models.transformer_as_linen(
-        config, mesh=self._mesh, quant=self.quant, model_mode=common_types.MODEL_MODE_TRAIN
-    )
+    model = models.transformer_as_linen(config, mesh=self._mesh, quant=self.quant, model_mode=common_types.MODEL_MODE_TRAIN)
     rng = jax.random.PRNGKey(1234)
     self.unboxed_abstract_state, _, _ = maxtext_utils.get_abstract_state(model, None, self.config, rng, self._mesh, False)
 
@@ -439,9 +437,7 @@ class LayerwiseQuantization:
     ]
 
     # Prepare dummy inputs for quantization
-    dummy_inputs = jnp.ones(
-        (1, self.config.max_prefill_predict_length, self.config.base_emb_dim), dtype=self.config.dtype
-    )
+    dummy_inputs = jnp.ones((1, self.config.max_prefill_predict_length, self.config.base_emb_dim), dtype=self.config.dtype)
     dummy_decoder_segment_ids = jnp.zeros((1, self.config.max_prefill_predict_length), dtype=jnp.int32)
     dummy_positions = None
 
@@ -468,9 +464,7 @@ class LayerwiseQuantization:
         layer_params = params["params"]["decoder"][layer_name]
 
         print(f"DEBUG: Loaded params shapes for {layer_name}:")
-        jax.tree_util.tree_map_with_path(
-            lambda path, x: print(f"  {jax.tree_util.keystr(path)}: {x.shape}"), layer_params
-        )
+        jax.tree_util.tree_map_with_path(lambda path, x: print(f"  {jax.tree_util.keystr(path)}: {x.shape}"), layer_params)
 
         # Validate structure before loading
         validate_loaded_params(layer, layer_params)
@@ -583,9 +577,7 @@ def main(argv: Sequence[str]) -> None:
 
 
 def validate_config(config):
-  assert (
-      config.load_full_state_path == ""
-  ), "Operation on full states not supported! Convert to parameter checkpoint first."
+  assert config.load_full_state_path == "", "Operation on full states not supported! Convert to parameter checkpoint first."
 
 
 if __name__ == "__main__":
