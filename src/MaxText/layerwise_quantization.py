@@ -39,7 +39,6 @@ from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 from absl import app
-import pprint
 
 from flax.linen import partitioning as nn_partitioning
 from flax import nnx
@@ -54,8 +53,6 @@ import orbax.checkpoint as ocp
 
 IGNORE = ocp.PLACEHOLDER
 PRNGKeyType = Any
-
-
 DictKey = jax.tree_util.DictKey
 
 
@@ -201,8 +198,12 @@ class LayerwiseQuantization:
     _, rng_quant_params = jax.random.split(rng)
 
     layers = [
-        deepseek.DeepSeekDenseLayer(config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode),
-        deepseek.DeepSeekMoELayer(config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode),
+        deepseek.DeepSeekDenseLayerToLinen(
+            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(rng)
+        ),
+        deepseek.DeepSeekMoELayerToLinen(
+            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(rng)
+        ),
     ]
     layer_prefixes = ["dense_layers", "moe_layers"]
     num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
