@@ -118,8 +118,8 @@ def match_aqt_and_unquantized_param(aqt_params, params):
     return jax.tree_util.tree_unflatten(aqt_tree_def, [])
 
   param_tree_flat_with_path, _ = jax.tree_util.tree_flatten_with_path(params)
-  params_path_set = {tuple(k) for k, v in param_tree_flat_with_path}
-  params_keys_str = {jax.tree_util.keystr(k) for k, v in param_tree_flat_with_path}
+  params_path_set = {tuple(k) for k, _ in param_tree_flat_with_path}
+  params_keys_str = {jax.tree_util.keystr(k) for k, _ in param_tree_flat_with_path}
 
   original_param_paths = []
 
@@ -185,7 +185,7 @@ class LayerwiseQuantization:
     rng = jax.random.PRNGKey(1234)
     self.unboxed_abstract_state, _, _ = maxtext_utils.get_abstract_state(model, None, self.config, rng, self._mesh, False)
 
-  def load_and_quantize(self, rng: None | PRNGKeyType = None) -> None:
+  def load_and_quantize(self, rng: PRNGKeyType) -> None:
     """
     Load parameters layer by layer and quantize them.
     """
