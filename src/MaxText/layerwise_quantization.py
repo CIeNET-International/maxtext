@@ -57,57 +57,85 @@ DictKey = jax.tree_util.DictKey
 
 
 def match_aqt_and_unquantized_param(aqt_params, params):
-    """match aqt and unquantized params"""
+  """Match AQT quantization variables to their original unquantized parameters,
+  using a nested loop approach.
+  """
+  # 1. Flatten aqt_params and filter for relevant QTensor leaves
+  aqt_param_flat_all, _ = jax.tree_util.tree_flatten_with_path(
+      aqt_params, is_leaf=lambda x: isinstance(x, aqt_tensor.QTensor)
+  )
 
-    aqt_flat_map = nnx.traversals.flatten_mapping(aqt_params, sep='/')
-    params_flat_map = nnx.traversals.flatten_mapping(params, sep='/')
+  filtered_aqt_flat = []
+  for path, value in aqt_param_flat_all:
+      str_path = '/'.join(k.key for k in path)
+      if 'AqtDotGeneral_' in str_path and not str_path.startswith('AqtEinsum_'):
+          filtered_aqt_flat.append((path, value))
 
-    filtered_aqt_items = {}
-    for path_str, value in aqt_flat_map.items():
-        path = path_str.split('/')
-        if isinstance(value, aqt_tensor.QTensor) and \
-           not (path and path[0].startswith('AqtEinsum_')):
-            if any('AqtDotGeneral_' in node for node in path):
-                filtered_aqt_items[path_str] = value
+  if not filtered_aqt_flat:
+      print("No parameter-quantizing AQT tensors found to match.")
+      return {}
 
-    if not filtered_aqt_items:
-        print("No parameter-quantizing AQT tensors found to match.")
+  # 2. Create the TreeDef corresponding to the filtered AQT items.
+  # The order of leaves in tree_unflatten must match this TreeDef.
+  # We use a temporary list to get the structure.
+  _, aqt_tree_def = jax.tree_util.tree_flatten([v for _, v in filtered_aqt_flat])
+
+  # 3. Flatten params
+  param_tree_flat, _ = jax.tree_util.tree_flatten_with_path(params)
+
+  # 4. Prepare to collect matching param paths, in order
+  param_paths = [None] * len(filtered_aqt_flat)
+  used_param_indices = set()
+
+  # 5. Nested loops to find matches
+  for i, (aqt_k, _) in enumerate(filtered_aqt_flat):
+      found_match = False
+      # Determine the module path for the AQT variable
+      aqt_module_path = None
+      for idx, key in enumerate(aqt_k):
+          if isinstance(key, jax.tree_util.DictKey) and 'AqtDotGeneral_' in key.key:
+              aqt_module_path = aqt_k[:idx]
+              break
+
+      if aqt_module_path is None:
+          print(f"‼️ Warning: Could not determine module path for AQT var: {aqt_k}")
+          continue
+
+      for j, (k, _) in enumerate(param_tree_flat):
+          if j in used_param_indices:
+              continue
+
+          # Check if the param path 'k' matches the expected structure
+          if len(k) > 0 and isinstance(k[-1], jax.tree_util.DictKey) and k[-1].key == 'kernel':
+              param_module_path = k[:-1]
+              if param_module_path == aqt_module_path:
+                  param_paths[i] = k
+                  used_param_indices.add(j)
+                  found_match = True
+                  break  # Move to the next AQT variable
+
+      if not found_match:
+          print(f"‼️ No match found for AQT path: {aqt_k}")
+
+  # 6. Validation and Unflatten
+  if any(p is None for p in param_paths):
+      print("Error: Some AQT variables could not be matched to a parameter path.")
+      for i, p in enumerate(param_paths):
+          if p is None:
+              print(f"  - No match for: {filtered_aqt_flat[i][0]}")
+      return {}
+
+  if len(param_paths) != len(filtered_aqt_flat):
+        print(f"Error: Mismatch in list lengths. This shouldn't happen here.")
         return {}
 
-    # Reconstruct a tree for the sole purpose of getting the TreeDef
-    filtered_aqt_tree = nnx.traversals.unflatten_mapping(filtered_aqt_items, sep='/')
-    _, aqt_tree_def = jax.tree_util.tree_flatten(filtered_aqt_tree, is_leaf=lambda x: isinstance(x, aqt_tensor.QTensor))
-    # This TreeDef now expects 9 leaves
-
-    param_paths_found = []
-    params_keys_used = set()
-
-    for aqt_path_str in filtered_aqt_items.keys():
-        aqt_path = aqt_path_str.split('/')
-        # Form the expected original parameter path
-        # Example: 'module/AqtDotGeneral_0' -> 'module/kernel'
-        original_param_path = aqt_path[:-1] + ['kernel']
-        original_param_key = '/'.join(original_param_path)
-
-        if original_param_key in params_flat_map and original_param_key not in params_keys_used:
-            # Convert the list of string keys to a tuple of DictKey
-            param_tuple_path = tuple(jax.tree_util.DictKey(key=k) for k in original_param_path)
-            param_paths_found.append(param_tuple_path)
-            params_keys_used.add(original_param_key)
-        else:
-            print(f"No match for AQT path: {aqt_path_str} (expected: {original_param_key})")
-
-    if len(param_paths_found) != len(filtered_aqt_items):
-      print(f"Error: Found {len(param_paths_found)} matching param paths for {len(filtered_aqt_items)} filtered AQT tensors.")
-      # This suggests some AqtDotGeneral paths didn't find a kernel
-      return {} # Or handle error appropriately
-
-    return jax.tree_util.tree_unflatten(aqt_tree_def, param_paths_found)
-
+  print(f"Successfully matched {len(param_paths)} AQT tensors to original parameters.")
+  breakpoint()
+  return jax.tree_util.tree_unflatten(aqt_tree_def, param_paths)
 
 def _get_aqt_key_paths(aqt_vars, params):
   """Generate a list of paths which have aqt state"""
-  aqt_to_unquantized_key_path = jax.tree_util.tree_flatten_with_path(aqt_vars, params)
+  aqt_to_unquantized_key_path = match_aqt_and_unquantized_param(aqt_vars, params)
   if not aqt_to_unquantized_key_path:
       return []
   aqt_key_paths, _ = jax.tree_util.tree_flatten(aqt_to_unquantized_key_path, is_leaf=lambda x: isinstance(x, tuple))
@@ -118,18 +146,25 @@ def remove_quantized_params(params, aqt_vars):
   """Remove param values with aqt tensors to Null to optimize memory."""
   quantized_param_paths = _get_aqt_key_paths(aqt_vars, params)
   if not quantized_param_paths:
-    print("No parameters to remove.")
-    return params
-  print(f"Removing {len(quantized_param_paths)} quantized parameters.")
+      print("No parameters to remove.")
+      return params
+
+  print(f"Attempting to remove {len(quantized_param_paths)} quantized parameter paths.")
   tree_flat, tree_struct = jax.tree_util.tree_flatten_with_path(params)
 
   new_tree_flat = []
+  removed_count = 0
   for k_path, v in tree_flat:
     if k_path in quantized_param_paths:
       new_tree_flat.append({})  # Replace with empty dict
+      removed_count += 1
     else:
       new_tree_flat.append(v)
 
+  if removed_count != len(quantized_param_paths):
+      print(f"Warning: Expected to remove {len(quantized_param_paths)} but only removed {removed_count}")
+
+  print(f"Successfully marked {removed_count} parameters for removal.")
   return jax.tree_util.tree_unflatten(tree_struct, new_tree_flat)
 
 class LayerwiseQuantization:
