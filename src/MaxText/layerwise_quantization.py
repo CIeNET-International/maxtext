@@ -33,7 +33,6 @@ python3 -m MaxText.layerwise_quantization  src/MaxText/configs/base.yml \
 import os
 from typing import Any, Sequence
 
-from aqt.jax.v2 import aqt_tensor
 from tqdm import tqdm
 
 import jax
@@ -54,6 +53,74 @@ import orbax.checkpoint as ocp
 IGNORE = ocp.PLACEHOLDER
 PRNGKeyType = Any
 DictKey = jax.tree_util.DictKey
+
+
+def match_aqt_and_unquantized_param(aqt_params, params):
+    """match aqt and unquantized params"""
+
+    aqt_flat_map = nnx.traversals.flatten_mapping(aqt_params, sep='/')
+    params_flat_map = nnx.traversals.flatten_mapping(params, sep='/')
+
+    filtered_aqt_items = {}
+    for path_str, value in aqt_flat_map.items():
+        path = path_str.split('/')
+        if not path[0].startswith('AqtEinsum_') and isinstance(value, aqt_tensor.QTensor):
+            if any('AqtDotGeneral_' in node for node in path):
+                filtered_aqt_items[path_str] = value
+
+    if not filtered_aqt_items:
+        return {}
+
+    # Reconstruct a tree for the sole purpose of getting the TreeDef
+    filtered_aqt_tree = nnx.traversals.unflatten_mapping(filtered_aqt_items, sep='/')
+    _, aqt_tree_def = jax.tree_util.tree_flatten(filtered_aqt_tree, is_leaf=lambda x: isinstance(x, aqt_tensor.QTensor))
+    # This TreeDef now expects 9 leaves
+
+    param_paths_found = []
+    params_keys_used = set()
+
+    for aqt_path_str in filtered_aqt_items.keys():
+        aqt_path = aqt_path_str.split('/')
+        # Form the expected original parameter path
+        # Example: 'module/AqtDotGeneral_0' -> 'module/kernel'
+        original_param_path = aqt_path[:-1] + ['kernel']
+        original_param_key = '/'.join(original_param_path)
+
+        if original_param_key in params_flat_map and original_param_key not in params_keys_used:
+            # Need to convert string path back to tuple of keys
+            param_tuple_path = []
+            current = params
+            for key in original_param_path:
+                param_tuple_path.append(jax.tree_util.DictKey(key=key))
+            param_paths_found.append(tuple(param_tuple_path))
+            params_keys_used.add(original_param_key)
+        else:
+            print(f"No match for AQT path: {aqt_path_str} (expected: {original_param_key})")
+
+    if len(param_paths_found) != len(filtered_aqt_items):
+        print(f"Error: Found {len(param_paths_found)} param paths for {len(filtered_aqt_items)} AQT entries.")
+        # Handle error or return gracefully
+
+    return jax.tree_util.tree_unflatten(aqt_tree_def, param_paths_found)
+
+
+def _get_aqt_key_paths(aqt_vars, params):
+  """Generate a list of paths which have aqt state"""
+  aqt_to_unquantized_key_path = jax.tree_util.tree_flatten_with_path(aqt_vars, params)
+  aqt_key_paths, _ = jax.tree_util.tree_flatten(aqt_to_unquantized_key_path, is_leaf=lambda x: isinstance(x, tuple))
+  return list(aqt_key_paths)
+
+
+def remove_quantized_params(params, aqt_vars):
+  """Remove param values with aqt tensors to Null to optimize memory."""
+  quantized_param_paths = _get_aqt_key_paths(aqt_vars, params)
+  tree_flat, tree_struct = jax.tree_util.tree_flatten_with_path(params)
+  for i, (k, v) in enumerate(tree_flat):
+    if k in quantized_param_paths:
+      v = {}
+    tree_flat[i] = v
+  return jax.tree_util.tree_flatten_with_path(tree_struct, tree_flat)
+
 
 class LayerwiseQuantization:
   """
