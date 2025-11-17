@@ -57,81 +57,60 @@ DictKey = jax.tree_util.DictKey
 
 
 def match_aqt_and_unquantized_param(aqt_params, params):
-  """Match AQT quantization variables to their original unquantized parameters,
-  using a nested loop approach.
   """
-  # 1. Flatten aqt_params and filter for relevant QTensor leaves
-  aqt_param_flat_all, _ = jax.tree_util.tree_flatten_with_path(
-      aqt_params, is_leaf=lambda x: isinstance(x, aqt_tensor.QTensor)
-  )
+  Matches AQT quantized components to original parameter paths.
 
-  filtered_aqt_flat = []
-  for path, value in aqt_param_flat_all:
-      str_path = '/'.join(k.key for k in path)
-      if 'AqtDotGeneral_' in str_path and not str_path.startswith('AqtEinsum_'):
-          filtered_aqt_flat.append((path, value))
+  Returns:
+      A PyTree structured like the modules containing AqtDotGeneral_,
+      where the leaves are the tuple paths to the corresponding original
+      'kernel' parameters in the params PyTree.
+  """
+  aqt_flat_map = nnx.traversals.flatten_mapping(aqt_params, sep='/')
+  params_flat_map = nnx.traversals.flatten_mapping(params, sep='/')
 
-  if not filtered_aqt_flat:
-      print("No parameter-quantizing AQT tensors found to match.")
-      return {}
+  # This dictionary will map the string path of a module
+  # (e.g., 'self_attention/out') to the full JAX tuple path
+  # of the original kernel (e.g., (DictKey('self_attention'), DictKey('out'), DictKey('kernel'))).
+  module_to_param_path = {}
 
-  # 2. Create the TreeDef corresponding to the filtered AQT items.
-  # The order of leaves in tree_unflatten must match this TreeDef.
-  # We use a temporary list to get the structure.
-  _, aqt_tree_def = jax.tree_util.tree_flatten([v for _, v in filtered_aqt_flat])
-
-  # 3. Flatten params
-  param_tree_flat, _ = jax.tree_util.tree_flatten_with_path(params)
-
-  # 4. Prepare to collect matching param paths, in order
-  param_paths = [None] * len(filtered_aqt_flat)
-  used_param_indices = set()
-
-  # 5. Nested loops to find matches
-  for i, (aqt_k, _) in enumerate(filtered_aqt_flat):
-      found_match = False
-      # Determine the module path for the AQT variable
-      aqt_module_path = None
-      for idx, key in enumerate(aqt_k):
-          if isinstance(key, jax.tree_util.DictKey) and 'AqtDotGeneral_' in key.key:
-              aqt_module_path = aqt_k[:idx]
-              break
-
-      if aqt_module_path is None:
-          print(f"‼️ Warning: Could not determine module path for AQT var: {aqt_k}")
+  for path_str in aqt_flat_map.keys():
+      if 'AqtDotGeneral_' not in path_str or path_str.startswith('AqtEinsum_'):
           continue
 
-      for j, (k, _) in enumerate(param_tree_flat):
-          if j in used_param_indices:
+      path = path_str.split('/')
+      try:
+          # Find the part of the path representing the module,
+          # right before the 'AqtDotGeneral_' part.
+          aqt_dot_general_index = next(i for i, part in enumerate(path) if 'AqtDotGeneral_' in part)
+          module_path_list = path[:aqt_dot_general_index]
+          module_key = '/'.join(module_path_list)
+
+          # We only need to find the kernel path once per module
+          if module_key in module_to_param_path:
               continue
 
-          # Check if the param path 'k' matches the expected structure
-          if len(k) > 0 and isinstance(k[-1], jax.tree_util.DictKey) and k[-1].key == 'kernel':
-              param_module_path = k[:-1]
-              if param_module_path == aqt_module_path:
-                  param_paths[i] = k
-                  used_param_indices.add(j)
-                  found_match = True
-                  break  # Move to the next AQT variable
+          # Construct the expected path to the original kernel
+          original_param_path_list = module_path_list + ['kernel']
+          original_param_key = '/'.join(original_param_path_list)
 
-      if not found_match:
-          print(f"‼️ No match found for AQT path: {aqt_k}")
+          if original_param_key in params_flat_map:
+              # Create the JAX path tuple
+              param_tuple_path = tuple(jax.tree_util.DictKey(key=k) for k in original_param_path_list)
+              module_to_param_path[module_key] = param_tuple_path
+          else:
+              print(f"Kernel not found for AQT module: {module_key} (Expected: {original_param_key})")
 
-  # 6. Validation and Unflatten
-  if any(p is None for p in param_paths):
-      print("Error: Some AQT variables could not be matched to a parameter path.")
-      for i, p in enumerate(param_paths):
-          if p is None:
-              print(f"  - No match for: {filtered_aqt_flat[i][0]}")
+      except StopIteration:
+          # Should not happen given the check above
+          continue
+
+  if not module_to_param_path:
+      print("No parameters found to be quantized by AqtDotGeneral.")
       return {}
 
-  if len(param_paths) != len(filtered_aqt_flat):
-        print(f"Error: Mismatch in list lengths. This shouldn't happen here.")
-        return {}
-
-  print(f"Successfully matched {len(param_paths)} AQT tensors to original parameters.")
-  breakpoint()
-  return jax.tree_util.tree_unflatten(aqt_tree_def, param_paths)
+  # Unflatten the map to create a PyTree. The leaves of this tree
+  # are the tuple paths to the original parameters.
+  return  nnx.traversals.unflatten_mapping(module_to_param_path, sep='/')
 
 def _get_aqt_key_paths(aqt_vars, params):
   """Generate a list of paths which have aqt state"""
