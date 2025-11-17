@@ -55,111 +55,6 @@ IGNORE = ocp.PLACEHOLDER
 PRNGKeyType = Any
 DictKey = jax.tree_util.DictKey
 
-
-def get_original_path_key(aqt_k_tuple):
-  """
-  Maps an AQT PyTree path (tuple of keys) to its corresponding original parameter path.
-  Prioritizes known structural transformations.
-  """
-  aqt_k = list(aqt_k_tuple)
-
-  # Rule 1: Handle specific structural changes first.
-  # Example: DeepSeek MoE layers use AqtEinsum at a high level, altering the structure.
-  # TODO: Extend this section for other known structural transformations as needed.
-  if len(aqt_k) >= 2 and isinstance(aqt_k[0], DictKey) and aqt_k[0].key.startswith("DeepSeekMoeBlock"):
-    if isinstance(aqt_k[1], DictKey):
-      module_key = aqt_k[1].key
-      if module_key == "AqtEinsum_0":
-        return (aqt_k[0], DictKey("MoeBlock_0"), DictKey("wi_0"))
-      if module_key == "AqtEinsum_1":
-        return (aqt_k[0], DictKey("MoeBlock_0"), DictKey("wi_1"))
-      if module_key == "AqtEinsum_2":
-        return (aqt_k[0], DictKey("MoeBlock_0"), DictKey("wo"))
-      # If not these specific AqtEinsum keys, fall through to Rule 2
-
-  # Rule 2: General AQT wrapper heuristic.
-  # This rule assumes an AQT module (e.g., AqtDotGeneral_0) wraps a tensor,
-  # and this tensor was likely named 'kernel' in the original structure.
-  aqt_module_index = -1
-  for i, key in enumerate(aqt_k):
-    if isinstance(key, DictKey) and key.key.startswith("Aqt"):
-      aqt_module_index = i
-      break  # Find the first AQT-specific module key
-
-  if aqt_module_index != -1:
-    # Check if the path structure beyond the AQT module matches the expected
-    # QTensor location: ['Aqt...']['qrhs']['frozen']
-    if (
-        len(aqt_k) > aqt_module_index + 2
-        and isinstance(aqt_k[aqt_module_index + 1], DictKey)
-        and aqt_k[aqt_module_index + 1].key == "qrhs"
-        and isinstance(aqt_k[aqt_module_index + 2], DictKey)
-        and aqt_k[aqt_module_index + 2].key == "frozen"
-    ):
-
-      # The original parameter path is the prefix before the AQT module
-      parent_path = tuple(aqt_k[:aqt_module_index])
-      return parent_path + (DictKey("kernel"),)
-
-  print(f"Warning: No mapping rule matched for AQT path: {jax.tree_util.keystr(aqt_k_tuple)}")
-  return None
-
-
-def match_aqt_and_unquantized_param(aqt_params, params):
-  """
-  Creates a PyTree with the same structure as aqt_params' QTensors,
-  where leaves are the corresponding paths in the original params tree.
-  """
-  is_qtensor = lambda x: isinstance(x, aqt_tensor.QTensor)
-
-  aqt_param_flat, aqt_tree_def = jax.tree_util.tree_flatten_with_path(aqt_params, is_leaf=is_qtensor)
-
-  if not aqt_param_flat:
-    return jax.tree_util.tree_unflatten(aqt_tree_def, [])
-
-  param_tree_flat_with_path, _ = jax.tree_util.tree_flatten_with_path(params)
-  params_path_set = {tuple(k) for k, _ in param_tree_flat_with_path}
-  params_keys_str = {jax.tree_util.keystr(k) for k, _ in param_tree_flat_with_path}
-
-  original_param_paths = []
-
-  for aqt_k_tuple, _ in aqt_param_flat:
-    original_k_tuple = get_original_path_key(aqt_k_tuple)
-
-    if original_k_tuple is None:
-      raise ValueError(f"Could not determine original path for AQT path: {jax.tree_util.keystr(aqt_k_tuple)}")
-
-    if original_k_tuple not in params_path_set:
-      raise ValueError(
-          f"Mapped AQT path {jax.tree_util.keystr(aqt_k_tuple)} to {jax.tree_util.keystr(original_k_tuple)}, but this path was not found in the original params tree. "
-          f"Available param paths: {params_keys_str}"
-      )
-
-    original_param_paths.append(original_k_tuple)
-
-  return jax.tree_util.tree_unflatten(aqt_tree_def, original_param_paths)
-
-
-def _get_aqt_key_paths(aqt_vars, params):
-  """Generates a list of original parameter paths (tuples) that are now quantized."""
-  aqt_to_unquantized_key_path_tree = match_aqt_and_unquantized_param(aqt_vars, params)
-  original_param_paths_list, _ = jax.tree_util.tree_flatten(aqt_to_unquantized_key_path_tree)
-  return list(original_param_paths_list)
-
-
-def remove_quantized_params(params, aqt_vars):
-  """Replaces the values in the original params tree that are now quantized with empty dicts."""
-  quantized_param_paths = _get_aqt_key_paths(aqt_vars, params)
-  quantized_param_path_set = set(quantized_param_paths)
-
-  def _map_fn(path, value):
-    if tuple(path) in quantized_param_path_set:
-      return {}
-    return value
-
-  return jax.tree_util.tree_map_with_path(_map_fn, params)
-
-
 class LayerwiseQuantization:
   """
   Layerwise quantization for large models.
@@ -198,16 +93,16 @@ class LayerwiseQuantization:
     _, rng_quant_params = jax.random.split(rng)
 
     layers = [
+       deepseek.DeepSeekMoELayerToLinen(
+            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(rng)
+        ),
         deepseek.DeepSeekDenseLayerToLinen(
             config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(rng)
         ),
-        deepseek.DeepSeekMoELayerToLinen(
-            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(rng)
-        ),
     ]
-    layer_prefixes = ["dense_layers", "moe_layers"]
+    layer_prefixes = ["moe_layers", "dense_layers"]
     num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
-    num_layers_list = [config.first_num_dense_layers, num_moe_layers]
+    num_layers_list = [num_moe_layers, config.first_num_dense_layers]
 
     def model_apply(_p, _rng, layer):
       return layer.apply(
@@ -237,7 +132,7 @@ class LayerwiseQuantization:
         quantized_params["aqt"]["decoder"][layer_name] = new_vars["aqt"]
 
         try:
-          removed_params = remove_quantized_params(params["params"], new_vars["aqt"])
+          removed_params = quantizations.remove_quantized_params(params["params"], new_vars["aqt"])
           quantized_params["params"]["decoder"][layer_name] = removed_params
         except Exception as e:
           print(f"ERROR: Failed to remove quantized params for {layer_name}: {e}")
