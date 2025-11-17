@@ -21,7 +21,7 @@ import pickle
 from flax import linen as nn
 from flax import nnx
 from flax.linen import partitioning as nn_partitioning
-from flax.training import train_state
+from flax.nnx import TrainState
 
 import numpy as np
 
@@ -709,15 +709,15 @@ def get_nested_value(dictionary, nested_key, default=None):
   return current_level
 
 
-def init_decode_state(apply_fn, params) -> train_state.TrainState:
+def init_decode_state(graphdef, params) -> TrainState:
   """Init train state with null opt state for decode."""
-  state = train_state.TrainState(step=0, apply_fn=apply_fn, params=params, tx=None, opt_state={})  # type: ignore
+  state = TrainState(step=0, graphdef=graphdef, params=params, tx=None, opt_state={})  # type: ignore
   return state
 
 
-def init_training_state(apply_fn, params, tx):
+def init_training_state(graphdef, params, tx):
   """Init train state for training."""
-  state = train_state.TrainState.create(apply_fn=apply_fn, params=params, tx=tx)
+  state = TrainState.create(graphdef=graphdef, params=params, tx=tx)
   return state
 
 
@@ -739,11 +739,11 @@ def init_initial_state(model, tx, config, is_training, key):
     and RNG state are discarded as they're managed by the model object itself.
   """
   # Extract only trainable parameters; discard structure and RNG state
-  _, params, _ = nnx.split(model, nnx.Param, ...)
-
+  graphdef, params, _ = nnx.split(model, nnx.Param, ...)
+  max_logging.log(f"Initialized {'training' if is_training else 'decode'} state with parameters:")
   if is_training:
-    return init_training_state(None, params, tx)
-  return init_decode_state(None, params)
+    return init_training_state(graphdef, params, tx)
+  return init_decode_state(graphdef, params)
 
 
 def setup_decode_state(model, config, rng, mesh, checkpoint_manager):
