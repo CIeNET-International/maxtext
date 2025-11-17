@@ -38,6 +38,7 @@ from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 from absl import app
+from aqt.jax.v2 import aqt_tensor
 
 from flax.linen import partitioning as nn_partitioning
 from flax import nnx
@@ -64,11 +65,13 @@ def match_aqt_and_unquantized_param(aqt_params, params):
     filtered_aqt_items = {}
     for path_str, value in aqt_flat_map.items():
         path = path_str.split('/')
-        if not path[0].startswith('AqtEinsum_') and isinstance(value, aqt_tensor.QTensor):
+        if isinstance(value, aqt_tensor.QTensor) and \
+           not (path and path[0].startswith('AqtEinsum_')):
             if any('AqtDotGeneral_' in node for node in path):
                 filtered_aqt_items[path_str] = value
 
     if not filtered_aqt_items:
+        print("No parameter-quantizing AQT tensors found to match.")
         return {}
 
     # Reconstruct a tree for the sole purpose of getting the TreeDef
@@ -87,19 +90,17 @@ def match_aqt_and_unquantized_param(aqt_params, params):
         original_param_key = '/'.join(original_param_path)
 
         if original_param_key in params_flat_map and original_param_key not in params_keys_used:
-            # Need to convert string path back to tuple of keys
-            param_tuple_path = []
-            current = params
-            for key in original_param_path:
-                param_tuple_path.append(jax.tree_util.DictKey(key=key))
-            param_paths_found.append(tuple(param_tuple_path))
+            # Convert the list of string keys to a tuple of DictKey
+            param_tuple_path = tuple(jax.tree_util.DictKey(key=k) for k in original_param_path)
+            param_paths_found.append(param_tuple_path)
             params_keys_used.add(original_param_key)
         else:
             print(f"No match for AQT path: {aqt_path_str} (expected: {original_param_key})")
 
     if len(param_paths_found) != len(filtered_aqt_items):
-        print(f"Error: Found {len(param_paths_found)} param paths for {len(filtered_aqt_items)} AQT entries.")
-        # Handle error or return gracefully
+      print(f"Error: Found {len(param_paths_found)} matching param paths for {len(filtered_aqt_items)} filtered AQT tensors.")
+      # This suggests some AqtDotGeneral paths didn't find a kernel
+      return {} # Or handle error appropriately
 
     return jax.tree_util.tree_unflatten(aqt_tree_def, param_paths_found)
 
@@ -107,6 +108,8 @@ def match_aqt_and_unquantized_param(aqt_params, params):
 def _get_aqt_key_paths(aqt_vars, params):
   """Generate a list of paths which have aqt state"""
   aqt_to_unquantized_key_path = jax.tree_util.tree_flatten_with_path(aqt_vars, params)
+  if not aqt_to_unquantized_key_path:
+      return []
   aqt_key_paths, _ = jax.tree_util.tree_flatten(aqt_to_unquantized_key_path, is_leaf=lambda x: isinstance(x, tuple))
   return list(aqt_key_paths)
 
@@ -114,13 +117,20 @@ def _get_aqt_key_paths(aqt_vars, params):
 def remove_quantized_params(params, aqt_vars):
   """Remove param values with aqt tensors to Null to optimize memory."""
   quantized_param_paths = _get_aqt_key_paths(aqt_vars, params)
+  if not quantized_param_paths:
+    print("No parameters to remove.")
+    return params
+  print(f"Removing {len(quantized_param_paths)} quantized parameters.")
   tree_flat, tree_struct = jax.tree_util.tree_flatten_with_path(params)
-  for i, (k, v) in enumerate(tree_flat):
-    if k in quantized_param_paths:
-      v = {}
-    tree_flat[i] = v
-  return jax.tree_util.tree_flatten_with_path(tree_struct, tree_flat)
 
+  new_tree_flat = []
+  for k_path, v in tree_flat:
+    if k_path in quantized_param_paths:
+      new_tree_flat.append({})  # Replace with empty dict
+    else:
+      new_tree_flat.append(v)
+
+  return jax.tree_util.tree_unflatten(tree_struct, new_tree_flat)
 
 class LayerwiseQuantization:
   """
@@ -199,7 +209,7 @@ class LayerwiseQuantization:
         quantized_params["aqt"]["decoder"][layer_name] = new_vars["aqt"]
 
         try:
-          removed_params = quantizations.remove_quantized_params(params["params"], new_vars["aqt"])
+          removed_params = remove_quantized_params(params["params"], new_vars["aqt"])
           quantized_params["params"]["decoder"][layer_name] = removed_params
         except Exception as e:
           print(f"ERROR: Failed to remove quantized params for {layer_name}: {e}")
