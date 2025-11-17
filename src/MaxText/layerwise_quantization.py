@@ -65,8 +65,8 @@ def match_aqt_and_unquantized_param(aqt_params, params):
       where the leaves are the tuple paths to the corresponding original
       'kernel' parameters in the params PyTree.
   """
-  aqt_flat_map = nnx.traversals.flatten_mapping(aqt_params, sep='/')
-  params_flat_map = nnx.traversals.flatten_mapping(params, sep='/')
+  aqt_flat_map = nnx.traversals.flatten_mapping(aqt_params, sep="/")
+  params_flat_map = nnx.traversals.flatten_mapping(params, sep="/")
 
   # This dictionary will map the string path of a module
   # (e.g., 'self_attention/out') to the full JAX tuple path
@@ -74,49 +74,50 @@ def match_aqt_and_unquantized_param(aqt_params, params):
   module_to_param_path = {}
 
   for path_str in aqt_flat_map.keys():
-      if 'AqtDotGeneral_' not in path_str or path_str.startswith('AqtEinsum_'):
-          continue
+    if "AqtDotGeneral_" not in path_str or path_str.startswith("AqtEinsum_"):
+      continue
 
-      path = path_str.split('/')
-      try:
-          # Find the part of the path representing the module,
-          # right before the 'AqtDotGeneral_' part.
-          aqt_dot_general_index = next(i for i, part in enumerate(path) if 'AqtDotGeneral_' in part)
-          module_path_list = path[:aqt_dot_general_index]
-          module_key = '/'.join(module_path_list)
+    path = path_str.split("/")
+    try:
+      # Find the part of the path representing the module,
+      # right before the 'AqtDotGeneral_' part.
+      aqt_dot_general_index = next(i for i, part in enumerate(path) if "AqtDotGeneral_" in part)
+      module_path_list = path[:aqt_dot_general_index]
+      module_key = "/".join(module_path_list)
 
-          # We only need to find the kernel path once per module
-          if module_key in module_to_param_path:
-              continue
+      # We only need to find the kernel path once per module
+      if module_key in module_to_param_path:
+        continue
 
-          # Construct the expected path to the original kernel
-          original_param_path_list = module_path_list + ['kernel']
-          original_param_key = '/'.join(original_param_path_list)
+      # Construct the expected path to the original kernel
+      original_param_path_list = module_path_list + ["kernel"]
+      original_param_key = "/".join(original_param_path_list)
 
-          if original_param_key in params_flat_map:
-              # Create the JAX path tuple
-              param_tuple_path = tuple(jax.tree_util.DictKey(key=k) for k in original_param_path_list)
-              module_to_param_path[module_key] = param_tuple_path
-          else:
-              print(f"Kernel not found for AQT module: {module_key} (Expected: {original_param_key})")
+      if original_param_key in params_flat_map:
+        # Create the JAX path tuple
+        param_tuple_path = tuple(jax.tree_util.DictKey(key=k) for k in original_param_path_list)
+        module_to_param_path[module_key] = param_tuple_path
+      else:
+        print(f"Kernel not found for AQT module: {module_key} (Expected: {original_param_key})")
 
-      except StopIteration:
-          # Should not happen given the check above
-          continue
+    except StopIteration:
+      # Should not happen given the check above
+      continue
 
   if not module_to_param_path:
-      print("No parameters found to be quantized by AqtDotGeneral.")
-      return {}
+    print("No parameters found to be quantized by AqtDotGeneral.")
+    return {}
 
   # Unflatten the map to create a PyTree. The leaves of this tree
   # are the tuple paths to the original parameters.
-  return  nnx.traversals.unflatten_mapping(module_to_param_path, sep='/')
+  return nnx.traversals.unflatten_mapping(module_to_param_path, sep="/")
+
 
 def _get_aqt_key_paths(aqt_vars, params):
   """Generate a list of paths which have aqt state"""
   aqt_to_unquantized_key_path = match_aqt_and_unquantized_param(aqt_vars, params)
   if not aqt_to_unquantized_key_path:
-      return []
+    return []
   aqt_key_paths, _ = jax.tree_util.tree_flatten(aqt_to_unquantized_key_path, is_leaf=lambda x: isinstance(x, tuple))
   return list(aqt_key_paths)
 
@@ -125,8 +126,8 @@ def remove_quantized_params(params, aqt_vars):
   """Remove param values with aqt tensors to Null to optimize memory."""
   quantized_param_paths = _get_aqt_key_paths(aqt_vars, params)
   if not quantized_param_paths:
-      print("No parameters to remove.")
-      return params
+    print("No parameters to remove.")
+    return params
 
   print(f"Attempting to remove {len(quantized_param_paths)} quantized parameter paths.")
   tree_flat, tree_struct = jax.tree_util.tree_flatten_with_path(params)
@@ -141,10 +142,11 @@ def remove_quantized_params(params, aqt_vars):
       new_tree_flat.append(v)
 
   if removed_count != len(quantized_param_paths):
-      print(f"Warning: Expected to remove {len(quantized_param_paths)} but only removed {removed_count}")
+    print(f"Warning: Expected to remove {len(quantized_param_paths)} but only removed {removed_count}")
 
   print(f"Successfully marked {removed_count} parameters for removal.")
   return jax.tree_util.tree_unflatten(tree_struct, new_tree_flat)
+
 
 class LayerwiseQuantization:
   """
@@ -184,7 +186,7 @@ class LayerwiseQuantization:
     _, rng_quant_params = jax.random.split(rng)
 
     layers = [
-       deepseek.DeepSeekMoELayerToLinen(
+        deepseek.DeepSeekMoELayerToLinen(
             config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(rng)
         ),
         deepseek.DeepSeekDenseLayerToLinen(
