@@ -38,7 +38,6 @@ from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 from absl import app
-from aqt.jax.v2 import aqt_tensor
 
 from flax.linen import partitioning as nn_partitioning
 from flax import nnx
@@ -153,8 +152,9 @@ class LayerwiseQuantization:
   Layerwise quantization for large models.
   """
 
-  def __init__(self, config: Any):
+  def __init__(self, config: Any, rng: PRNGKeyType):
     self.config = config
+    self.rng = rng
 
     # TODO(ranlihao): Remove this assertion once the Layerwise quantization is supported for other decoder blocks.
     assert (
@@ -170,10 +170,11 @@ class LayerwiseQuantization:
     model = models.transformer_as_linen(
         config, mesh=self._mesh, quant=self.quant, model_mode=common_types.MODEL_MODE_TRAIN
     )
-    rng = jax.random.PRNGKey(1234)
-    self.unboxed_abstract_state, _, _ = maxtext_utils.get_abstract_state(model, None, self.config, rng, self._mesh, False)
+    self.unboxed_abstract_state, _, _ = maxtext_utils.get_abstract_state(
+        model, None, self.config, self.rng, self._mesh, False
+    )
 
-  def load_and_quantize(self, rng: PRNGKeyType) -> None:
+  def load_and_quantize(self) -> None:
     """
     Load parameters layer by layer and quantize them.
     """
@@ -183,14 +184,14 @@ class LayerwiseQuantization:
     config = self.config
     self.quant.quant_mode = quantizations.get_quant_mode("convert")
     model_mode = common_types.MODEL_MODE_PREFILL
-    _, rng_quant_params = jax.random.split(rng)
+    _, rng_quant_params = jax.random.split(self.rng)
 
     layers = [
         deepseek.DeepSeekMoELayerToLinen(
-            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(rng)
+            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(self.rng)
         ),
         deepseek.DeepSeekDenseLayerToLinen(
-            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(rng)
+            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(self.rng)
         ),
     ]
     layer_prefixes = ["moe_layers", "dense_layers"]
@@ -212,6 +213,8 @@ class LayerwiseQuantization:
     for layer, num_layers, layer_prefix in zip(layers, num_layers_list, layer_prefixes):
       for index in tqdm(range(num_layers)):
         layer_name = f"{layer_prefix}_{index}"
+        print(f"Processing layer: {layer_name}")
+
         params = self._load_layer(layer_name)
         params["params"] = params["params"]["decoder"][layer_name]
 
@@ -290,9 +293,9 @@ def main(argv: Sequence[str]) -> None:
   config = pyconfig.initialize(argv)
   validate_config(config)
   max_utils.print_system_information()
-  quantization = LayerwiseQuantization(config)
   rng = jax.random.PRNGKey(1234)
-  quantization.load_and_quantize(rng)
+  quantization = LayerwiseQuantization(config, rng)
+  quantization.load_and_quantize()
 
 
 def validate_config(config):
