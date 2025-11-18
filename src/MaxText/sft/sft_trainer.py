@@ -47,6 +47,10 @@ import flax.linen as nn
 
 from flax.linen import partitioning as nn_partitioning
 from jax.sharding import Mesh
+from MaxText.layers.normalizations import RMSNorm
+from MaxText.layers.attentions import Attention
+from MaxText.layers import quantizations
+from MaxText.layers.quantizations import AqtQuantization as Quant
 
 from orbax import checkpoint as ocp
 
@@ -86,7 +90,7 @@ def get_tunix_config(mt_config):
   )
 
   # Metrics configurations
-  metrics_logging_options = metrics_logger.MetricsLoggerOptions(log_dir=mt_config.tensorboard_dir)
+  metrics_logging_options = peft_trainer.metrics_logger.MetricsLoggerOptions(log_dir=mt_config.tensorboard_dir)
 
   # Profiler configurations
   profiler_options = None
@@ -401,8 +405,50 @@ class DummyLoRAModel(nnx.Module):
     self.mesh = mesh
     self.config = config
     self.model_mode = model_mode
+    batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(config, model_mode)
+    dummy_inputs_shape = (batch_size, seq_len, config.emb_dim)
+    self.dummy_inputs_shape = dummy_inputs_shape
+    self.pre_self_attention_layer_norm = RMSNorm(
+      num_features=config.emb_dim,
+      dtype=config.dtype,
+      weight_dtype=config.weight_dtype,
+      kernel_axes=("norm",),
+      epsilon=config.normalization_layer_epsilon,
+      rngs=rngs,
+    )
+    self.self_attention = Attention(
+        config=config,
+        num_query_heads=config.num_query_heads,
+        num_kv_heads=config.num_kv_heads,
+        head_dim=config.head_dim,
+        max_target_length=config.max_target_length,
+        max_prefill_predict_length=config.max_prefill_predict_length,
+        attention_kernel=config.attention,
+        inputs_q_shape=dummy_inputs_shape,
+        inputs_kv_shape=dummy_inputs_shape,
+        mesh=mesh,
+        dtype=config.dtype,
+        weight_dtype=config.weight_dtype,
+        dropout_rate=config.dropout_rate,
+        float32_qk_product=config.float32_qk_product,
+        float32_logits=config.float32_logits,
+        quant=None,
+        kv_quant=quantizations.configure_kv_quant(config),
+        prefill_cache_axis_order=tuple(map(int, config.prefill_cache_axis_order.split(","))),
+        ar_cache_axis_order=tuple(map(int, config.ar_cache_axis_order.split(","))),
+        compute_axis_order=tuple(map(int, config.compute_axis_order.split(","))),
+        reshape_q=config.reshape_q,
+        use_ragged_attention=config.use_ragged_attention,
+        ragged_block_size=config.ragged_block_size,
+        use_qk_norm=config.use_qk_norm,
+        # note: chunk_attn_window_size is set in the config
+        model_mode=model_mode,
+        rngs=rngs,
+    )
+
   def __call__(self, decoder_input_tokens, decoder_positions):
-    x = jnp.ones((5), dtype=jnp.int32)
+    x = jnp.ones(self.dummy_inputs_shape, dtype=jnp.int32)
+    self.self_attention(x, x)
     return self.layer(x)
 
 def train_dummy(mt_config, goodput_recorder=None):
@@ -441,11 +487,51 @@ def train_dummy(mt_config, goodput_recorder=None):
     # Create the model with sharded parameters.
     sharded_state = create_sharded_state()
     model = nnx.merge(graphdef, sharded_state)
-
+    nnx.display(model)
 
     model = apply_lora_to_model(model, mesh, mt_config, quantize=quantize_lora)
     lora_enabled = utils.is_lora_enabled(model)
     print(f'lora_enabled: {lora_enabled}')
+
+  learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(mt_config)
+  optimizer = optimizers.get_optimizer(mt_config, learning_rate_schedule)
+
+  with maybe_record_goodput(goodput_recorder, GoodputEvent.TRAINING_PREPARATION):
+    training_hooks = hooks.SFTTrainingHooks(mt_config, mesh, learning_rate_schedule, goodput_recorder)
+    data_hooks = hooks.SFTDataHooks(mt_config, mesh, goodput_recorder)
+
+    lora_enabled = utils.is_lora_enabled(model)
+    # assert(lora_enabled == use_lora), "LoRA enabled state mismatch between model and config"
+
+    # Log LoRA training configuration
+    max_logging.log("\n" + "="*80)
+    max_logging.log("TRAINING CONFIGURATION")
+    max_logging.log("="*80)
+    max_logging.log(f"LoRA enabled: {lora_enabled}")
+    if lora_enabled:
+      max_logging.log(f"LoRA rank: {mt_config.lora_rank}")
+      max_logging.log(f"LoRA alpha: {mt_config.lora_alpha}")
+      max_logging.log(f"Quantized LoRA: {mt_config.quantize_lora}")
+    max_logging.log("="*80 + "\n")
+    
+    # Compare base model vs LoRA model before training
+    log_model_comparison(base_model, lora_model, mt_config)
+    
+    trainer = peft_trainer.PeftTrainer(model, optimizer, tunix_config)
+    trainer.with_training_hooks(training_hooks)
+    trainer.with_data_hooks(data_hooks)
+    
+    # When LoRA is enabled, set up input transformation function
+    if lora_enabled:
+      trainer.with_gen_model_input_fn(gen_model_input_for_lora)
+    
+    trainer = use_maxtext_loss_function(trainer, mt_config)
+
+  with mesh, nn_partitioning.axis_rules(mt_config.logical_axis_rules):
+    trainer.train(data_hooks.train_data_iterator, data_hooks.eval_data_iterator)
+
+
+
 
 def train(mt_config, goodput_recorder=None):
   """Runs the SFT training loop.
@@ -474,6 +560,7 @@ def train(mt_config, goodput_recorder=None):
       max_logging.log("\nApplying LoRA to the model...")
       quantize_lora = getattr(mt_config, "quantize_lora", False)
       model = apply_lora_to_model(model, mesh, mt_config, quantize=quantize_lora)
+      return
       lora_model = model
       max_logging.log("LoRA applied successfully")
       
@@ -526,18 +613,6 @@ def train_model(mt_config, trainer, mesh):
   with mesh, nn_partitioning.axis_rules(mt_config.logical_axis_rules):
     trainer.train(trainer.data_hooks.train_data_iterator, trainer.data_hooks.eval_data_iterator)
   return trainer
-
-
-def train(mt_config, goodput_recorder=None):
-  """Main method for SFT training.
-
-  Args:
-    mt_config: MaxText config.
-    goodput_recorder: An optional GoodputRecorder to record performance metrics.
-  """
-  trainer, mesh = setup_trainer_state(mt_config, goodput_recorder)
-  trainer = train_model(mt_config, trainer, mesh)
-  return trainer, mesh
 
 
 def main(argv: Sequence[str]) -> None:
