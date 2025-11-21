@@ -530,12 +530,6 @@ class Transformer(nnx.Module):
     #      logit projection.
     # Its only effect is to "sow" these losses; it does not alter the primary logits output.
     if self.config.mtp_num_layers > 0:
-      # DEBUG: Print MTP block call info
-      import sys
-      print(f"[NNX Transformer] Calling MTP block, model_mode={model_mode}, enable_dropout={enable_dropout}", file=sys.stderr, flush=True)
-      print(f"[NNX Transformer] MTP block type: {type(self.mtp_block)}", file=sys.stderr, flush=True)
-      print(f"[NNX Transformer] decoder_target_tokens shape: {decoder_target_tokens.shape if decoder_target_tokens is not None else None}", file=sys.stderr, flush=True)
-
       self.mtp_block(
           shared_embedding=self.token_embedder,
           main_hidden_state=hidden_state,
@@ -547,7 +541,6 @@ class Transformer(nnx.Module):
           deterministic=not enable_dropout,
           model_mode=model_mode,
       )
-      print(f"[NNX Transformer] MTP block call completed", file=sys.stderr, flush=True)
 
     if self.config.attention == "vllm_rpa":
       # In vLLM, logits are computed separately after updating the KV cache.
