@@ -374,10 +374,8 @@ def calculate_mtp_loss(intermediate_outputs, config):
   sum_of_all_mtp_losses = jnp.sum(mtp_losses_array)
   sum_of_all_mtp_weights = jnp.sum(mtp_weights_array)
 
-  # If all weights are zero (initialization state), return 0
-  if sum_of_all_mtp_weights == 0.0:
-    return 0.0
-
+  # Compute loss with EPS to handle zero weights (initialization state)
+  # This avoids division by zero and TracerBoolConversionError in jit
   avg_mtp_loss = sum_of_all_mtp_losses / (sum_of_all_mtp_weights + EPS)
   scaled_mtp_loss = avg_mtp_loss * config.mtp_loss_scaling_factor
   return scaled_mtp_loss
