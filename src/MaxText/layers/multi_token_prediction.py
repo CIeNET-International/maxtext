@@ -225,10 +225,12 @@ class MultiTokenPredictionBlock(nnx.Module):
     # ToLinen wrapper will automatically expose these as Linen mutable collections:
     # - mtp_losses variables -> 'mtp_losses' collection
     # - mtp_acceptance variables -> 'mtp_acceptance' collection
-    self.losses = mtp_losses(jnp.array([]))
-    self.weights = mtp_losses(jnp.array([]))
-    self.mtp_preds = mtp_acceptance(jnp.array([]))
-    self.mtp_mask = mtp_acceptance(jnp.array([]))
+    # Initialize with zeros of proper shape to avoid checkpointing errors with zero-size arrays
+    self.losses = mtp_losses(jnp.zeros((config.mtp_num_layers,), dtype=jnp.float32))
+    self.weights = mtp_losses(jnp.zeros((config.mtp_num_layers,), dtype=jnp.float32))
+    # For acceptance, we use a dummy shape (1,) since these are only used during eval
+    self.mtp_preds = mtp_acceptance(jnp.zeros((1,), dtype=jnp.int32))
+    self.mtp_mask = mtp_acceptance(jnp.zeros((1,), dtype=jnp.float32))
 
     for k in range(1, config.mtp_num_layers + 1):
       layer = MultiTokenPredictionLayer(
@@ -369,6 +371,10 @@ def calculate_mtp_loss(intermediate_outputs, config):
 
   sum_of_all_mtp_losses = jnp.sum(mtp_losses_array)
   sum_of_all_mtp_weights = jnp.sum(mtp_weights_array)
+
+  # If all weights are zero (initialization state), return 0
+  if sum_of_all_mtp_weights == 0.0:
+    return 0.0
 
   avg_mtp_loss = sum_of_all_mtp_losses / (sum_of_all_mtp_weights + EPS)
   scaled_mtp_loss = avg_mtp_loss * config.mtp_loss_scaling_factor
