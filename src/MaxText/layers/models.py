@@ -381,13 +381,15 @@ class Transformer(nnx.Module):
       # For MTP, we use the DecoderLayer blueprint to ensure architectural consistency.
       # By convention, this is the last layer in the list.
       mtp_layer = layer_types[-1]
-      self.mtp_block = MultiTokenPredictionBlock(
+      mtp_block_linen = multi_token_prediction_block_as_linen(
           config=self.config,
           mesh=self.mesh,
           transformer_layer_module=mtp_layer,
           decoder=self.decoder,
           rngs=rngs,
+          name="mtp_block",
       )
+      self.mtp_block = nnx_wrappers.ToNNX(mtp_block_linen, rngs=rngs)
 
       self.mtp_block.lazy_init(
           shared_embedding=self.token_embedder,

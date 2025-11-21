@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
+from flax import linen as nn
 from flax import nnx
 
 from MaxText.common_types import Config, MODEL_MODE_TRAIN
@@ -27,6 +28,7 @@ from MaxText.layers.linears import DenseGeneral
 from MaxText.layers.normalizations import RMSNorm
 from MaxText.layers.decoders import DecoderLayer
 from MaxText.layers import nnx_wrappers
+from MaxText.layers.nnx_wrappers import current_linen_module
 from MaxText import max_utils
 from MaxText import maxtext_utils
 
@@ -285,14 +287,18 @@ class MultiTokenPredictionBlock(nnx.Module):
       # This is only active for the target layer during an eval run.
       if cfg.mtp_eval_target_module == k:
         mtp_top_1_pred = jnp.argmax(mtp_logits, axis=-1)
-        self.sow("mtp_acceptance", "mtp_preds", mtp_top_1_pred)
-        self.sow("mtp_acceptance", "mtp_mask", rolled_target_mask)
+        linen_module = current_linen_module()
+        if linen_module is not None:
+          linen_module.sow("mtp_acceptance", "mtp_preds", mtp_top_1_pred)
+          linen_module.sow("mtp_acceptance", "mtp_mask", rolled_target_mask)
 
       # For training, save the loss components for this MTP head.
       # This is only active during a training run.
       if model_mode == MODEL_MODE_TRAIN:
-        self.sow("mtp_losses", "losses", jnp.sum(mtp_xent_masked))
-        self.sow("mtp_losses", "weights", jnp.sum(rolled_target_mask))
+        linen_module = current_linen_module()
+        if linen_module is not None:
+          linen_module.sow("mtp_losses", "losses", jnp.sum(mtp_xent_masked))
+          linen_module.sow("mtp_losses", "weights", jnp.sum(rolled_target_mask))
 
       # The output of this layer is the input for the next, maintaining the causal chain.
       mtp_hidden_state = next_mtp_hidden_state
@@ -362,7 +368,7 @@ def multi_token_prediction_block_as_linen(
     decoder: nnx.Module,
     rngs: nnx.Rngs,
     name: str | None = None,
-) -> nnx.Module:
+) -> nn.Module:
   """Initializes MultiTokenPredictionBlock as a Linen module.
 
   Args:
