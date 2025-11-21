@@ -98,6 +98,10 @@ def create_nnx_model(config, mesh=None, devices=None, model_mode=MODEL_MODE_TRAI
     if rng_key is None:
       rng_key = jax.random.PRNGKey(config.init_weights_seed)
 
+  def _create_model(mesh: Mesh | None = None, model_mode: str = MODEL_MODE_TRAIN, rng_key: jax.Array | None = None):
+    if rng_key is None:
+      rng_key = jax.random.PRNGKey(config.init_weights_seed)
+
     if model_mode == MODEL_MODE_TRAIN:
       rngs = nnx.Rngs(params=rng_key, dropout=1)
     else:
