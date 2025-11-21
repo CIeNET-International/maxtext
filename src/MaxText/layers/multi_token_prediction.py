@@ -228,8 +228,9 @@ class MultiTokenPredictionBlock(nnx.Module):
     # Initialize with zeros of proper shape to avoid checkpointing errors with zero-size arrays
     self.losses = mtp_losses(jnp.zeros((config.mtp_num_layers,), dtype=jnp.float32))
     self.weights = mtp_losses(jnp.zeros((config.mtp_num_layers,), dtype=jnp.float32))
-    # For acceptance, we use a dummy shape (1,) since these are only used during eval
-    self.mtp_preds = mtp_acceptance(jnp.zeros((1,), dtype=jnp.int32))
+    # For acceptance, use float32 for all to avoid grad errors with int32
+    # These are only used during eval, and we'll convert to int32 when actually storing predictions
+    self.mtp_preds = mtp_acceptance(jnp.zeros((1,), dtype=jnp.float32))
     self.mtp_mask = mtp_acceptance(jnp.zeros((1,), dtype=jnp.float32))
 
     for k in range(1, config.mtp_num_layers + 1):
@@ -320,7 +321,8 @@ class MultiTokenPredictionBlock(nnx.Module):
       # For evaluation, collect predictions for target module
       if cfg.mtp_eval_target_module == k:
         mtp_top_1_pred = jnp.argmax(mtp_logits, axis=-1)
-        mtp_preds_list.append(mtp_top_1_pred)
+        # Convert to float32 to avoid grad errors (will be converted back to int in calculate_mtp_acceptance_rate)
+        mtp_preds_list.append(mtp_top_1_pred.astype(jnp.float32))
         mtp_masks_list.append(rolled_target_mask)
 
       # The output of this layer is the input for the next, maintaining the causal chain.
@@ -408,6 +410,9 @@ def calculate_mtp_acceptance_rate(intermediate_outputs, config):
   # where the required data is absent (e.g., during a training step) and prevents errors.
   if mtp_preds is None or valid_mask is None:
     return 0.0
+
+  # Convert predictions back to int32 (they were stored as float32 to avoid grad errors)
+  mtp_preds = mtp_preds.astype(jnp.int32)
 
   # Get the main model's greedy predictions from the logits.
   main_model_preds = jnp.argmax(intermediate_outputs["logits"], axis=-1)
