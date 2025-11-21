@@ -22,13 +22,13 @@ from jax.sharding import Mesh
 
 from flax import linen as nn
 from flax import nnx
+from flax.nnx import bridge
 
 from MaxText.common_types import Config, MODEL_MODE_TRAIN
 from MaxText.layers.linears import DenseGeneral
 from MaxText.layers.normalizations import RMSNorm
 from MaxText.layers.decoders import DecoderLayer
 from MaxText.layers import nnx_wrappers
-from MaxText.layers.nnx_wrappers import current_linen_module
 from MaxText import max_utils
 from MaxText import maxtext_utils
 
@@ -284,20 +284,43 @@ class MultiTokenPredictionBlock(nnx.Module):
       mtp_xent_masked = mtp_xent * rolled_target_mask
 
       # This logic doesn't run during model initialization to avoid unwanted population of the mutable collections.
-      linen_module = current_linen_module()
-      if linen_module is not None and not linen_module.is_initializing():
-        # For evaluation, save the top prediction and a valid token mask.
-        # This is only active for the target layer during an eval run.
-        if cfg.mtp_eval_target_module == k and linen_module.is_mutable_collection("mtp_acceptance"):
-          mtp_top_1_pred = jnp.argmax(mtp_logits, axis=-1)
-          linen_module.sow("mtp_acceptance", "mtp_preds", mtp_top_1_pred)
-          linen_module.sow("mtp_acceptance", "mtp_mask", rolled_target_mask)
+      # Try to get Linen context from bridge
+      context = bridge.current_context()
 
-        # For training, save the loss components for this MTP head.
-        # This is only active during a training run.
-        if linen_module.is_mutable_collection("mtp_losses"):
-          linen_module.sow("mtp_losses", "losses", jnp.sum(mtp_xent_masked))
-          linen_module.sow("mtp_losses", "weights", jnp.sum(rolled_target_mask))
+      # DEBUG: Print context status (this will be compiled away in JAX but shows in traces)
+      if k == 1:  # Only print for first layer to avoid spam
+        import sys
+        print(f"[MTP DEBUG] Layer {k}: context={context is not None}", file=sys.stderr, flush=True)
+
+      if context is not None:
+        linen_module = context.module
+
+        if k == 1:
+          print(f"[MTP DEBUG] Layer {k}: is_initializing={linen_module.is_initializing()}", file=sys.stderr, flush=True)
+          print(f"[MTP DEBUG] Layer {k}: is_mutable_collection('mtp_losses')={linen_module.is_mutable_collection('mtp_losses')}", file=sys.stderr, flush=True)
+
+        if not linen_module.is_initializing():
+          # For evaluation, save the top prediction and a valid token mask.
+          # This is only active for the target layer during an eval run.
+          if cfg.mtp_eval_target_module == k and linen_module.is_mutable_collection("mtp_acceptance"):
+            mtp_top_1_pred = jnp.argmax(mtp_logits, axis=-1)
+            linen_module.sow("mtp_acceptance", "mtp_preds", mtp_top_1_pred)
+            linen_module.sow("mtp_acceptance", "mtp_mask", rolled_target_mask)
+            if k == 1:
+              print(f"[MTP DEBUG] Layer {k}: Sowed mtp_acceptance", file=sys.stderr, flush=True)
+
+          # For training, save the loss components for this MTP head.
+          # This is only active during a training run.
+          if linen_module.is_mutable_collection("mtp_losses"):
+            linen_module.sow("mtp_losses", "losses", jnp.sum(mtp_xent_masked))
+            linen_module.sow("mtp_losses", "weights", jnp.sum(rolled_target_mask))
+            if k == 1:
+              loss_val = jnp.sum(mtp_xent_masked)
+              weight_val = jnp.sum(rolled_target_mask)
+              print(f"[MTP DEBUG] Layer {k}: Sowed mtp_losses - loss={loss_val:.4f}, weight={weight_val:.4f}", file=sys.stderr, flush=True)
+      else:
+        if k == 1:
+          print(f"[MTP DEBUG] Layer {k}: No Linen context found!", file=sys.stderr, flush=True)
 
       # The output of this layer is the input for the next, maintaining the causal chain.
       mtp_hidden_state = next_mtp_hidden_state
