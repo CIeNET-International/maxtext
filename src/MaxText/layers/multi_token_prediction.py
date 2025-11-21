@@ -233,13 +233,17 @@ class MultiTokenPredictionBlock(nnx.Module):
     self.mtp_preds = mtp_acceptance(jnp.zeros((1,), dtype=jnp.float32))
     self.mtp_mask = mtp_acceptance(jnp.zeros((1,), dtype=jnp.float32))
 
+    # Create each MTP layer with a forked RNG to ensure different initializations
+    # This matches Linen's behavior where each layer gets unique parameters
     for k in range(1, config.mtp_num_layers + 1):
+      # Fork the RNG for each layer to get unique parameter initializations
+      layer_rngs = rngs.fork()
       layer = MultiTokenPredictionLayer(
           config=config,
           mesh=mesh,
           layer_number=k,
           transformer_layer_module=transformer_layer_module,
-          rngs=rngs,
+          rngs=layer_rngs,
       )
       setattr(self, f"mtp_layer_{k}", layer)
 
@@ -316,7 +320,8 @@ class MultiTokenPredictionBlock(nnx.Module):
       # Collect loss components for this MTP head
       if model_mode == MODEL_MODE_TRAIN:
         mtp_losses_list.append(jnp.sum(mtp_xent_masked))
-        mtp_weights_list.append(jnp.sum(rolled_target_mask))
+        # Convert weights to float32 for consistency with Variable initialization
+        mtp_weights_list.append(jnp.sum(rolled_target_mask).astype(jnp.float32))
 
       # For evaluation, collect predictions for target module
       if cfg.mtp_eval_target_module == k:
@@ -335,10 +340,6 @@ class MultiTokenPredictionBlock(nnx.Module):
     if mtp_losses_list:
       self.losses.value = jnp.stack(mtp_losses_list)
       self.weights.value = jnp.stack(mtp_weights_list)
-      # DEBUG: Print MTP losses to verify collection
-      import sys
-      print(f"[MTP DEBUG] Collected {len(mtp_losses_list)} losses: {self.losses.value}", file=sys.stderr, flush=True)
-      print(f"[MTP DEBUG] Collected {len(mtp_weights_list)} weights: {self.weights.value}", file=sys.stderr, flush=True)
     if mtp_preds_list:
       self.mtp_preds.value = jnp.stack(mtp_preds_list)
       self.mtp_mask.value = jnp.stack(mtp_masks_list)
@@ -357,11 +358,6 @@ def calculate_mtp_loss(intermediate_outputs, config):
   mtp_weights = maxtext_utils.get_nested_value(
       intermediate_outputs, weights_path, default=None
   )
-
-  # DEBUG: Print what we got
-  import sys
-  print(f"[calculate_mtp_loss] mtp_losses type: {type(mtp_losses)}, value: {mtp_losses}", file=sys.stderr, flush=True)
-  print(f"[calculate_mtp_loss] mtp_weights type: {type(mtp_weights)}, value: {mtp_weights}", file=sys.stderr, flush=True)
 
   # Handle both tuple (Linen sow) and array (NNX Variable) formats
   if mtp_losses is None:
@@ -383,15 +379,10 @@ def calculate_mtp_loss(intermediate_outputs, config):
   sum_of_all_mtp_losses = jnp.sum(mtp_losses_array)
   sum_of_all_mtp_weights = jnp.sum(mtp_weights_array)
 
-  print(f"[calculate_mtp_loss] sum_losses: {sum_of_all_mtp_losses}, sum_weights: {sum_of_all_mtp_weights}", file=sys.stderr, flush=True)
-
   # Compute loss with EPS to handle zero weights (initialization state)
   # This avoids division by zero and TracerBoolConversionError in jit
   avg_mtp_loss = sum_of_all_mtp_losses / (sum_of_all_mtp_weights + EPS)
   scaled_mtp_loss = avg_mtp_loss * config.mtp_loss_scaling_factor
-
-  print(f"[calculate_mtp_loss] avg_loss: {avg_mtp_loss}, scaled_loss: {scaled_mtp_loss}", file=sys.stderr, flush=True)
-
   return scaled_mtp_loss
 
 
