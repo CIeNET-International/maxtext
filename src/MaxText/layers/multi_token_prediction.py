@@ -283,20 +283,19 @@ class MultiTokenPredictionBlock(nnx.Module):
       )
       mtp_xent_masked = mtp_xent * rolled_target_mask
 
-      # For evaluation, save the top prediction and a valid token mask.
-      # This is only active for the target layer during an eval run.
-      if cfg.mtp_eval_target_module == k:
-        mtp_top_1_pred = jnp.argmax(mtp_logits, axis=-1)
-        linen_module = current_linen_module()
-        if linen_module is not None:
+      # This logic doesn't run during model initialization to avoid unwanted population of the mutable collections.
+      linen_module = current_linen_module()
+      if linen_module is not None and not linen_module.is_initializing():
+        # For evaluation, save the top prediction and a valid token mask.
+        # This is only active for the target layer during an eval run.
+        if cfg.mtp_eval_target_module == k and linen_module.is_mutable_collection("mtp_acceptance"):
+          mtp_top_1_pred = jnp.argmax(mtp_logits, axis=-1)
           linen_module.sow("mtp_acceptance", "mtp_preds", mtp_top_1_pred)
           linen_module.sow("mtp_acceptance", "mtp_mask", rolled_target_mask)
 
-      # For training, save the loss components for this MTP head.
-      # This is only active during a training run.
-      if model_mode == MODEL_MODE_TRAIN:
-        linen_module = current_linen_module()
-        if linen_module is not None:
+        # For training, save the loss components for this MTP head.
+        # This is only active during a training run.
+        if linen_module.is_mutable_collection("mtp_losses"):
           linen_module.sow("mtp_losses", "losses", jnp.sum(mtp_xent_masked))
           linen_module.sow("mtp_losses", "weights", jnp.sum(rolled_target_mask))
 
