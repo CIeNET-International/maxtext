@@ -22,8 +22,6 @@ from jax.sharding import Mesh
 
 from flax import linen as nn
 from flax import nnx
-from flax.nnx import bridge
-from flax import linen
 
 from MaxText.common_types import Config, MODEL_MODE_TRAIN
 from MaxText.layers.linears import DenseGeneral
@@ -346,17 +344,31 @@ def calculate_mtp_loss(intermediate_outputs, config):
   weights_path = ("mtp_losses", "mtp_block", "weights")
 
   mtp_losses = maxtext_utils.get_nested_value(
-      intermediate_outputs, losses_path, default=()
+      intermediate_outputs, losses_path, default=None
   )
   mtp_weights = maxtext_utils.get_nested_value(
-      intermediate_outputs, weights_path, default=()
+      intermediate_outputs, weights_path, default=None
   )
 
-  if not mtp_losses:  # MTP heads did not run
+  # Handle both tuple (Linen sow) and array (NNX Variable) formats
+  if mtp_losses is None:
     return 0.0
 
-  sum_of_all_mtp_losses = jnp.sum(jnp.array(mtp_losses))
-  sum_of_all_mtp_weights = jnp.sum(jnp.array(mtp_weights))
+  # Convert to array if it's a tuple/list, otherwise use as-is
+  if isinstance(mtp_losses, (tuple, list)):
+    if not mtp_losses:  # Empty tuple/list
+      return 0.0
+    mtp_losses_array = jnp.array(mtp_losses)
+    mtp_weights_array = jnp.array(mtp_weights)
+  else:
+    # Already an array from NNX Variable
+    if mtp_losses.size == 0:  # Empty array
+      return 0.0
+    mtp_losses_array = mtp_losses
+    mtp_weights_array = mtp_weights
+
+  sum_of_all_mtp_losses = jnp.sum(mtp_losses_array)
+  sum_of_all_mtp_weights = jnp.sum(mtp_weights_array)
 
   avg_mtp_loss = sum_of_all_mtp_losses / (sum_of_all_mtp_weights + EPS)
   scaled_mtp_loss = avg_mtp_loss * config.mtp_loss_scaling_factor
@@ -369,8 +381,21 @@ def calculate_mtp_acceptance_rate(intermediate_outputs, config):
   sown_data = maxtext_utils.get_nested_value(
       intermediate_outputs, ("mtp_acceptance", "mtp_block"), {}
   )
-  mtp_preds = maxtext_utils.get_nested_value(sown_data, ("mtp_preds",), [None])[0]
-  valid_mask = maxtext_utils.get_nested_value(sown_data, ("mtp_mask",), [None])[0]
+
+  # Handle both tuple (Linen sow) and direct value (NNX Variable) formats
+  mtp_preds_raw = maxtext_utils.get_nested_value(sown_data, ("mtp_preds",), None)
+  valid_mask_raw = maxtext_utils.get_nested_value(sown_data, ("mtp_mask",), None)
+
+  # Extract the actual value from tuple if needed (Linen format)
+  if isinstance(mtp_preds_raw, (tuple, list)):
+    mtp_preds = mtp_preds_raw[0] if mtp_preds_raw else None
+  else:
+    mtp_preds = mtp_preds_raw
+
+  if isinstance(valid_mask_raw, (tuple, list)):
+    valid_mask = valid_mask_raw[0] if valid_mask_raw else None
+  else:
+    valid_mask = valid_mask_raw
 
   # These values are only "sown" (saved) during an evaluation run and only for the specific
   # MTP layer specified by `config.mtp_eval_target_module`. This check handles cases
