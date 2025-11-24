@@ -16,7 +16,7 @@
 """ Utils that are only interesting for creating a model in MaxText. """
 
 from collections.abc import Sequence
-from typing import overload
+from typing import Any, overload
 
 from flax import nnx
 import flax.linen as nn
@@ -34,45 +34,12 @@ from etils import epath
 
 def from_config(
     config: pyconfig.HyperParameters,
-    devices: Sequence[jax.Device] | None = None,
-    mesh: Mesh | None = None,
+    devices: Sequence[Any] | None = None,
     *,
     model_mode: str = MODEL_MODE_TRAIN,
     rngs: nnx.Rngs | None = None,
-) -> models.Transformer:
-  """Load a pretrained MaxText model from checkpoint.
-
-  This function loads a model from a checkpoint.
-
-  Args:
-      config: Config object.
-      devices: Sequence of devices to use for the model. If None, use all
-        available devices.
-
-  Returns:
-      Transformer: The loaded model instance (only the model)
-
-  Example:
-      model = from_config(config)
-  """
-  rngs = rngs or nnx.Rngs(
-      params=jax.random.PRNGKey(config.init_weights_seed),
-      dropout=jax.random.PRNGKey(config.init_dropouts_seed),
-  )
-  devices_array = maxtext_utils.create_device_mesh(config, devices)
-
-  if mesh is None:
-    if config.shard_mode == ShardMode.EXPLICIT:
-      axis_types = tuple([AxisType.Explicit] * len(config.mesh_axes))
-    else:
-      axis_types = tuple([AxisType.Auto] * len(config.mesh_axes))
-
-    mesh = Mesh(devices_array, config.mesh_axes, axis_types=axis_types)
-
-  model = create_model(config, mesh, model_mode=model_mode, rngs=rngs)
-
-  # Return only the model
-  return model
+) -> nnx.Module:
+  ...
 
 
 def get_transformer_model(config, mesh, quant, rngs: nnx.Rngs, model_mode: str = MODEL_MODE_TRAIN) -> nn.Module:
@@ -82,13 +49,15 @@ def get_transformer_model(config, mesh, quant, rngs: nnx.Rngs, model_mode: str =
   return models.Transformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
 
 
-def create_model(config, mesh, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rngs | None = None):
-  """Instantiates and returns the model object, sharded across the mesh."""
-  # Model definition
-  quant = quantizations.configure_quantization(config)
-  model = get_transformer_model(config, mesh, quant, model_mode=model_mode, rngs=rngs)
-  model = quantizations.maybe_quantize_model(model, config)
-  return model
+def create_nnx_model(
+    config: pyconfig.HyperParameters,
+    devices: Sequence[Any] | None = None,
+    *,
+    model_mode: str = MODEL_MODE_TRAIN,
+):
+  """Creates an NNX model with sharded parameters, optionally loading checkpoints."""
+
+  mesh = _create_mesh(config, devices)
 
 
 def create_nnx_model(config, mesh=None, devices=None, model_mode=MODEL_MODE_TRAIN, rng_key=None):
@@ -115,24 +84,15 @@ def create_nnx_model(config, mesh=None, devices=None, model_mode=MODEL_MODE_TRAI
   graphdef, abstract_state = nnx.split(abstract_model)
   specs = nnx.get_partition_spec(abstract_state)
 
-  if mesh is None:
-    mesh = abstract_model.mesh
-
-  # JIT a function that creates the model state with proper sharding from the start.
-  # By providing out_shardings, we instruct JAX to produce sharded output directly,
-  # avoiding a large intermediate allocation on a single device.
   with nn.logical_axis_rules(config.logical_axis_rules):
     out_shardings = nn.logical_to_mesh_sharding(specs, mesh)
 
   @partial(jax.jit, out_shardings=out_shardings)
   def create_sharded_state():
-    # This will be JIT-compiled. JAX knows the output sharding and can
-    # initialize the parameters directly on the target devices in a sharded way.
-    model = from_config(config, devices)
+    model = _create_model()
     return nnx.state(model)
 
   with mesh:
-    # Create the model with sharded parameters.
     sharded_state = create_sharded_state()
     model = nnx.merge(graphdef, sharded_state)
 
@@ -147,12 +107,6 @@ def create_nnx_model(config, mesh=None, devices=None, model_mode=MODEL_MODE_TRAI
             )
         )
 
-        # This is a memory optimization. We don't want to restore the entire checkpoint - only the params.
-        # Rather than passing the entire abstract state, which could unnecessarily restore opt_state and
-        # waste memory, we instead restore the params field of the checkpoint (which itself may be a dictionary
-        #  containing a key named 'params').
-
-        # Get the structure of checkpoint in `config.load_parameters_path`
         metadata = ckptr.metadata(config.load_parameters_path)
 
         is_nnx_checkpoint = True
@@ -160,7 +114,6 @@ def create_nnx_model(config, mesh=None, devices=None, model_mode=MODEL_MODE_TRAI
             "params" in metadata.item_metadata.tree.keys()
             and "params" in metadata.item_metadata.tree.get("params", {}).keys()
         ):
-          # structure of linen checkpoint: {'params': {'params': {'decoder': ...}}}
           is_nnx_checkpoint = False
           target_for_restore = jax.tree.map(
               lambda v: v.value,
@@ -171,7 +124,6 @@ def create_nnx_model(config, mesh=None, devices=None, model_mode=MODEL_MODE_TRAI
           item_to_restore = {"params": {"params": target_for_restore}}
           restore_args = {"params": {"params": ocp.checkpoint_utils.construct_restore_args(target_for_restore)}}
         else:
-          # structure of nnx checkpoint: {'decoder': {'value': ...}}
           target_for_restore = jax.tree.map(
               lambda v: {"value": v.value},
               sharded_state,
