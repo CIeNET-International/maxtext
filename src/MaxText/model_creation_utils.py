@@ -32,6 +32,37 @@ from functools import partial
 from etils import epath
 
 
+def _ensure_rngs(rngs: nnx.Rngs | None, config: pyconfig.HyperParameters) -> nnx.Rngs:
+  return rngs or nnx.Rngs(params=jax.random.PRNGKey(config.init_weights_seed), dropout=1)
+
+
+def _create_mesh(config: pyconfig.HyperParameters, devices: Sequence[Any] | None) -> Mesh:
+  devices_array = maxtext_utils.create_device_mesh(config, devices)
+  if config.shard_mode == ShardMode.EXPLICIT:
+    axis_types = tuple([AxisType.Explicit] * len(config.mesh_axes))
+  else:
+    axis_types = tuple([AxisType.Auto] * len(config.mesh_axes))
+  return Mesh(devices_array, config.mesh_axes, axis_types=axis_types)
+
+
+def _instantiate_transformer(
+    config: pyconfig.HyperParameters,
+    mesh: Mesh,
+    *,
+    model_mode: str = MODEL_MODE_TRAIN,
+    rngs: nnx.Rngs,
+) -> nnx.Module:
+  """Create an NNX Transformer (or ZeroOneTransformer) and apply quantization."""
+
+  quant = quantizations.configure_quantization(config)
+  if config.model_fsdp_ag_once:
+    model = models.ZeroOneTransformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
+  else:
+    model = models.Transformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
+  return quantizations.maybe_quantize_model(model, config)
+
+
+@overload
 def from_config(
     config: pyconfig.HyperParameters,
     devices: Sequence[Any] | None = None,
@@ -42,11 +73,18 @@ def from_config(
   ...
 
 
-def get_transformer_model(config, mesh, quant, rngs: nnx.Rngs, model_mode: str = MODEL_MODE_TRAIN) -> nn.Module:
-  """Returns the transformer model based on the configuration."""
-  if config.model_fsdp_ag_once:
-    return models.ZeroOneTransformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
-  return models.Transformer(config, mesh, quant=quant, model_mode=model_mode, rngs=rngs)
+def from_config(
+    config: pyconfig.HyperParameters,
+    devices: Sequence[Any] | None = None,
+    *,
+    model_mode: str = MODEL_MODE_TRAIN,
+    rngs: nnx.Rngs | None = None,
+) -> nnx.Module | models.Transformer:
+  """Instantiate an NNX Transformer from config and optional devices."""
+
+  mesh = _create_mesh(config, devices)
+  model_rngs = _ensure_rngs(rngs, config)
+  return _instantiate_transformer(config, mesh, model_mode=model_mode, rngs=model_rngs)
 
 
 def create_nnx_model(
@@ -59,24 +97,9 @@ def create_nnx_model(
 
   mesh = _create_mesh(config, devices)
 
-
-def create_nnx_model(config, mesh=None, devices=None, model_mode=MODEL_MODE_TRAIN, rng_key=None):
-  """Creates a NNX model with sharded parameters, possibly loading from a checkpoint."""
-
-  def _create_model(mesh: Mesh | None = None, model_mode: str = MODEL_MODE_TRAIN, rng_key: jax.Array | None = None):
-    if rng_key is None:
-      rng_key = jax.random.PRNGKey(config.init_weights_seed)
-
-  def _create_model(mesh: Mesh | None = None, model_mode: str = MODEL_MODE_TRAIN, rng_key: jax.Array | None = None):
-    if rng_key is None:
-      rng_key = jax.random.PRNGKey(config.init_weights_seed)
-
-    if model_mode == MODEL_MODE_TRAIN:
-      rngs = nnx.Rngs(params=rng_key, dropout=1)
-    else:
-      rngs = nnx.Rngs(params=rng_key)  # disable dropout RNG for inference
-
-    return from_config(config, devices, mesh, rngs=rngs, model_mode=model_mode)
+  def _create_model():
+    local_rngs = nnx.Rngs(params=jax.random.PRNGKey(config.init_weights_seed), dropout=1)
+    return _instantiate_transformer(config, mesh, model_mode=model_mode, rngs=local_rngs)
 
   _create_model_partial = partial(_create_model, mesh=mesh, model_mode=model_mode, rng_key=rng_key)
 
