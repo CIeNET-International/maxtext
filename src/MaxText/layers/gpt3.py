@@ -190,7 +190,7 @@ class Gpt3MultiHeadAttention(nnx.Module):
       config: Config,
       model_mode: str,
       num_heads: int,
-      feature_dim: Array,
+      feature_dim: tuple[int, ...],
       head_dim: int,
       max_target_length: int,
       max_prefill_predict_length: int,
@@ -263,7 +263,11 @@ class Gpt3MultiHeadAttention(nnx.Module):
     )
 
   def create_projection_layer(
-      self, input_shape: tuple[int], output_shape: tuple[int], kernel_axes: tuple[str], axis: int = -1
+      self, 
+      input_shape: tuple[int, ...],
+      output_shape: tuple[int, ...] | int,
+      kernel_axes: tuple[str, ...],
+      axis: int | tuple[int, ...] = -1
   ):
     """Create projection layer for Key, Value, Query and Output"""
     axis = canonicalize_tuple(axis)
