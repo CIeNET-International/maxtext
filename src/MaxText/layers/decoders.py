@@ -399,14 +399,10 @@ class Decoder(nn.Module):
     self.decoder_layer = self.get_decoder_layers()
     self.norm_layer = self.get_norm_layer(num_features=self.config.emb_dim)
     if self.config.using_pipeline_parallelism:
-      nnx_decoder_classes = self.get_nnx_decoder_layers()
-      if nnx_decoder_classes is not None:
-        pipeline_stage_module = self.get_pipeline_stage_module(nnx_decoder_classes, use_nnx=True)
-      else:
-        pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer, use_nnx=False)
+      pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer)
       remat_policy = self.get_remat_policy()
       self.pipeline_module = pipeline.create_pipeline(
-          config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy, use_nnx=(nnx_decoder_classes is not None)
+          config=self.config, mesh=self.mesh, layer=pipeline_stage_module, remat_policy=remat_policy,
       )
 
   def minimal_policy(self, with_context=False):
@@ -685,7 +681,7 @@ class Decoder(nn.Module):
         config=cfg, mesh=mesh, name=metadata_axis_name, quant=self.quant, **kwargs  # pytype: disable=wrong-keyword-args
     )
 
-  def get_pipeline_stage_module(self, decoder_blocks, use_nnx=False):
+  def get_pipeline_stage_module(self, decoder_blocks):
     """get pipeline stage module
 
     Args:
@@ -703,7 +699,7 @@ class Decoder(nn.Module):
     cfg = self.config
     base_stage = get_layer_to_pipeline(decoder_blocks, cfg)
 
-    if use_nnx:
+    if issubclass(base_stage, nnx.Module):
       if cfg.num_layers_per_pipeline_stage == 1:
         return base_stage
       else:

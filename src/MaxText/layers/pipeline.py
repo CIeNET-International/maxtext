@@ -32,6 +32,7 @@ from MaxText.common_types import Config, MODEL_MODE_TRAIN, EP_AS_CONTEXT
 from MaxText.sharding import all_gather_over_fsdp
 from MaxText import max_logging
 from MaxText.layers import nnx_wrappers
+from MaxText.layers.initializers import variable_to_logically_partitioned
 
 
 class Pipeline(nnx.Module):
@@ -53,10 +54,10 @@ class Pipeline(nnx.Module):
 
   def __init__(
       self,
-      layers: Callable | type,
+      layer: Callable[..., nnx.Module|nn.Module],
       config: Config,
       mesh: Mesh,
-      rngs: nnx.Rngs = None,
+      rngs: nnx.Rngs,
       remat_policy: Any = None,
   ):
     """Initialize Pipeline with NNX or Linen decoder layers.
@@ -88,20 +89,19 @@ class Pipeline(nnx.Module):
       self.seq_len_axis_name = "activation_length_no_exp"
 
     # Detect if layers is a Linen class/instance or NNX class
-    self._is_linen = (isinstance(layers, type) and issubclass(layers, nn.Module)) or isinstance(layers, nn.Module)
-
+    self._is_linen = (isinstance(layer, type) and issubclass(layer, nn.Module)) or isinstance(layer, nn.Module)
     if self._is_linen:
-      if isinstance(layers, nn.Module):
-        self.layers = layers
+      if isinstance(layer, nn.Module):
+        self.layer = layer
       else:
-        self.layers = layers(config=config, mesh=mesh, model_mode=MODEL_MODE_TRAIN)
+        self.layer = layer(config=config, mesh=mesh, model_mode=MODEL_MODE_TRAIN)
       self._linen_variables = None
     else:
       # Create num_stages independent NNX instances, stored as attributes for
       # NNX pytree tracking (not as Python lists).
       for s in range(self.num_stages):
         stage_rngs = nnx.Rngs(s)
-        instance = layers(
+        instance = layer(
             config=config,
             mesh=mesh,
             model_mode=MODEL_MODE_TRAIN,
@@ -361,7 +361,7 @@ class Pipeline(nnx.Module):
 
     linen_rngs = {'params': jax.random.PRNGKey(0), 'dropout': jax.random.PRNGKey(1)}
 
-    base_params = self.layers.init(
+    base_params = self.layer.init(
         linen_rngs,
         sample_input,
         sample_seg_ids,
@@ -392,7 +392,7 @@ class Pipeline(nnx.Module):
     )
 
     def apply_stage(stage_params, stage_input, stage_seg_ids, stage_pos):
-      output = self.layers.apply(
+      output = self.layer.apply(
           stage_params,
           stage_input,
           stage_seg_ids,
@@ -606,16 +606,15 @@ class PipelineToLinen(nnx_wrappers.ToLinen):
 
 def create_pipeline(
     config: Config,
-    layers: Callable | type,
+    layer: Callable | type,
     mesh: Mesh,
     remat_policy: Any = None,
-    use_nnx: bool = True,
-) -> PipelineToLinen:
+) -> nnx_wrappers.ToLinen:
   """Factory function to create a Pipeline wrapped as a Linen module.
 
   Args:
     config: Model configuration
-    layers: NNX or Linen decoder layer class to use for pipeline stages
+    layer: NNX or Linen decoder layer class to use for pipeline stages
     mesh: Device mesh for sharding
     remat_policy: Remat policy for loop iterations
     use_nnx: Whether to use NNX pipeline (True) or Linen (False)
@@ -623,17 +622,13 @@ def create_pipeline(
   Returns:
     PipelineToLinen wrapper around the NNX Pipeline
   """
-  if not use_nnx:
-    raise ValueError("This implementation only supports NNX pipelines (use_nnx=True)")
-
-  wrapped = PipelineToLinen(
+  return nnx_wrappers.to_linen(
       Pipeline,
-      kwargs={
-          'layers': layers,
-          'config': config,
-          'mesh': mesh,
-          'remat_policy': remat_policy,
-      }
+      config=config,
+      mesh=mesh,
+      layer=layer,
+      remat_policy=remat_policy,
+      name="pipeline_module",
+      abstract_init=False,
+      metadata_fn=variable_to_logically_partitioned,
   )
-
-  return wrapped
