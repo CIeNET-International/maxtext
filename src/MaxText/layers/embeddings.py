@@ -342,6 +342,7 @@ class RotaryEmbedding(nnx.Module):
           "The embedding dims of the rotary position embedding" "must match the hidden dimension of the inputs."
       )
 
+
     position = position[:, :, jnp.newaxis, jnp.newaxis]
     sinusoid_inp = position / self.timescale
     sin = jnp.sin(sinusoid_inp).astype(inputs.dtype)

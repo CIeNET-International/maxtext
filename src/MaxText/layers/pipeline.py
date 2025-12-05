@@ -14,7 +14,6 @@
 
 """ Pipeline layer wrapping a decoder layer(s). Supports circular pipelining """
 
-import functools
 from typing import Any, Callable
 
 import numpy as np
@@ -29,8 +28,6 @@ from flax import linen as nn
 from flax import nnx
 
 from MaxText.common_types import Config, MODEL_MODE_TRAIN, EP_AS_CONTEXT
-from MaxText.sharding import all_gather_over_fsdp
-from MaxText import max_logging
 from MaxText.layers import nnx_wrappers
 from MaxText.layers.initializers import variable_to_logically_partitioned
 
@@ -51,6 +48,8 @@ class Pipeline(nnx.Module):
     mesh:  The device mesh of the system.
     remat_policy: Remat policy to use for the loop iterations
   """
+
+  _linen_variables: nnx.Data[dict | None]
 
   def __init__(
       self,
@@ -89,12 +88,9 @@ class Pipeline(nnx.Module):
       self.seq_len_axis_name = "activation_length_no_exp"
 
     # Detect if layers is a Linen class/instance or NNX class
-    self._is_linen = (isinstance(layer, type) and issubclass(layer, nn.Module)) or isinstance(layer, nn.Module)
+    self._is_linen = isinstance(layer, nn.Module)
     if self._is_linen:
-      if isinstance(layer, nn.Module):
-        self.layer = layer
-      else:
-        self.layer = layer(config=config, mesh=mesh, model_mode=MODEL_MODE_TRAIN)
+      self.layer = layer
       self._linen_variables = None
     else:
       # Create num_stages independent NNX instances, stored as attributes for
@@ -361,6 +357,12 @@ class Pipeline(nnx.Module):
 
     linen_rngs = {'params': jax.random.PRNGKey(0), 'dropout': jax.random.PRNGKey(1)}
 
+    # Ensure inputs to init are 2D
+    if sample_seg_ids is not None and sample_seg_ids.ndim == 1:
+        sample_seg_ids = sample_seg_ids[None, :]
+    if sample_positions is not None and sample_positions.ndim == 1:
+        sample_positions = sample_positions[None, :]
+
     base_params = self.layer.init(
         linen_rngs,
         sample_input,
@@ -392,6 +394,12 @@ class Pipeline(nnx.Module):
     )
 
     def apply_stage(stage_params, stage_input, stage_seg_ids, stage_pos):
+      # Ensure per-stage positions and segment_ids are 2D for the layer call
+      if stage_pos is not None and stage_pos.ndim == 1:
+        stage_pos = stage_pos[None, :]
+      if stage_seg_ids is not None and stage_seg_ids.ndim == 1:
+        stage_seg_ids = stage_seg_ids[None, :]
+
       output = self.layer.apply(
           stage_params,
           stage_input,
@@ -441,6 +449,12 @@ class Pipeline(nnx.Module):
     )
 
     def call_stage(state, stage_input, stage_seg_ids, stage_pos):
+
+      if stage_pos is not None and stage_pos.ndim == 1:
+        stage_pos = stage_pos[None, :]
+      if stage_seg_ids is not None and stage_seg_ids.ndim == 1:
+        stage_seg_ids = stage_seg_ids[None, :]
+
       module = nnx.merge(graphdef, state)
       output = module(stage_input, stage_seg_ids, stage_pos, deterministic, model_mode)
       if isinstance(output, tuple):
@@ -449,6 +463,10 @@ class Pipeline(nnx.Module):
 
     if stages_segment_ids is None:
       def call_stage_no_seg(state, stage_input, stage_pos):
+        # Ensure per-stage positions is 2D for the layer call
+        if stage_pos is not None and stage_pos.ndim == 1:
+          stage_pos = stage_pos[None, :]
+
         module = nnx.merge(graphdef, state)
         output = module(stage_input, None, stage_pos, deterministic, model_mode)
         if isinstance(output, tuple):
@@ -538,6 +556,14 @@ class Pipeline(nnx.Module):
             self.config.emb_dim,
         )
     )
+    if positions is not None:
+        positions = positions.reshape(
+            (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
+        )
+    if segment_ids is not None:
+        segment_ids = segment_ids.reshape(
+            (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
+        )
 
     if self._is_linen and self._linen_variables is None:
       example_input = inputs[0]
