@@ -109,7 +109,7 @@ class Pipeline(nnx.Module):
         + self.iterations_to_complete_first_microbatch_one_repeat()
     )
 
-  def init_states(self, inputs):
+  def init_states(self, inputs, initial_dropout_rng):
     """Initialize pipeline loop state buffers.
 
     Assumes inputs are reshaped to [num_microbatches, micro_batch_size, sequence, embed].
@@ -158,6 +158,7 @@ class Pipeline(nnx.Module):
         "circ_storage_mover": circ_storage_mover,
         "loop_iteration": 0,
         "prev_outputs": prev_outputs,
+         "dropout_rng": initial_dropout_rng # Initialize RNG in state
     }
     return init_loop_state
 
@@ -477,10 +478,9 @@ class Pipeline(nnx.Module):
     circ_storage = loop_state["circ_storage"]
     loop_iteration = loop_state["loop_iteration"]
 
-    # Get a base key for this iteration
-    iter_dropout_key_base = self.rngs.dropout()
-    # Fold in the loop iteration number to make the key unique per iteration
-    iter_dropout_key = jax.random.fold_in(iter_dropout_key_base, loop_iteration)
+    dropout_key = loop_state["dropout_rng"] # Get key from state
+    # Split key for this iteration's use and for the next iteration
+    iter_dropout_key, next_iter_dropout_key = jax.random.split(dropout_key)
 
  
     microbatch_ids, _ = self.get_microbatch_and_repeat_ids(loop_iteration)
@@ -492,6 +492,7 @@ class Pipeline(nnx.Module):
     stages_output = self._run_stages_linen(stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode, iter_dropout_key)
 
     new_loop_state = self.get_new_loop_state(stages_output, loop_state)
+    new_loop_state["dropout_rng"] = next_iter_dropout_key # Store the key for the next loop
     return new_loop_state
 
 
@@ -533,32 +534,26 @@ class Pipeline(nnx.Module):
       example_pos = positions[0] if positions is not None else None
       self._initialize_linen_parameters(example_input, example_seg_ids, example_pos, deterministic, model_mode)
 
-    loop_state = self.init_states(inputs)
+    loop_state = self.init_states(inputs, self.rngs.dropout())
 
     bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
     real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
     total_iterations = real_iterations + bubble_iterations
 
     if self.config.scan_pipeline_iterations:
-      def run_iteration_scannable(pipeline_instance, loop_state, xs):
-        new_loop_state = pipeline_instance.run_one_iteration(loop_state, positions, segment_ids, deterministic, model_mode)
-        return new_loop_state
+      def run_iteration_scannable(loop_state, xs):
+        new_loop_state = self.run_one_iteration(loop_state, positions, segment_ids, deterministic, model_mode)
+        return new_loop_state, None
 
-      remat_fn = run_iteration_scannable
       if self.config.set_remat_policy_on_pipeline_iterations:
-        remat_fn = nnx.remat(
-            run_iteration_scannable,
-            prevent_cse=False,
-            policy=self.get_pipeline_remat_policy(),
+        run_iteration_scannable = jax.checkpoint(
+          run_iteration_scannable,
+          prevent_cse=False,
+          policy=self.get_pipeline_remat_policy(),
         )
 
-      ScannedFn = nnx.scan(
-          remat_fn,
-          in_axes=(None, nnx.Carry, None),  # Corresponds to (self, loop_state, xs)
-          out_axes=nnx.Carry,               # Corresponds to new_loop_state
-          length=total_iterations,
-      )
-      loop_state = ScannedFn(self, loop_state, None)
+      loop_state, _ = jax.lax.scan(run_iteration_scannable, loop_state, None, length=total_iterations)
+
     else:
       for _ in range(total_iterations):
         loop_state = self.run_one_iteration(loop_state, positions, segment_ids, deterministic, model_mode)
