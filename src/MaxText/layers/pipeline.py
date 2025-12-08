@@ -377,13 +377,9 @@ class Pipeline(nnx.Module):
         *stage_params_list
     )
 
-    def apply_stage(stage_idx, stage_params, stage_input, stage_seg_ids, stage_pos):
+    def apply_stage(stage_params, stage_input, stage_seg_ids, stage_pos, rng_key):
       if stage_pos is not None and stage_pos.ndim == 1: stage_pos = stage_pos[None, :]
       if stage_seg_ids is not None and stage_seg_ids.ndim == 1: stage_seg_ids = stage_seg_ids[None, :]
-
-      # Fold in stage index to the iteration key for unique RNG per stage
-      stage_dropout_key = jax.random.fold_in(dropout_key, stage_idx)
-
       output = self.layer.apply(
           stage_params,
           stage_input,
@@ -391,21 +387,21 @@ class Pipeline(nnx.Module):
           stage_pos,
           deterministic=deterministic,
           model_mode=model_mode,
-          rngs={"dropout": stage_dropout_key},
+          rngs={"dropout": rng_key},
       )
       return output[0] if isinstance(output, tuple) else output
 
-    stage_indices = jnp.arange(self.num_stages)
+    dropout_keys_for_vmap = jax.random.split(dropout_key, self.num_stages)
 
     if stages_segment_ids is None:
-      vmap_fn = lambda idx, p, i, pos: apply_stage(idx, p, i, None, pos)
+      vmap_fn = lambda p, i, pos, rng: apply_stage(p, i, None, pos, rng)
       stages_outputs = jax.vmap(vmap_fn, in_axes=(0, 0, 0, 0), out_axes=0)(
-          stage_indices, stacked_params, stages_inputs, stages_positions
+        stacked_params, stages_inputs, stages_positions, dropout_keys_for_vmap
       )
     else:
-      vmap_fn = lambda idx, p, i, s, pos: apply_stage(idx, p, i, s, pos)
+      vmap_fn = lambda p, i, s, pos, rng: apply_stage(p, i, s, pos, rng)
       stages_outputs = jax.vmap(vmap_fn, in_axes=(0, 0, 0, 0, 0), out_axes=0)(
-        stage_indices, stacked_params, stages_inputs, stages_segment_ids, stages_positions
+        stacked_params, stages_inputs, stages_segment_ids, stages_positions, dropout_keys_for_vmap
       )
 
     return stages_outputs
