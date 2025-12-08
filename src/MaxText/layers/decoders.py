@@ -699,20 +699,6 @@ class Decoder(nn.Module):
     cfg = self.config
     base_stage = get_layer_to_pipeline(decoder_blocks, cfg)
 
-    if issubclass(base_stage, nnx.Module):
-      if cfg.num_layers_per_pipeline_stage == 1:
-        return base_stage
-      else:
-        return lambda config, mesh, model_mode, rngs, quant=None: SequentialNNXWrapper(
-            decoder_layer_class=base_stage,
-            num_decoder_layers=cfg.num_layers_per_pipeline_stage,
-            config=config,
-            mesh=mesh,
-            model_mode=model_mode,
-            rngs=rngs,
-            quant=quant
-        )
-
     if cfg.set_remat_policy_on_layers_per_stage:
       policy = self.get_remat_policy()
       base_stage = self.set_remat_policy([base_stage], policy)[0]

@@ -49,7 +49,7 @@ class Pipeline(nnx.Module):
     remat_policy: Remat policy to use for the loop iterations
   """
 
-  _linen_variables: nnx.Data[dict | None]
+  _linen_variables: nnx.Data[list[dict] | None]
 
   def __init__(
       self,
@@ -87,24 +87,11 @@ class Pipeline(nnx.Module):
       self.batch_axis_name = "activation_batch"
       self.seq_len_axis_name = "activation_length_no_exp"
 
-    # Detect if layers is a Linen class/instance or NNX class
-    self._is_linen = isinstance(layer, nn.Module)
-    if self._is_linen:
-      self.layer = layer
-      self._linen_variables = None
-    else:
-      # Create num_stages independent NNX instances, stored as attributes for
-      # NNX pytree tracking (not as Python lists).
-      for s in range(self.num_stages):
-        stage_rngs = nnx.Rngs(s)
-        instance = layer(
-            config=config,
-            mesh=mesh,
-            model_mode=MODEL_MODE_TRAIN,
-            rngs=stage_rngs,
-            quant=None,
-        )
-        setattr(self, f'stage_{s}', instance)
+    # TODO: Support NNX layers in addition to Linen layers
+    self._is_linen = True # Always true given the input
+    self.layer = layer # Store the module instance
+    self._linen_variables = None # Will be populated in _initialize_linen_parameters
+
 
   def need_circ_storage(self):
     return (
@@ -352,10 +339,8 @@ class Pipeline(nnx.Module):
 
   def _initialize_linen_parameters(self, sample_input, sample_seg_ids, sample_positions, deterministic, model_mode):
     """Initialize Linen module parameters for all stages."""
-    if self._linen_variables is not None:
+    if not self._is_linen or self._linen_variables is not None:
       return
-
-    linen_rngs = {'params': jax.random.PRNGKey(0), 'dropout': jax.random.PRNGKey(1)}
 
     # Ensure inputs to init are 2D
     if sample_seg_ids is not None and sample_seg_ids.ndim == 1:
@@ -363,20 +348,18 @@ class Pipeline(nnx.Module):
     if sample_positions is not None and sample_positions.ndim == 1:
         sample_positions = sample_positions[None, :]
 
-    base_params = self.layer.init(
-        linen_rngs,
-        sample_input,
-        sample_seg_ids,
-        sample_positions,
-        deterministic,
-        model_mode,
-    )
 
-    stage_params = {}
-    for stage_idx in range(self.num_stages):
-      stage_params[f'stage_{stage_idx}'] = jax.tree_util.tree_map(lambda x: x, base_params)
+    stage_params_list = []
+    for _ in range(self.num_stages):
+        linen_rngs = {
+            'params': self.rngs.params(),
+            'dropout': self.rngs.dropout()
+        }
+        base_params = self.layer.init(
+            linen_rngs, sample_input, sample_seg_ids, sample_positions, deterministic, model_mode)
+        stage_params_list.append(base_params)
+    self._linen_variables = stage_params_list
 
-    self._linen_variables = {'params': stage_params}
 
   def _run_stages_linen(
       self,
@@ -385,15 +368,16 @@ class Pipeline(nnx.Module):
       stages_positions,
       deterministic,
       model_mode,
+      dropout_key
   ):
     """Run stages using Linen module with manual vmap."""
-    stage_params_list = [self._linen_variables['params'][f'stage_{i}'] for i in range(self.num_stages)]
+    stage_params_list = self._linen_variables if self._linen_variables is not None else []
     stacked_params = jax.tree_util.tree_map(
         lambda *xs: jnp.stack(xs, axis=0),
         *stage_params_list
     )
 
-    def apply_stage(stage_params, stage_input, stage_seg_ids, stage_pos):
+    def apply_stage(stage_params, stage_input, stage_seg_ids, stage_pos, rng_key):
       # Ensure per-stage positions and segment_ids are 2D for the layer call
       if stage_pos is not None and stage_pos.ndim == 1:
         stage_pos = stage_pos[None, :]
@@ -407,23 +391,27 @@ class Pipeline(nnx.Module):
           stage_pos,
           deterministic,
           model_mode,
+          rngs={"dropout": rng_key},
       )
-      if isinstance(output, tuple):
-        return output[0]
-      return output
+      return output[0] if isinstance(output, tuple) else output
+
+    dropout_keys_for_vmap = jax.random.split(dropout_key, self.num_stages)
 
     if stages_segment_ids is None:
-      vmapped_apply = jax.vmap(
-          lambda p, i, pos: apply_stage(p, i, None, pos),
-          in_axes=(0, 0, 0),
-          out_axes=0
+      vmap_fn = lambda p, i, pos, rng: apply_stage(p, i, None, pos, rng)
+      in_axes = (0, 0, 0, 0)
+      stages_outputs = jax.vmap(vmap_fn, in_axes=in_axes, out_axes=0)(
+          stacked_params, stages_inputs, stages_positions, dropout_keys_for_vmap
       )
-      stages_outputs = vmapped_apply(stacked_params, stages_inputs, stages_positions)
     else:
-      vmapped_apply = jax.vmap(apply_stage, in_axes=(0, 0, 0, 0), out_axes=0)
-      stages_outputs = vmapped_apply(stacked_params, stages_inputs, stages_segment_ids, stages_positions)
+      vmap_fn = lambda p, i, s, pos, rng: apply_stage(p, i, s, pos, rng)
+      in_axes = (0, 0, 0, 0, 0)
+      stages_outputs = jax.vmap(vmap_fn, in_axes=in_axes, out_axes=0)(
+        stacked_params, stages_inputs, stages_segment_ids, stages_positions, dropout_keys_for_vmap
+      )
 
     return stages_outputs
+
 
   def _run_stages_vmapped(
       self,
@@ -449,37 +437,34 @@ class Pipeline(nnx.Module):
     )
 
     def call_stage(state, stage_input, stage_seg_ids, stage_pos):
-
       if stage_pos is not None and stage_pos.ndim == 1:
         stage_pos = stage_pos[None, :]
       if stage_seg_ids is not None and stage_seg_ids.ndim == 1:
         stage_seg_ids = stage_seg_ids[None, :]
-
       module = nnx.merge(graphdef, state)
-      output = module(stage_input, stage_seg_ids, stage_pos, deterministic, model_mode)
-      if isinstance(output, tuple):
-        return output[0]
-      return output
+      output = module(stage_input, stage_seg_ids, stage_pos, deterministic=deterministic, model_mode=model_mode)
+      return output[0] if isinstance(output, tuple) else output
 
     if stages_segment_ids is None:
       def call_stage_no_seg(state, stage_input, stage_pos):
-        # Ensure per-stage positions is 2D for the layer call
         if stage_pos is not None and stage_pos.ndim == 1:
           stage_pos = stage_pos[None, :]
-
         module = nnx.merge(graphdef, state)
-        output = module(stage_input, None, stage_pos, deterministic, model_mode)
-        if isinstance(output, tuple):
-          return output[0]
-        return output
-
-      vmapped_call = jax.vmap(call_stage_no_seg, in_axes=(0, 0, 0), out_axes=0)
-      stages_outputs = vmapped_call(stacked_state, stages_inputs, stages_positions)
+        output = module(stage_input, None, stage_pos, deterministic=deterministic, model_mode=model_mode)
+        return output[0] if isinstance(output, tuple) else output
+      vmap_fn = call_stage_no_seg
+      in_axes = (0, 0, 0)
+      stages_outputs = jax.vmap(vmap_fn, in_axes=in_axes, out_axes=0)(
+         stacked_state, stages_inputs, stages_positions
+      )
     else:
-      vmapped_call = jax.vmap(call_stage, in_axes=(0, 0, 0, 0), out_axes=0)
-      stages_outputs = vmapped_call(stacked_state, stages_inputs, stages_segment_ids, stages_positions)
-
+      vmap_fn = call_stage
+      in_axes = (0, 0, 0, 0)
+      stages_outputs = jax.vmap(vmap_fn, in_axes=in_axes, out_axes=0)(
+         stacked_state, stages_inputs, stages_segment_ids, stages_positions
+      )
     return stages_outputs
+
 
   def run_one_iteration(
       self,
@@ -494,33 +479,19 @@ class Pipeline(nnx.Module):
     shift = loop_state["shift"]
     circ_storage = loop_state["circ_storage"]
     loop_iteration = loop_state["loop_iteration"]
-
+    iter_dropout_key = self.rngs.dropout()
+ 
     microbatch_ids, _ = self.get_microbatch_and_repeat_ids(loop_iteration)
-
     stages_inputs = self.get_iteration_inputs(loop_iteration, state_io, circ_storage, shift)
     stages_inputs = jax.ad_checkpoint.checkpoint_name(stages_inputs, "iteration_input")
     stages_positions = self.vmap_gather(positions, microbatch_ids, 0) if positions is not None else None
     stages_segment_ids = self.vmap_gather(segment_ids, microbatch_ids, 0) if segment_ids is not None else None
 
-    if self._is_linen:
-      stages_output = self._run_stages_linen(
-          stages_inputs,
-          stages_segment_ids,
-          stages_positions,
-          deterministic,
-          model_mode,
-      )
-    else:
-      stages_output = self._run_stages_vmapped(
-          stages_inputs,
-          stages_segment_ids,
-          stages_positions,
-          deterministic,
-          model_mode,
-      )
+    stages_output = self._run_stages_linen(stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode, iter_dropout_key)
 
-    new_state = self.get_new_loop_state(stages_output, loop_state)
-    return new_state
+    new_loop_state = self.get_new_loop_state(stages_output, loop_state)
+    return new_loop_state
+
 
   def get_pipeline_remat_policy(self):
     """Returns the remat policy for pipeline iterations."""
@@ -548,41 +519,17 @@ class Pipeline(nnx.Module):
     Reshapes inputs into microbatches, runs pipeline iterations with bubble
     handling, and returns outputs reshaped to original batch size.
     """
-    inputs = inputs.reshape(
-        (
-            self.config.num_pipeline_microbatches,
-            self.pipeline_microbatch_size,
-            self.config.max_target_length,
-            self.config.emb_dim,
-        )
-    )
+    inputs = inputs.reshape((self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length, self.config.emb_dim))
     if positions is not None:
-        positions = positions.reshape(
-            (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
-        )
+      positions = positions.reshape((self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length))
     if segment_ids is not None:
-        segment_ids = segment_ids.reshape(
-            (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
-        )
+      segment_ids = segment_ids.reshape((self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length))
 
-    if self._is_linen and self._linen_variables is None:
+    if self._linen_variables is None:
       example_input = inputs[0]
       example_seg_ids = segment_ids[0] if segment_ids is not None else None
       example_pos = positions[0] if positions is not None else None
       self._initialize_linen_parameters(example_input, example_seg_ids, example_pos, deterministic, model_mode)
-
-    ag_sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(None, None))
-    if positions is not None:
-      positions = jax.lax.with_sharding_constraint(positions, ag_sharding)
-      positions = positions.reshape(
-          (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
-      )
-
-    if segment_ids is not None:
-      segment_ids = jax.lax.with_sharding_constraint(segment_ids, ag_sharding)
-      segment_ids = segment_ids.reshape(
-          (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
-      )
 
     loop_state = self.init_states(inputs)
 
@@ -591,36 +538,34 @@ class Pipeline(nnx.Module):
     total_iterations = real_iterations + bubble_iterations
 
     if self.config.scan_pipeline_iterations:
-      def run_iteration_scannable(loop_state, xs):
-        return (
-            self.run_one_iteration(
-                loop_state, positions, segment_ids, deterministic, model_mode
-            ),
-            None,
-        )
+      def run_iteration_scannable(pipeline_instance, loop_state, xs):
+        new_loop_state = pipeline_instance.run_one_iteration(loop_state, positions, segment_ids, deterministic, model_mode)
+        return new_loop_state
 
+      remat_fn = run_iteration_scannable
       if self.config.set_remat_policy_on_pipeline_iterations:
-        run_iteration_scannable = jax.checkpoint(
+        remat_fn = nnx.remat(
             run_iteration_scannable,
             prevent_cse=False,
             policy=self.get_pipeline_remat_policy(),
         )
 
-      loop_state, _ = jax.lax.scan(run_iteration_scannable, loop_state, None, length=total_iterations)
+      ScannedFn = nnx.scan(
+          remat_fn,
+          in_axes=(None, nnx.Carry, None),  # Corresponds to (self, loop_state, xs)
+          out_axes=nnx.Carry,               # Corresponds to new_loop_state
+          length=total_iterations,
+      )
+      loop_state = ScannedFn(self, loop_state, None)
     else:
       for _ in range(total_iterations):
-        loop_state = self.run_one_iteration(
-            loop_state, positions, segment_ids, deterministic, model_mode
-        )
+        loop_state = self.run_one_iteration(loop_state, positions, segment_ids, deterministic, model_mode)
 
     final_output = self.permute_output_micro_per_stage_dim(loop_state["state_io"])
-
     final_output = jnp.reshape(
         final_output, (self.config.micro_batch_size_to_train_on, self.config.max_target_length, self.config.emb_dim)
     )
-
     return final_output
-
 
 class PipelineToLinen(nnx_wrappers.ToLinen):
   """Wrap NNX Pipeline as a Linen module.
