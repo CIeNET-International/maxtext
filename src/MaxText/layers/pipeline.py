@@ -88,7 +88,6 @@ class Pipeline(nnx.Module):
       self.seq_len_axis_name = "activation_length_no_exp"
 
     # TODO: Support NNX layers in addition to Linen layers
-    self._is_linen = True # Always true given the input
     self.layer = layer # Store the module instance
     self._linen_variables = None # Will be populated in _initialize_linen_parameters
 
@@ -339,7 +338,7 @@ class Pipeline(nnx.Module):
 
   def _initialize_linen_parameters(self, sample_input, sample_seg_ids, sample_positions, deterministic, model_mode):
     """Initialize Linen module parameters for all stages."""
-    if not self._is_linen or self._linen_variables is not None:
+    if self._linen_variables is not None:
       return
 
     # Ensure inputs to init are 2D
@@ -377,37 +376,35 @@ class Pipeline(nnx.Module):
         *stage_params_list
     )
 
-    def apply_stage(stage_params, stage_input, stage_seg_ids, stage_pos, rng_key):
-      # Ensure per-stage positions and segment_ids are 2D for the layer call
-      if stage_pos is not None and stage_pos.ndim == 1:
-        stage_pos = stage_pos[None, :]
-      if stage_seg_ids is not None and stage_seg_ids.ndim == 1:
-        stage_seg_ids = stage_seg_ids[None, :]
+    def apply_stage(stage_idx, stage_params, stage_input, stage_seg_ids, stage_pos):
+      if stage_pos is not None and stage_pos.ndim == 1: stage_pos = stage_pos[None, :]
+      if stage_seg_ids is not None and stage_seg_ids.ndim == 1: stage_seg_ids = stage_seg_ids[None, :]
+
+      # Fold in stage index to the iteration key for unique RNG per stage
+      stage_dropout_key = jax.random.fold_in(dropout_key, stage_idx)
 
       output = self.layer.apply(
           stage_params,
           stage_input,
           stage_seg_ids,
           stage_pos,
-          deterministic,
-          model_mode,
-          rngs={"dropout": rng_key},
+          deterministic=deterministic,
+          model_mode=model_mode,
+          rngs={"dropout": stage_dropout_key},
       )
       return output[0] if isinstance(output, tuple) else output
 
-    dropout_keys_for_vmap = jax.random.split(dropout_key, self.num_stages)
+    stage_indices = jnp.arange(self.num_stages)
 
     if stages_segment_ids is None:
-      vmap_fn = lambda p, i, pos, rng: apply_stage(p, i, None, pos, rng)
-      in_axes = (0, 0, 0, 0)
-      stages_outputs = jax.vmap(vmap_fn, in_axes=in_axes, out_axes=0)(
-          stacked_params, stages_inputs, stages_positions, dropout_keys_for_vmap
+      vmap_fn = lambda idx, p, i, pos: apply_stage(idx, p, i, None, pos)
+      stages_outputs = jax.vmap(vmap_fn, in_axes=(0, 0, 0, 0), out_axes=0)(
+          stage_indices, stacked_params, stages_inputs, stages_positions
       )
     else:
-      vmap_fn = lambda p, i, s, pos, rng: apply_stage(p, i, s, pos, rng)
-      in_axes = (0, 0, 0, 0, 0)
-      stages_outputs = jax.vmap(vmap_fn, in_axes=in_axes, out_axes=0)(
-        stacked_params, stages_inputs, stages_segment_ids, stages_positions, dropout_keys_for_vmap
+      vmap_fn = lambda idx, p, i, s, pos: apply_stage(idx, p, i, s, pos)
+      stages_outputs = jax.vmap(vmap_fn, in_axes=(0, 0, 0, 0, 0), out_axes=0)(
+        stage_indices, stacked_params, stages_inputs, stages_segment_ids, stages_positions
       )
 
     return stages_outputs
@@ -479,7 +476,12 @@ class Pipeline(nnx.Module):
     shift = loop_state["shift"]
     circ_storage = loop_state["circ_storage"]
     loop_iteration = loop_state["loop_iteration"]
-    iter_dropout_key = self.rngs.dropout()
+
+    # Get a base key for this iteration
+    iter_dropout_key_base = self.rngs.dropout()
+    # Fold in the loop iteration number to make the key unique per iteration
+    iter_dropout_key = jax.random.fold_in(iter_dropout_key_base, loop_iteration)
+
  
     microbatch_ids, _ = self.get_microbatch_and_repeat_ids(loop_iteration)
     stages_inputs = self.get_iteration_inputs(loop_iteration, state_io, circ_storage, shift)
