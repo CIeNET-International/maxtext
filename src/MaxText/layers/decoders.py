@@ -712,6 +712,7 @@ class Decoder(nn.Module):
           "layers_per_stage",
           self.mesh,
           in_axes_tuple=(nn.broadcast,) * 4,
+          model_mode=self.model_mode,
       )
     else:
       stage_module = SequentialBlockDecoderLayers(
