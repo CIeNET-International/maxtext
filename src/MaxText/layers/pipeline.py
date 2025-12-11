@@ -406,6 +406,30 @@ class Pipeline(nnx.Module):
         
         return jax.tree.map(gather_weights_for_stages_in, pipeline_weights)
 
+    def get_pipeline_remat_policy(self):
+        """
+        Constructs the checkpoint policy.
+        1. Always saves 'iteration_input' (required for Pipeline Parallelism to save memory).
+        2. Merges with self.remat_policy if provided (e.g. for attention layers).
+        """
+        # If config says "custom", we trust the user provided policy entirely
+        if self.config.remat_policy == "custom":
+            return self.remat_policy
+
+        # Base Policy: Save the inputs to the stage. 
+        # This reduces memory from O(N_layers) to O(1) per stage.
+        save_input_policy = jax.checkpoint_policies.save_only_these_names(
+            "iteration_input", "decoder_layer_input"
+        )
+        
+        # Combine with user-provided policy (if any)
+        if self.remat_policy is not None:
+            return jax.checkpoint_policies.save_from_both_policies(
+                self.remat_policy, save_input_policy
+            )
+        return save_input_policy
+
+
     # Output sorting
     def permute_output_micro_per_stage_dim(self, output):
         microbatch_0_idx = self.iterations_to_complete_first_microbatch_one_repeat() % self.microbatches_per_stage
@@ -501,9 +525,25 @@ class Pipeline(nnx.Module):
                         model_mode=model_mode
                     )
 
-                # Apply Remat/Checkpointing
-                if self.remat_policy is not None:
-                    vmapped_linen_apply = jax.checkpoint(vmapped_linen_apply, prevent_cse=False)
+                # 3. APPLY THE SWITCH (set_remat_policy_on_pipeline_iterations)
+                # This logic mimics the original: 
+                # if self.config.set_remat_policy_on_pipeline_iterations:
+                #     run_iteration_scannable = nn.remat(..., policy=self.get_pipeline_remat_policy())
+                print(f"set_remat_policy_on_pipeline_iterations",self.config.set_remat_policy_on_pipeline_iterations)
+                if self.config.set_remat_policy_on_pipeline_iterations:
+                    # Retrieve the strategy
+                    policy = self.get_pipeline_remat_policy()
+                    
+                    # Logic for CSE (Common Subexpression Elimination)
+                    # prevent_cse defaults to False if scanning, True otherwise to save memory
+                    prevent_cse = not self.config.scan_pipeline_iterations
+                    
+                    # Apply jax.checkpoint (equivalent to nn.remat)
+                    vmapped_linen_apply = jax.checkpoint(
+                        vmapped_linen_apply, 
+                        policy=policy,
+                        prevent_cse=prevent_cse
+                    )
 
                 # VMAP Execution
                 # Build args dynamically handling None
@@ -551,41 +591,25 @@ def add_stage_axis_to_partitioning(variable, repeats=1):
     If repeats > 1, the first dimension is 'Repeats' (Replicated/None), 
     and the second is 'Stage'.
     """
-    # 1. Try to get existing partitioning
     partitioned_obj = variable_to_logically_partitioned(variable)
     
-    # 2. Extract base names
     if isinstance(partitioned_obj, nn.LogicallyPartitioned):
         base_names = partitioned_obj.names
         value = partitioned_obj.value
     else:
-        # Heuristics if metadata lost
+        # Heuristics
         value = partitioned_obj
         if not hasattr(value, 'ndim'):
             return value
-        
-        # Base heuristics for inner layers (Embed, MLP)
-        # Note: These are for the INNER tensor (excluding Stage/Repeat dims)
-        # We need to deduce what the inner rank is.
-        # If repeats=1, inner_rank = ndim - 1.
-        # If repeats>1, inner_rank = ndim - 2.
-        
-        # However, checking absolute ndim is safer if we know the structure
-        # Let's reconstruct based on full ndim.
         base_names = None
 
-    # 3. Construct new names based on repeats and rank
     ndim = value.ndim
     
     if repeats > 1:
-        # Expected Structure: [Repeats, Stage, ...]
-        # We want: (None, 'stage', ...)
-        
+        # Structure: [Repeats, Stage, Inner...]
         if base_names is not None:
-            # If we recovered ('fsdp', 'tensor'), just prepend
             new_names = (None, 'stage') + base_names
         else:
-            # Heuristics for [Repeats, Stage, In, Out]
             if ndim == 4: # [Repeats, Stage, Embed, MLP]
                 new_names = (None, 'stage', 'fsdp', 'tensor')
             elif ndim == 3: # [Repeats, Stage, Bias]
@@ -593,21 +617,18 @@ def add_stage_axis_to_partitioning(variable, repeats=1):
             else:
                 new_names = (None, 'stage') + (None,) * (ndim - 2)
     else:
-        # Expected Structure: [Stage, ...]
-        # We want: ('stage', ...)
-        
+        # Structure: [Stage, Inner...]
         if base_names is not None:
              new_names = ('stage',) + base_names
         else:
-            if ndim == 3: # [Stage, Embed, MLP]
+            if ndim == 3: 
                 new_names = ('stage', 'fsdp', 'tensor')
-            elif ndim == 2: # [Stage, Bias]
+            elif ndim == 2: 
                 new_names = ('stage', 'fsdp')
             else:
                 new_names = ('stage',) + (None,) * (ndim - 1)
 
     return nn.LogicallyPartitioned(value, new_names)
-
 def create_pipeline(
     config: Config,
     layer: Callable | type,
