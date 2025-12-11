@@ -34,10 +34,10 @@ class Pipeline(nnx.Module):
 
     def __init__(
         self,
-        layer: nn.Module,  # Instance of the Linen Layer (e.g. DecoderLayer)
-        config: Any,       # MaxText Config object
-        mesh: Mesh,        # JAX Mesh
-        rngs: nnx.Rngs,    # NNX RNGs
+        layer: nn.Module,
+        config: Any,
+        mesh: Mesh,
+        rngs: nnx.Rngs,
         remat_policy: Any = None
     ):
         self.config = config
@@ -45,17 +45,15 @@ class Pipeline(nnx.Module):
         self.linen_module = layer
         self.remat_policy = remat_policy
 
-        # --- 1. Calculate Pipeline Dimensions ---
+        # --- Dimensions ---
         self.num_stages = self.config.ici_pipeline_parallelism * self.config.dcn_pipeline_parallelism
         self.forwarding_delay = 2 if self.config.pipeline_delay_activation_forwarding else 1
-        
         self.total_microbatches = self.config.num_pipeline_microbatches
         self.microbatch_size = self.config.micro_batch_size_to_train_on // self.total_microbatches
         self.microbatches_per_stage = self.total_microbatches // self.num_stages
-
         self.use_circ_storage = self._need_circ_storage()
 
-        # Axis Naming
+        # --- Axis Naming ---
         if hasattr(self.config, 'expert_shard_attention_option') and self.config.expert_shard_attention_option == EP_AS_CONTEXT:
             self.batch_axis_name = "activation_batch_no_exp"
             self.seq_len_axis_name = "activation_length"
@@ -69,17 +67,16 @@ class Pipeline(nnx.Module):
             self.config.emb_dim
         )
 
-        # --- 2. Eager Initialization (FIXED for Circular Repeats) ---
+        # --- Initialization ---
         init_rng_key = rngs.params()
         repeats = self.config.num_pipeline_repeats
-
+        
+        # Helper to init one stage
         def init_single_stage(key):
-            # Create dummy inputs
             dummy_in = jnp.zeros(self.input_shape, dtype=jnp.float32)
             dummy_pos_shape = (self.input_shape[0], self.input_shape[1])
             dummy_positions = jnp.zeros(dummy_pos_shape, dtype=jnp.int32)
             dummy_segments = jnp.zeros(dummy_pos_shape, dtype=jnp.int32)
-
             return self.linen_module.init(
                 {'params': key}, 
                 dummy_in, 
@@ -89,36 +86,50 @@ class Pipeline(nnx.Module):
                 model_mode=MODEL_MODE_TRAIN
             )
 
+        # 1. Run ONCE without vmap to capture correct Metadata (names)
+        # This returns LogicallyPartitioned objects with rules like ('embed', 'mlp')
+        ref_variables = init_single_stage(init_rng_key)
+
+        # 2. Run WITH vmap to get the actual Data (values)
         if repeats > 1:
-            # Case A: Circular Pipeline (Multiple Repeats)
-            # We need independent weights for [Repeats, Num_Stages]
             repeat_keys = jax.random.split(init_rng_key, repeats)
-            # Split each repeat key into stage keys -> Shape: [Repeats, Stages]
             stage_rng_keys = jax.vmap(lambda k: jax.random.split(k, self.num_stages))(repeat_keys)
-            
-            # Double vmap: Map over Repeats (Axis 0), then Stages (Axis 0 of inner)
-            # Output Shape: [Repeats, Stages, ...]
             raw_variables = jax.vmap(jax.vmap(init_single_stage))(stage_rng_keys)
         else:
-            # Case B: Standard Pipeline (Single Repeat)
-            # Shape: [Num_Stages]
             stage_rng_keys = jax.random.split(init_rng_key, self.num_stages)
-            # Output Shape: [Stages, ...]
             raw_variables = jax.vmap(init_single_stage)(stage_rng_keys)
 
-        # --- 3. Register Parameters with NNX ---
-        def _to_nnx_structure(node):
-            if hasattr(node, 'items'):
-                return nnx.Dict({k: _to_nnx_structure(v) for k, v in node.items()})
-            elif isinstance(node, (list, tuple)):
-                return nnx.List([_to_nnx_structure(v) for v in node])
+        # 3. Register Parameters with Metadata Injection
+        # We traverse the 'raw' (data) and 'ref' (metadata) trees together.
+        def _create_param_with_metadata(raw_node, ref_node):
+            if hasattr(raw_node, 'items'):
+                return nnx.Dict({k: _create_param_with_metadata(v, ref_node[k]) for k, v in raw_node.items()})
+            elif isinstance(raw_node, (list, tuple)):
+                return nnx.List([_create_param_with_metadata(v, ref_node[i]) for i, v in enumerate(raw_node)])
             else:
-                return nnx.Param(node)
+                # Unwrap raw value if it came wrapped
+                if isinstance(raw_node, nn.LogicallyPartitioned):
+                    actual_value = raw_node.value
+                else:
+                    actual_value = raw_node
 
-        self.stage_params = _to_nnx_structure(raw_variables['params'])
+                # Check ref_node for metadata
+                sharding_kwargs = {}
+                if hasattr(ref_node, 'names'): 
+                    original_names = ref_node.names
+                    if repeats > 1:
+                        new_names = (None, 'stage') + original_names
+                    else:
+                        new_names = ('stage',) + original_names
+                    
+                    # Pass as keyword argument to nnx.Param
+                    sharding_kwargs['sharding_names'] = new_names
 
-        if 'batch_stats' in raw_variables:
-            print("Warning: Pipeline detected batch_stats during init. Registering as VariableState.")
+                return nnx.Param(actual_value, **sharding_kwargs)
+
+        self.stage_params = _create_param_with_metadata(raw_variables['params'], ref_variables['params'])
+
+
     # ==========================================================================
     # Helper Methods
     # ==========================================================================
@@ -407,22 +418,15 @@ class Pipeline(nnx.Module):
         return jax.tree.map(gather_weights_for_stages_in, pipeline_weights)
 
     def get_pipeline_remat_policy(self):
-        """
-        Constructs the checkpoint policy.
-        1. Always saves 'iteration_input' (required for Pipeline Parallelism to save memory).
-        2. Merges with self.remat_policy if provided (e.g. for attention layers).
-        """
-        # If config says "custom", we trust the user provided policy entirely
-        if self.config.remat_policy == "custom":
-            return self.remat_policy
-
-        # Base Policy: Save the inputs to the stage. 
-        # This reduces memory from O(N_layers) to O(1) per stage.
+        # Strict policy: Save ONLY the input tensor named 'iteration_input'.
+        # Discard everything else (dots, gathers, etc).
         save_input_policy = jax.checkpoint_policies.save_only_these_names(
             "iteration_input", "decoder_layer_input"
         )
         
-        # Combine with user-provided policy (if any)
+        if self.config.remat_policy == "custom":
+            return self.remat_policy
+            
         if self.remat_policy is not None:
             return jax.checkpoint_policies.save_from_both_policies(
                 self.remat_policy, save_input_policy
@@ -436,168 +440,155 @@ class Pipeline(nnx.Module):
         permutation = (jnp.arange(self.microbatches_per_stage) + microbatch_0_idx) % self.microbatches_per_stage
         output = output[:, permutation]
         return output
-
+    
     def __call__(
-            self, 
-            inputs: jax.Array, 
-            segment_ids: Optional[jax.Array] = None, 
-            positions: Optional[jax.Array] = None, 
-            deterministic: bool = True,
-            model_mode: str = MODEL_MODE_TRAIN,
-            partition_spec: Any = None,
-        ) -> jax.Array:
-            
-            # 1. Reshape Inputs
-            inputs = inputs.reshape((
+        self, 
+        inputs: jax.Array, 
+        segment_ids: Optional[jax.Array] = None, 
+        positions: Optional[jax.Array] = None, 
+        deterministic: bool = True,
+        model_mode: str = MODEL_MODE_TRAIN,
+        partition_spec: Any = None,
+    ) -> jax.Array:
+        
+        # 1. Reshape Inputs
+        inputs = inputs.reshape((
+            self.total_microbatches, 
+            self.microbatch_size, 
+            self.config.max_target_length, 
+            self.config.emb_dim
+        ))
+        
+        if positions is not None:
+            positions = positions.reshape((
                 self.total_microbatches, 
                 self.microbatch_size, 
-                self.config.max_target_length, 
-                self.config.emb_dim
+                self.config.max_target_length
             ))
             
-            if positions is not None:
-                positions = positions.reshape((
-                    self.total_microbatches, 
-                    self.microbatch_size, 
-                    self.config.max_target_length
-                ))
-                
-            if segment_ids is not None:
-                segment_ids = segment_ids.reshape((
-                    self.total_microbatches, 
-                    self.microbatch_size, 
-                    self.config.max_target_length
-                ))
+        if segment_ids is not None:
+            segment_ids = segment_ids.reshape((
+                self.total_microbatches, 
+                self.microbatch_size, 
+                self.config.max_target_length
+            ))
 
-            # 2. Initialize State
-            loop_state = self.init_states(inputs)
+        # 2. Initialize State
+        loop_state = self.init_states(inputs)
+        
+        # 3. Prepare Weights
+        param_values = self._to_pure_dict(self.stage_params)
+        
+        if self.config.pipeline_fsdp_ag_once and partition_spec is not None:
+             try:
+                param_values = self._all_gather_over_fsdp(param_values, partition_spec)
+             except (ValueError, TypeError, KeyError):
+                 pass
+
+        # 4. Scan Loop
+        def scan_body(carry, _):
+            iteration = carry['loop_iteration']
+            current_rng = carry['rng_stream']
             
-            # 3. Prepare Weights
-            # Convert NNX Params to pure dict for Linen & FSDP
-            param_values = self._to_pure_dict(self.stage_params)
+            step_rng, next_rng = jax.random.split(current_rng)
+            stage_rngs = jax.random.split(step_rng, self.num_stages)
             
-            # Apply FSDP All-Gather if requested
-            if self.config.pipeline_fsdp_ag_once and partition_spec is not None:
-                try:
-                    param_values = self._all_gather_over_fsdp(param_values, partition_spec)
-                except (ValueError, TypeError, KeyError):
-                    # Log warning in real code if needed
-                    pass
+            stages_inputs = self.get_iteration_inputs(
+                iteration, 
+                carry['state_io'], 
+                carry['circ_storage'], 
+                carry['shift']
+            )
+            # Checkpoint inputs: Crucial for policy detection
+            stages_inputs = jax.ad_checkpoint.checkpoint_name(stages_inputs, "iteration_input")
+            
+            # Gather Positions & Segments
+            mb_ids, _ = self.get_microbatch_and_repeat_ids(iteration)
+            stages_positions = jnp.take(positions, mb_ids, axis=0) if positions is not None else None
+            stages_segment_ids = jnp.take(segment_ids, mb_ids, axis=0) if segment_ids is not None else None
 
-            # 4. Scan Loop
-            def scan_body(carry, _):
-                iteration = carry['loop_iteration']
-                current_rng = carry['rng_stream']
-                
-                step_rng, next_rng = jax.random.split(current_rng)
-                stage_rngs = jax.random.split(step_rng, self.num_stages)
-                
-                stages_inputs = self.get_iteration_inputs(
-                    iteration, 
-                    carry['state_io'], 
-                    carry['circ_storage'], 
-                    carry['shift']
-                )
-                # Checkpoint inputs
-                stages_inputs = jax.ad_checkpoint.checkpoint_name(stages_inputs, "iteration_input")
-                
-                # Gather Positions & Segments
-                mb_ids, _ = self.get_microbatch_and_repeat_ids(iteration)
-                
-                stages_positions = jnp.take(positions, mb_ids, axis=0) if positions is not None else None
-                stages_segment_ids = jnp.take(segment_ids, mb_ids, axis=0) if segment_ids is not None else None
+            # Dynamic Weight Selection
+            current_params = self.get_current_stage_weights(param_values, iteration)
 
-                # Dynamic Weight Selection (for Circular Pipelines)
-                current_params = self.get_current_stage_weights(param_values, iteration)
-
-                # VMAP Function
-                def vmapped_linen_apply(p, x, r, pos, seg):
+            # --- A. Define the VMAP Logic (Pure Execution) ---
+            def execution_logic(params, inputs, rngs, pos, seg):
+                # Inner function applied to ONE stage
+                def stage_fn(p, x, r, po, se):
                     variables = {'params': p}
                     rngs_dict = {'dropout': r} if not deterministic else {}
-                    
                     return self.linen_module.apply(
-                        variables, 
-                        x, 
-                        decoder_segment_ids=seg,
-                        decoder_positions=pos,
-                        deterministic=deterministic, 
-                        rngs=rngs_dict,
+                        variables, x, 
+                        decoder_segment_ids=se, decoder_positions=po,
+                        deterministic=deterministic, rngs=rngs_dict,
                         model_mode=model_mode
                     )
-
-                # 3. APPLY THE SWITCH (set_remat_policy_on_pipeline_iterations)
-                # This logic mimics the original: 
-                # if self.config.set_remat_policy_on_pipeline_iterations:
-                #     run_iteration_scannable = nn.remat(..., policy=self.get_pipeline_remat_policy())
-                print(f"set_remat_policy_on_pipeline_iterations",self.config.set_remat_policy_on_pipeline_iterations)
-                if self.config.set_remat_policy_on_pipeline_iterations:
-                    # Retrieve the strategy
-                    policy = self.get_pipeline_remat_policy()
-                    
-                    # Logic for CSE (Common Subexpression Elimination)
-                    # prevent_cse defaults to False if scanning, True otherwise to save memory
-                    prevent_cse = not self.config.scan_pipeline_iterations
-                    
-                    # Apply jax.checkpoint (equivalent to nn.remat)
-                    vmapped_linen_apply = jax.checkpoint(
-                        vmapped_linen_apply, 
-                        policy=policy,
-                        prevent_cse=prevent_cse
-                    )
-
-                # VMAP Execution
-                # Build args dynamically handling None
-                vmap_args = [current_params, stages_inputs, stage_rngs]
-                vmap_axes = [0, 0, 0] 
-
-                vmap_args.append(stages_positions)
-                vmap_axes.append(0 if stages_positions is not None else None)
-
-                vmap_args.append(stages_segment_ids)
-                vmap_axes.append(0 if stages_segment_ids is not None else None)
-
-                stages_output = jax.vmap(vmapped_linen_apply, in_axes=tuple(vmap_axes))(*vmap_args)
                 
-                if hasattr(self.config, 'scan_layers') and self.config.scan_layers:
-                    if isinstance(stages_output, tuple):
-                        stages_output = stages_output[0]
-
-                new_loop_state = self.get_new_loop_state(stages_output, carry)
-                new_loop_state['rng_stream'] = next_rng
+                # Apply VMAP here
+                # Map axes: Params(0), Inputs(0), Rngs(0), Pos(0/None), Seg(0/None)
+                vmap_axes = [0, 0, 0]
+                vmap_args = [params, inputs, rngs]
                 
-                return new_loop_state, None
+                vmap_axes.append(0 if pos is not None else None)
+                vmap_args.append(pos)
+                
+                vmap_axes.append(0 if seg is not None else None)
+                vmap_args.append(seg)
+                
+                return jax.vmap(stage_fn, in_axes=tuple(vmap_axes))(*vmap_args)
 
-            bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
-            real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
-            total_ticks = real_iterations + bubble_iterations
-
-            final_state, _ = jax.lax.scan(scan_body, loop_state, None, length=total_ticks)
-
-            output = final_state['state_io']
-
-            # Permute output (Sort Microbatches)
-            output = self.permute_output_micro_per_stage_dim(output)
-
-            output = output.reshape((self.config.micro_batch_size_to_train_on, 
-                                    self.config.max_target_length, 
-                                    self.config.emb_dim))
+            # --- B. Apply Checkpoint to the VMAP (Parity with Linen) ---
+            # We wrap the entire execution logic (which contains the vmap)
             
-            return output
+            if self.config.set_remat_policy_on_pipeline_iterations:
+                policy = self.get_pipeline_remat_policy()
+                
+                # Checkpoint the function that DOES the vmap
+                execution_logic = jax.checkpoint(
+                    execution_logic, 
+                    policy=policy,
+                    prevent_cse=False
+                )
+
+            # --- C. Execute ---
+            stages_output = execution_logic(
+                current_params, stages_inputs, stage_rngs, stages_positions, stages_segment_ids
+            )
+            
+            if hasattr(self.config, 'scan_layers') and self.config.scan_layers:
+                 if isinstance(stages_output, tuple):
+                     stages_output = stages_output[0]
+
+            new_loop_state = self.get_new_loop_state(stages_output, carry)
+            new_loop_state['rng_stream'] = next_rng
+            
+            return new_loop_state, None
+
+        bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
+        real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
+        total_ticks = real_iterations + bubble_iterations
+
+        final_state, _ = jax.lax.scan(scan_body, loop_state, None, length=total_ticks)
+
+        output = final_state['state_io']
+        output = self.permute_output_micro_per_stage_dim(output)
+        output = output.reshape((self.config.micro_batch_size_to_train_on, 
+                                 self.config.max_target_length, 
+                                 self.config.emb_dim))
+        
+        return output
 
 def add_stage_axis_to_partitioning(variable, repeats=1):
     """
     Metadata function for to_linen.
-    Applies 'stage' sharding to the correct dimension.
-    If repeats > 1, the first dimension is 'Repeats' (Replicated/None), 
-    and the second is 'Stage'.
     """
+    # 1. Try to recover metadata
     partitioned_obj = variable_to_logically_partitioned(variable)
     
     if isinstance(partitioned_obj, nn.LogicallyPartitioned):
         base_names = partitioned_obj.names
         value = partitioned_obj.value
     else:
-        # Heuristics
+        # 2. Fallback to Heuristics (Crucial for jax.vmap created variables)
         value = partitioned_obj
         if not hasattr(value, 'ndim'):
             return value
@@ -606,21 +597,23 @@ def add_stage_axis_to_partitioning(variable, repeats=1):
     ndim = value.ndim
     
     if repeats > 1:
-        # Structure: [Repeats, Stage, Inner...]
+        # [Repeats, Stage, Inner...]
         if base_names is not None:
             new_names = (None, 'stage') + base_names
         else:
-            if ndim == 4: # [Repeats, Stage, Embed, MLP]
+            # Heuristic for Rank 4 (Repeats, Stage, Embed, MLP)
+            if ndim == 4:
                 new_names = (None, 'stage', 'fsdp', 'tensor')
-            elif ndim == 3: # [Repeats, Stage, Bias]
+            elif ndim == 3:
                 new_names = (None, 'stage', 'fsdp')
             else:
                 new_names = (None, 'stage') + (None,) * (ndim - 2)
     else:
-        # Structure: [Stage, Inner...]
+        # [Stage, Inner...]
         if base_names is not None:
              new_names = ('stage',) + base_names
         else:
+            # Heuristic for Rank 3 (Stage, Embed, MLP)
             if ndim == 3: 
                 new_names = ('stage', 'fsdp', 'tensor')
             elif ndim == 2: 
@@ -629,6 +622,7 @@ def add_stage_axis_to_partitioning(variable, repeats=1):
                 new_names = ('stage',) + (None,) * (ndim - 1)
 
     return nn.LogicallyPartitioned(value, new_names)
+
 def create_pipeline(
     config: Config,
     layer: Callable | type,
@@ -636,12 +630,9 @@ def create_pipeline(
     remat_policy: Any = None,
 ) -> nnx_wrappers.ToLinen:
     """Factory function to create a Pipeline wrapped as a Linen module."""
-    # Determine repeats from config
-    repeats = getattr(config, 'num_pipeline_repeats', 1)
-    
-    # Create specialized metadata function
-    metadata_fn = functools.partial(add_stage_axis_to_partitioning, repeats=repeats)
 
+    repeats = getattr(config, "num_pipeline_repeat", 1)
+    metadata_fn = functools.partial(add_stage_axis_to_partitioning,repeats=repeats)
     return nnx_wrappers.to_linen(
         Pipeline,
         config=config,
@@ -650,5 +641,5 @@ def create_pipeline(
         remat_policy=remat_policy,
         name="pipeline_module",
         abstract_init=False,
-        metadata_fn=metadata_fn, # Pass the partial function
+        metadata_fn=metadata_fn,
     )
