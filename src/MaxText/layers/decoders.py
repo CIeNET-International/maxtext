@@ -402,7 +402,7 @@ class Decoder(nn.Module):
       pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer)
       remat_policy = self.get_remat_policy()
       self.pipeline_module = pipeline.create_pipeline(
-          config=self.config, mesh=self.mesh, layer=pipeline_stage_module, remat_policy=remat_policy,
+          config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy,
       )
 
   def minimal_policy(self, with_context=False):
