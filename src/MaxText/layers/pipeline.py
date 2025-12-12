@@ -73,7 +73,7 @@ class Pipeline(nnx.Module):
 
     def __init__(
         self,
-        layer: nn.Module,
+        layers: nn.Module,
         config: Config,
         mesh: Mesh,
         rngs: nnx.Rngs,
@@ -81,7 +81,7 @@ class Pipeline(nnx.Module):
     ):
         self.config = config
         self.mesh = mesh
-        self.linen_module = layer
+        self.layers = layers
         self.remat_policy = remat_policy
 
         # --- Dimensions ---
@@ -115,7 +115,7 @@ class Pipeline(nnx.Module):
                 dummy_positions = jnp.zeros(dummy_pos_shape, dtype=jnp.int32)
                 dummy_segments = jnp.zeros(dummy_pos_shape, dtype=jnp.int32)
                 
-                return self.linen_module.init(
+                return self.layers.init(
                     {'params': k},
                     dummy_in,
                     dummy_segments,
@@ -158,7 +158,7 @@ class Pipeline(nnx.Module):
         sharded_variables = jax.jit(generate_vars_fn, out_shardings=sharding_tree)(init_rng_key)
 
         # --- Register with NNX ---
-        self.layers = self._to_nnx_structure(sharded_variables)
+        self.stage_params = self._to_nnx_structure(sharded_variables)
         
         # Handle batch_stats if present
         if 'batch_stats' in sharded_variables:
@@ -326,7 +326,7 @@ class Pipeline(nnx.Module):
         return save_input_policy
 
     def get_weight_sharding(self, *init_args):
-        variables = self.layers
+        variables = self.stage_params
         repeats = self.config.num_pipeline_repeats
         def _infer_partition_spec(node):
             if hasattr(node, 'value'):
@@ -334,7 +334,7 @@ class Pipeline(nnx.Module):
                 return nn.LogicallyPartitioned(node.value, names).get_partition_spec()
             return None
         specs = jax.tree.map(_infer_partition_spec, variables, is_leaf=lambda x: hasattr(x, 'value'))
-        return {'params': {'layers': specs['params']}}
+        return {'params': {'stage_params': specs['params']}}
 
     def _all_gather_over_fsdp(self, params, partition_spec):
         def _remove_fsdp_from_spec(spec):
@@ -362,7 +362,7 @@ class Pipeline(nnx.Module):
         if segment_ids is not None: segment_ids = segment_ids.reshape((self.total_microbatches, self.microbatch_size, self.config.max_target_length))
         
         loop_state = self.init_states(inputs)
-        layer_variables = self._to_pure_dict(self.layers)
+        layer_variables = self._to_pure_dict(self.stage_params)
         
         compute_dtype = getattr(self.config, 'compute_dtype', jnp.bfloat16)
         if isinstance(compute_dtype, str):
@@ -371,9 +371,9 @@ class Pipeline(nnx.Module):
 
         if self.config.pipeline_fsdp_ag_once and partition_spec is not None:
             try:
-                if "params" in partition_spec and "layers" in partition_spec["params"]:
+                if "params" in partition_spec and "stage_params" in partition_spec["params"]:
                      params_only = layer_variables['params']
-                     params_spec = partition_spec['params']['layers']['params']
+                     params_spec = partition_spec['params']['stage_params']['params']
                      layer_variables['params'] = self._all_gather_over_fsdp(params_only, params_spec)
             except (KeyError, TypeError): pass
 
@@ -393,7 +393,7 @@ class Pipeline(nnx.Module):
                 def stage_fn(v, x, r, po, se):
                     rngs_dict = {'dropout': r} if not deterministic else {}
                     mutables = ['aux_loss', 'intermediates']
-                    return self.linen_module.apply(v, x, se, po, deterministic, model_mode, rngs=rngs_dict, mutable=mutables)
+                    return self.layers.apply(v, x, se, po, deterministic, model_mode, rngs=rngs_dict, mutable=mutables)
                 vmap_axes = [0, 0, 0]
                 vmap_args = [vars_in, inputs, rngs]
                 vmap_axes.append(0 if pos is not None else None); vmap_args.append(pos)
@@ -421,6 +421,8 @@ class Pipeline(nnx.Module):
         output = output.reshape((self.config.micro_batch_size_to_train_on, self.config.max_target_length, self.config.emb_dim))
         return output
 
+
+
 # ==============================================================================
 # Factory
 # ==============================================================================
@@ -439,7 +441,7 @@ def add_stage_axis_to_partitioning(variable, repeats=1):
     new_names = _infer_partition_names(value, repeats=repeats, base_names=base_names)
     return nn.LogicallyPartitioned(value, new_names)
 
-def create_pipeline(config: Config, layer: Callable | type, mesh: Mesh, remat_policy: Any = None) -> nnx_wrappers.ToLinen:
+def create_pipeline(config: Config, layers: Callable | type, mesh: Mesh, remat_policy: Any = None) -> nnx_wrappers.ToLinen:
     repeats = getattr(config, 'num_pipeline_repeats', 1)
     metadata_fn = functools.partial(add_stage_axis_to_partitioning, repeats=repeats)
-    return nnx_wrappers.to_linen(Pipeline, config=config, mesh=mesh, layer=layer, remat_policy=remat_policy, name="pipeline_module", abstract_init=False, metadata_fn=metadata_fn)
+    return nnx_wrappers.to_linen(Pipeline, config=config, mesh=mesh, layers=layers, remat_policy=remat_policy, name="pipeline_module", abstract_init=False, metadata_fn=metadata_fn)
