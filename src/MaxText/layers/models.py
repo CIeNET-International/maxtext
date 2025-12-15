@@ -85,8 +85,8 @@ class TransformerLinenPure(nn.Module):
         config=cfg,
         mesh=self.mesh,
     )
-    self.vision_encoder = vision_encoder_as_linen(config=cfg, mesh=mesh) if cfg.use_multimodal else None
-    self.decoder = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode)
+    self.vision_encoder = VisionEncoder(config=cfg, mesh=mesh) if cfg.use_multimodal else None
+    self.decoder = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode, rngs=nnx.Rngs(0))
     # If MTP is enabled via config, set up the MTP block.
     if self.config.mtp_num_layers > 0:
       # Get the list of layer blueprints for the current model.
@@ -283,6 +283,106 @@ class TransformerLinen(nnx_wrappers.ToLinen):
     return nnx_wrappers.ToLinen.apply(module, *args, **kwargs)
 
 
+
+from flax import traverse_util
+def inspect_nnx_structure(nnx_model):
+  """
+  Prints the high-level components of the first layer in an NNX model.
+  """
+  print(f"{'='*20} NNX STRUCTURE REPORT {'='*20}")
+
+  # 1. Get the full state (parameters) of the model
+  # We convert to a flat dictionary to easily analyze paths
+  try:
+      state = nnx.state(nnx_model)
+      flat_state = traverse_util.flatten_dict(state.to_pure_dict(), sep='/')
+  except Exception as e:
+      print(f"! Error getting NNX state: {e}")
+      return
+
+  if not flat_state:
+      print("! Model state is EMPTY.")
+      print("  Possible cause: The lazy Linen layers (ToNNX) have not been initialized.")
+      print("  Fix: You must run a dummy pass `model(...)` or use the updated `_create_scanned_layers` code.")
+      return
+
+  # 2. Find the prefix for the First Layer
+  # We look for common patterns: 'layers_stack', 'layers/0', 'dense_stack', etc.
+  # We'll just take the first key that looks like a layer container.
+  sample_keys = sorted(list(flat_state.keys()))
+  
+  layer_prefix = None
+  
+  # Priority A: Check for 'layers_stack' (Scanned)
+  for key in sample_keys:
+      if key.startswith('layers_stack'):
+          # In NNX vmap/scan, the axis might be inside. 
+          # We just want the root prefix "layers_stack/"
+          layer_prefix = "layers_stack"
+          break
+          
+  # Priority B: Check for 'layers/0' or 'layers_0' (Sequential)
+  if not layer_prefix:
+      for key in sample_keys:
+          if 'layers/0' in key:
+              layer_prefix = "layers/0"
+              break
+          if 'layers_0' in key:
+              layer_prefix = "layers_0"
+              break
+  
+  # Priority C: DeepSeek style (dense_stack / moe_stack)
+  if not layer_prefix:
+      for key in sample_keys:
+          if key.startswith('dense_stack'):
+              layer_prefix = "dense_stack"
+              break
+
+  if not layer_prefix:
+      print("! Could not identify a layer container (e.g., 'layers_stack' or 'layers/0').")
+      print("  Top-level keys found:", sorted(list(set(k.split('/')[0] for k in sample_keys))))
+      return
+
+  print(f"Inspecting First Layer Prefix: '{layer_prefix}'\n")
+
+  # 3. Group by Component
+  # We filter keys that start with the prefix and group them by the next segment (the component name)
+  components = {}
+  
+  for key, value in flat_state.items():
+      if key.startswith(layer_prefix):
+          # Strip the prefix
+          relative_path = key[len(layer_prefix):].strip('/')
+          
+          # The first part of the remaining path is the Component Name (e.g., 'mlp', 'self_attention')
+          parts = relative_path.split('/')
+          if len(parts) > 0:
+              component_name = parts[0]
+              
+              # If using ToNNX, there is often a 'params' intermediate key. We skip it for cleaner viewing.
+              # e.g. mlp/params/dense/kernel -> dense/kernel
+              param_name = "/".join(parts[1:])
+              if param_name.startswith('params/'):
+                  param_name = param_name[7:] 
+              
+              if component_name not in components:
+                  components[component_name] = []
+              
+              shape = value.shape if hasattr(value, 'shape') else 'scalar/unknown'
+              components[component_name].append((param_name, shape))
+
+  # 4. Print Report
+  for comp_name in sorted(components.keys()):
+      print(f"  [Component] {comp_name}")
+      for param_name, shape in sorted(components[comp_name]):
+          # Filter out empty param names (sometimes happens with state containers)
+          if param_name:
+              print(f"      - {param_name:<20} shape: {shape}")
+      print("")
+
+  print(f"{'='*50}")
+
+
 class Transformer(nnx.Module):
   """An autoregressive transformer model."""
 
@@ -316,10 +416,9 @@ class Transformer(nnx.Module):
         config=cfg,
         rngs=rngs,
     )
-    self.vision_encoder = VisionEncoder(config=cfg, mesh=mesh, rngs=rngs) if cfg.use_multimodal else None
-
-    decoder_linen = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode)
-    self.decoder = nnx_wrappers.ToNNX(decoder_linen, rngs=rngs)
+    self.vision_encoder = VisionEncoder(config=cfg, mesh=mesh) if cfg.use_multimodal else None
+    self.decoder = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode, rngs=rngs)
+    inspect_nnx_structure(self.decoder) 
     self.hidden_states = None
 
     batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(config=cfg, model_mode=model_mode)
@@ -344,14 +443,14 @@ class Transformer(nnx.Module):
       )
     else:
       dummy_attention_metadata = None
-
+    """
     self.decoder.lazy_init(
         shared_embedding=self.token_embedder,
         decoder_input_tokens=dummy_decoder_input_tokens,
         decoder_positions=dummy_decoder_positions,
         attention_metadata=dummy_attention_metadata,
     )
-
+    """
     # If MTP is enabled via config, set up the MTP block.
     if self.config.mtp_num_layers > 0:
       # Get the list of layer blueprints for the current model.
