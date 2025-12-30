@@ -140,7 +140,11 @@ class DeepSeekBatchSplitGenericLayer(nnx.Module):
         slot,
     )
 
-    x += self.mlp_op(self.post_attention_norm_op(x), deterministic)
+    mlp_output = self.mlp_op(self.post_attention_norm_op(x), deterministic)
+    if isinstance(mlp_output, tuple):
+      x += mlp_output[0]
+    else:
+      x += mlp_output
     x = self.dropout_op(x, deterministic)
     return self.post_process(x, kv_cache=kv_cache)
 
@@ -339,7 +343,8 @@ class DeepSeekMoELayer(DeepSeekBatchSplitGenericLayer):
       )
 
     def _moe(x):
-      return self.mlp_op(self.post_attention_norm_op(x), deterministic)
+      output, _, _ = self.mlp_op(self.post_attention_norm_op(x), deterministic)
+      return output
 
     # Split the inputs into micro-batches.
     x = _split(x)

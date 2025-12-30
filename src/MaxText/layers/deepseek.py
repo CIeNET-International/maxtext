@@ -123,42 +123,6 @@ class DeepSeekGenericLayer(nnx.Module):
 
     self.dropout = Dropout(rate=self.config.dropout_rate, broadcast_dims=(-2,), rngs=self.rngs)
 
-  def __call__(
-      self,
-      inputs,
-      decoder_segment_ids,
-      decoder_positions,
-      deterministic,
-      model_mode,
-      previous_chunk=None,
-      page_state: None | page_manager.PageState = None,
-      slot: None | int = None,
-      kv_cache=None,
-      attention_metadata=None,
-  ):
-    # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
-    if isinstance(inputs, tuple):
-      inputs = inputs[0]
-    x = self.with_logical_constraint(inputs)
-    x = checkpoint_name(x, "decoder_layer_input")
-
-    hidden_states, intermediate_inputs = self.self_attention_with_norm_op(
-        x,
-        decoder_segment_ids,
-        decoder_positions,
-        deterministic,
-        previous_chunk,
-        page_state,
-        slot,
-    )
-
-    mlp_lnx = self.mlp_op(hidden_states, deterministic)
-
-    layer_output = mlp_lnx + intermediate_inputs
-    layer_output = self.dropout_op(layer_output, deterministic=deterministic)
-
-    return self.post_process(layer_output, kv_cache)
-
   def mlp_op(self, x, deterministic, *args, **kwargs):
     """Executes the MLP operation. To be implemented by subclasses."""
     raise NotImplementedError()
@@ -230,8 +194,15 @@ class DeepSeekGenericLayer(nnx.Module):
         "activation_mlp",
     )
 
-  def post_process(self, layer_output, kv_cache=None):
+  def post_process(self, layer_output, load_balance_loss, moe_bias_updates, kv_cache=None):
     """postprocessing."""
+
+    if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
+      self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss)
+
+    if self.config.routed_bias and self.config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
+      self.sow(nnx.Intermediate, "moe_bias_updates", moe_bias_updates)
+
     if self.config.record_internal_nn_metrics:
       self.sow(nnx.Intermediate, "activation_mean", jnp.mean(layer_output))
       self.sow(nnx.Intermediate, "activation_stdev", jnp.std(layer_output))
@@ -304,6 +275,42 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
         self.mlp(x, deterministic, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding)
     )
 
+  def __call__(
+      self,
+      inputs,
+      decoder_segment_ids,
+      decoder_positions,
+      deterministic,
+      model_mode,
+      previous_chunk=None,
+      page_state: None | page_manager.PageState = None,
+      slot: None | int = None,
+      kv_cache=None,
+      attention_metadata=None,
+  ):
+    # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
+    if isinstance(inputs, tuple):
+      inputs = inputs[0]
+    x = self.with_logical_constraint(inputs)
+    x = checkpoint_name(x, "decoder_layer_input")
+
+    hidden_states, intermediate_inputs = self.self_attention_with_norm_op(
+        x,
+        decoder_segment_ids,
+        decoder_positions,
+        deterministic,
+        previous_chunk,
+        page_state,
+        slot,
+    )
+
+    mlp_lnx = self.mlp_op(hidden_states, deterministic)
+
+    layer_output = mlp_lnx + intermediate_inputs
+    layer_output = self.dropout_op(layer_output, deterministic=deterministic)
+
+    return self.post_process(layer_output, None, None, kv_cache)
+
 
 DeepSeekDenseLayerToLinen = nnx_wrappers.to_linen_class(
     DeepSeekDenseLayer,
@@ -338,6 +345,42 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         quant=quant,
         rngs=self.rngs,
     )
+
+  def __call__(
+      self,
+      inputs,
+      decoder_segment_ids,
+      decoder_positions,
+      deterministic,
+      model_mode,
+      previous_chunk=None,
+      page_state: None | page_manager.PageState = None,
+      slot: None | int = None,
+      kv_cache=None,
+      attention_metadata=None,
+  ):
+    # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
+    if isinstance(inputs, tuple):
+      inputs = inputs[0]
+    x = self.with_logical_constraint(inputs)
+    x = checkpoint_name(x, "decoder_layer_input")
+
+    hidden_states, intermediate_inputs = self.self_attention_with_norm_op(
+        x,
+        decoder_segment_ids,
+        decoder_positions,
+        deterministic,
+        previous_chunk,
+        page_state,
+        slot,
+    )
+
+    mlp_lnx, load_balance_loss, moe_bias_updates = self.mlp_op(hidden_states, deterministic)
+
+    layer_output = mlp_lnx + intermediate_inputs
+    layer_output = self.dropout_op(layer_output, deterministic=deterministic)
+
+    return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
 
   def mlp_op(self, x, deterministic, *args, **kwargs):
     return self.with_logical_constraint(
