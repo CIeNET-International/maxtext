@@ -63,30 +63,13 @@ export MODEL_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-bucket/
 ```
 
 ### Option 2: Converting a Hugging Face checkpoint
-If your model checkpoint is from Hugging Face, you need to run a conversion script to make it MaxText-compatible.
 
-1. **Set the Output Path:** First, define where the converted MaxText checkpoint will be saved. For example:
+Refer the steps in [Convert from a Hugging Face checkpoint to MaxText for post training](./convert_hf_checkpoint.md)
+Make sure you have correct checkpoint files saved in `MAXTEXT_CKPT_PATH`.
+Then set the `MODEL_CKPT_PATH` to `$MAXTEXT_CKPT_PATH`
 
-```sh
-export MODEL_CKPT_DIRECTORY=${BASE_OUTPUT_DIRECTORY}/maxtext-checkpoint
-```
-
-2. **Run the Conversion Script:** Execute the following command that downloads the specified Hugging Face model and converts its weights into the MaxText format. The conversion script only supports official versions of models from Hugging Face. To see the specific models and versions currently supported for conversion, please refer to the `HF_IDS` dictionary in the MaxText utility file [here](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/utils/ckpt_conversion/utils/utils.py).
-
-```sh
-python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu  # Ensure torch is installed for the conversion script
-
-python3 -m MaxText.utils.ckpt_conversion.to_maxtext src/MaxText/configs/base.yml \
-    model_name=${MODEL_NAME} \
-    hf_access_token=${HF_TOKEN} \
-    base_output_directory=${MODEL_CKPT_DIRECTORY} \
-    scan_layers=True skip_jax_distributed_system=True
-```
-
-3. **Use the Converted Checkpoint:** Set the following environment variable to use the converted checkpoint:
-
-```sh
-export MODEL_CKPT_PATH=${MODEL_CKPT_DIRECTORY}/0/items
+```bash
+export MODEL_CKPT_PATH=$MAXTEXT_CKPT_PATH
 ```
 
 ## Dataset
