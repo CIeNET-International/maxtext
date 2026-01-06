@@ -81,7 +81,10 @@ If your model checkpoint is from Hugging Face, you need to run a conversion scri
 export PRE_TRAINED_MODEL_CKPT_DIRECTORY=${BASE_OUTPUT_DIRECTORY}/maxtext-checkpoint
 ```
 
-2. **Run the Conversion Script:** Execute the following command that downloads the specified Hugging Face model and converts its weights into the MaxText format. The conversion script only supports official versions of models from Hugging Face. To see the specific models and versions currently supported for conversion, please refer to the `HF_IDS` dictionary in the MaxText utility file [here](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/utils/ckpt_conversion/utils/utils.py).
+2. **Run the Conversion Script:** Execute the following command that downloads the specified Hugging Face model and converts its weights into the MaxText format. The conversion script only supports official versions of models from Hugging Face.
+To see the specific models and versions currently supported for conversion, please refer to the `HF_IDS` dictionary in the MaxText utility file [here](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/utils/ckpt_conversion/utils/utils.py).
+For more info about checkpoint conversion script, please refer to [Checkpoint conversion
+utilities](checkpointing_solutions/convert_checkpoint).
 
 ```sh
 python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu  # Ensure torch is installed for the conversion script

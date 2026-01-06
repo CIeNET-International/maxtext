@@ -24,6 +24,13 @@ Handle preemption and recover training progress.
 
 Optimize storage costs and performance with multi-tier usage.
 :::
+
+:::{grid-item-card} 🔁 Checkpoint conversion utilities
+:link: checkpointing_solutions/convert_checkpoint
+:link-type: doc
+
+Optimize storage costs and performance with multi-tier usage.
+:::
 ::::
 
 ```{toctree}
