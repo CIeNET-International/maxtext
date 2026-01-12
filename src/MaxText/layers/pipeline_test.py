@@ -5,6 +5,9 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 
 from flax import nnx
+from flax import linen as nn
+from MaxText.layers import nnx_wrappers
+from MaxText.layers import initializers
 
 
 from MaxText.common_types import Config, MODEL_MODE_TRAIN, EP_AS_CONTEXT, ShardMode
@@ -810,3 +813,25 @@ class Pipeline(nnx.Module):
     )
 
     return final_output
+
+
+
+
+def pipeline_as_linen(
+    layers: nn.Module,
+    config: Config,
+    mesh: jax.sharding.Mesh,
+    remat_policy = None,
+) :
+    """Helper to create a Pipeline and convert to Linen style module."""
+    rngs = nnx.Rngs(params=config.init_weights_seed)
+    return nnx_wrappers.to_linen(
+      Pipeline,
+      layers=layers,
+      config=config,
+      mesh=mesh,
+      remat_policy=remat_policy,
+      rngs=rngs,
+    )
+
+
