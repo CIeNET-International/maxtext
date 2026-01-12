@@ -222,7 +222,7 @@ class PipelineStageBlock(nnx.Module):
       model_mode: str,
       num_layers: int,
       layer_class: Type[nnx.Module],
-      # ADDED: explicit policy arg
+      scan_axis_name: str = "layers_per_stage",
       remat_policy: Any = None, 
       *,
       rngs: nnx.Rngs
@@ -235,18 +235,30 @@ class PipelineStageBlock(nnx.Module):
     
     self.captured_intermediates = nnx.Intermediate([])
     
-    layer_keys = rngs.split(num_layers)
+    #  We must split params and dropout manually.
+    layer_param_keys = jax.random.split(rngs.params(), num_layers)
+    layer_dropout_keys = jax.random.split(rngs.dropout(), num_layers)
 
-    def create_layer(key):
+    def create_layer(p_key, d_key):
+        # Reconstruct Rngs for the individual layer
+        layer_rngs = nnx.Rngs(params=p_key, dropout=d_key)
         return layer_class(
-            config=config, mesh=mesh, quant=quant, model_mode=model_mode, rngs=key
+            config=config, mesh=mesh, quant=quant, model_mode=model_mode, rngs=layer_rngs
         )
 
     if config.scan_layers_per_stage:
-        self.layers = nnx.vmap(create_layer)(layer_keys)
+        # Pass split keys to vmap
+        self.layers = nnx.vmap(
+            create_layer,
+            transform_metadata={nnx.PARTITION_NAME: scan_axis_name}
+        )(layer_param_keys, layer_dropout_keys)
         self.is_scanned = True
     else:
-        self.layers = [create_layer(k) for k in layer_keys]
+        # Iterate over keys for sequential list
+        self.layers = nnx.List([
+            create_layer(layer_param_keys[i], layer_dropout_keys[i]) 
+            for i in range(num_layers)
+        ])
         self.is_scanned = False
 
   def __call__(
@@ -341,7 +353,8 @@ class PipelineStageBlock(nnx.Module):
             
             # FIX: Robust Remat Condition
             if self.config.remat_policy != "none":
-                result = jax.checkpoint(layer_run, policy=self.remat_policy)(y, kv_in)
+                prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
+                result = jax.checkpoint(layer_run, policy=self.remat_policy,prevent_cse=prevent_cse)(y, kv_in)
             else:
                 result = layer_run(y, kv_in)
             
@@ -429,7 +442,7 @@ class Decoder(nnx.Module):
         dense_d_keys = jax.random.split(rngs.dropout(), self.first_dense_layers)
         
         # Use helper
-        self.local_dense_stack = self._create_layer_stack(DenseCls, dense_p_keys, dense_d_keys)
+        self.local_dense_stack = self._create_layer_stack(DenseCls, dense_p_keys, dense_d_keys,scan_axis_name="dense_layers")
     else:
         self.first_dense_layers = 0
         self.local_dense_stack = None
@@ -453,7 +466,7 @@ class Decoder(nnx.Module):
         rem_p_keys = jax.random.split(rngs.params(), remaining_count)
         rem_d_keys = jax.random.split(rngs.dropout(), remaining_count)
         
-        self.remaining_stack = self._create_layer_stack(RemCls, rem_p_keys, rem_d_keys)
+        self.remaining_stack = self._create_layer_stack(RemCls, rem_p_keys, rem_d_keys,scan_axis_name="layers_outside_pipeline")
     else:
         self.remaining_stack = None
 
@@ -466,24 +479,40 @@ class Decoder(nnx.Module):
       num_remaining = self.config.num_decoder_layers % pattern_len
       
       if num_full_blocks > 0:
-        block_keys = rngs.split(num_full_blocks)
-        def create_block(k):
+        # Split streams
+        block_param_keys = jax.random.split(rngs.params(), num_full_blocks)
+        block_dropout_keys = jax.random.split(rngs.dropout(), num_full_blocks)
+
+        def create_block(p_key, d_key):
+                block_rngs = nnx.Rngs(params=p_key, dropout=d_key)
                 return ScannableBlock(
                     config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, 
-                    num_of_layers=pattern_len, rngs=k
+                    num_of_layers=pattern_len, rngs=block_rngs
                 )
+
         if self.config.scan_layers:
-                self.gemma_main_stack = nnx.vmap(create_block)(block_keys)
+                # vmap over keys
+                self.gemma_main_stack = nnx.vmap(
+                    create_block,
+                    transform_metadata={nnx.PARTITION_NAME: "layers"}
+                )(block_param_keys, block_dropout_keys)
         else:
-                self.gemma_main_stack = [create_block(k) for k in block_keys]
+                self.gemma_main_stack = [
+                    create_block(block_param_keys[i], block_dropout_keys[i]) 
+                    for i in range(num_full_blocks)
+                ]
       else:
         self.gemma_main_stack = None
 
       if num_remaining > 0:
-        rem_key = rngs.split(1)[0]
+        # For a single block, we don't need vmap splitting, just new keys
+        rem_rngs = nnx.Rngs(
+            params=jax.random.split(rngs.params(), 1)[0],
+            dropout=jax.random.split(rngs.dropout(), 1)[0]
+        )
         self.gemma_remainder = ScannableBlock(
                 config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, 
-                num_of_layers=num_remaining, rngs=rem_key
+                num_of_layers=num_remaining, rngs=rem_rngs
         )
       else:
         self.gemma_remainder = None
@@ -493,8 +522,9 @@ class Decoder(nnx.Module):
     block_classes = self.get_decoder_layer_class()
     layer_stacks = []
 
-    # 1. Determine topology
-    if len(block_classes) == 2 and cfg.decoder_block == DecoderBlockType.DEEPSEEK:
+    is_deepseek = (len(block_classes) == 2 and cfg.decoder_block == DecoderBlockType.DEEPSEEK)
+    
+    if is_deepseek:
         self.layer_counts = [cfg.first_num_dense_layers, cfg.num_decoder_layers - cfg.first_num_dense_layers]
     else:
         self.layer_counts = [cfg.num_decoder_layers]
@@ -520,9 +550,15 @@ class Decoder(nnx.Module):
         stack_param_keys = all_param_keys[key_idx : key_idx + count]
         stack_dropout_keys = all_dropout_keys[key_idx : key_idx + count]
         
+        # === LOGIC FOR AXIS NAME ===
+        if is_deepseek:
+            # Match original Linen logic: 0 -> dense, 1 -> moe
+            scan_axis_name = "dense_layers" if i == 0 else "moe_layers"
+        else:
+            scan_axis_name = "layers"
         # Use the new helper to create the stack/list
         # This integrates the "is_scanned" check logic from Implementation B
-        stack = self._create_layer_stack(BlockClass, stack_param_keys, stack_dropout_keys)
+        stack = self._create_layer_stack(BlockClass, stack_param_keys, stack_dropout_keys,scan_axis_name)
         
         layer_stacks.append(stack)
         
@@ -531,7 +567,7 @@ class Decoder(nnx.Module):
     self.layer_stacks = nnx.List(layer_stacks)
 
 
-  def _create_layer_stack(self, BlockClass, param_keys, dropout_keys):
+  def _create_layer_stack(self, BlockClass, param_keys, dropout_keys,scan_axis_name="layers"):
         """
         Factory to create either a vmapped stack (for scan) or a list of layers (for loop),
         depending on self.is_scanned.
@@ -558,14 +594,14 @@ class Decoder(nnx.Module):
             # === SCANNED PATH ===
             # Use nnx.vmap to create a module where parameters have a leading 'layers' axis.
             # We pass the split keys directly to the vmapped function.
-            stack = nnx.vmap(create_layer)(param_keys, dropout_keys)
+            stack = nnx.vmap(
+                create_layer,
+                transform_metadata={nnx.PARTITION_NAME: scan_axis_name} 
+            )(param_keys, dropout_keys)
             return stack
         else:
-            # === SEQUENTIAL PATH ===
-            # Create a standard Python list of independent layer modules.
-            # We assume param_keys is indexable (result of jax.random.split).
             count = len(param_keys)
-            return [create_layer(param_keys[i], dropout_keys[i]) for i in range(count)]
+            return nnx.List([create_layer(param_keys[i], dropout_keys[i]) for i in range(count)])
 
   def _minimal_policy(self, with_context=False):
     """Helper for creating minimal checkpoint policies."""
@@ -734,7 +770,8 @@ class Decoder(nnx.Module):
             model_mode=self.model_mode,
             num_layers=cfg.num_layers_per_pipeline_stage,
             layer_class=base_stage_cls,
-            remat_policy=policy, # PASS POLICY HERE
+            remat_policy=policy,
+            scan_axis_name="layers_per_stage",
             rngs=rngs_key
         )
     return stage_factory
