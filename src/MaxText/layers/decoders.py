@@ -222,6 +222,8 @@ class PipelineStageBlock(nnx.Module):
       model_mode: str,
       num_layers: int,
       layer_class: Type[nnx.Module],
+      # ADDED: explicit policy arg
+      remat_policy: Any = None, 
       *,
       rngs: nnx.Rngs
   ):
@@ -229,8 +231,8 @@ class PipelineStageBlock(nnx.Module):
     self.mesh = mesh
     self.model_mode = model_mode
     self.num_layers = num_layers
+    self.remat_policy = remat_policy # Store policy
     
-    # Container for metrics captured during execution
     self.captured_intermediates = nnx.Intermediate([])
     
     layer_keys = rngs.split(num_layers)
@@ -262,7 +264,6 @@ class PipelineStageBlock(nnx.Module):
   ):
     y = inputs
     
-    # In Pipeline, KV caches might be passed as None or managed internally.
     stage_kv_stack = None
     if kv_caches is not None and self.is_scanned:
          stage_kv_stack = jnp.stack(kv_caches)
@@ -296,16 +297,27 @@ class PipelineStageBlock(nnx.Module):
             current_layer = nnx.merge(layer_graph, params_slice)
             
             def layer_forward(y_c, kv_c):
-                # DecoderLayer returns (y, kv, metrics)
                 return call_layer(current_layer, y_c, kv_c)
             
+            # FIX: Robust Remat Condition
             if self.config.remat_policy != "none":
-                 layer_forward = jax.checkpoint(layer_forward)
+                 prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
+                 layer_forward = jax.checkpoint(
+                     layer_forward, 
+                     policy=self.remat_policy,
+                     prevent_cse=prevent_cse
+                 )
 
-            y_out, kv_out, mets = layer_forward(y_in, kv_slice)
+            # FIX: Robust Unpacking
+            result = layer_forward(y_in, kv_slice)
+            if isinstance(result, tuple) and len(result) == 2:
+                y_out, kv_out = result
+                mets = None
+            else:
+                y_out, kv_out, mets = result
             
-            # Accumulate both KV updates and Metrics
-            return y_out, (kv_out, mets)
+            # FIX: Dict return
+            return y_out, {"kv": kv_out, "metrics": mets}
 
         if stage_kv_stack is None:
              def scan_fn_no_kv(carry, params_slice):
@@ -314,8 +326,10 @@ class PipelineStageBlock(nnx.Module):
         else:
              y, (_, stacked_metrics) = jax.lax.scan(scan_fn, y, scan_xs)
 
-        if stacked_metrics:
-            all_metrics.append(stacked_metrics)
+        if stacked_metrics is not None and stacked_metrics.get("metrics") is not None:
+             # Depending on structure, stacked_metrics might be None or dict of Nones
+             # We accumulate if it looks valid
+             all_metrics.append(stacked_metrics)
 
     else:
         # === SEQUENTIAL EXECUTION ===
@@ -325,22 +339,25 @@ class PipelineStageBlock(nnx.Module):
             def layer_run(y_c, kv_c):
                 return call_layer(layer, y_c, kv_c)
             
+            # FIX: Robust Remat Condition
             if self.config.remat_policy != "none":
-                y, _, mets = jax.checkpoint(layer_run)(y, kv_in)
+                result = jax.checkpoint(layer_run, policy=self.remat_policy)(y, kv_in)
             else:
-                y, _, mets = layer_run(y, kv_in)
+                result = layer_run(y, kv_in)
+            
+            # FIX: Robust Unpacking
+            if isinstance(result, tuple) and len(result) == 2:
+                y, _, mets = result[0], result[1], None
+            else:
+                y, _, mets = result
             
             if mets:
                 all_metrics.append(mets)
 
-    # Store metrics for retrieval if needed
     if self.config.record_internal_nn_metrics and all_metrics:
         self.captured_intermediates.value = all_metrics
 
-    # Pipeline requires returning only 'y'
     return y
-
-
 class Decoder(nnx.Module):
   """A stack of decoder layers as a part of an encoder-decoder architecture."""
 
@@ -706,6 +723,9 @@ class Decoder(nnx.Module):
     cfg = self.config
     base_stage_cls = decoder_block_classes[1] if cfg.decoder_block == DecoderBlockType.DEEPSEEK else decoder_block_classes[0]
     
+    # Pre-fetch policy to pass to stage
+    policy = self.get_remat_policy()
+
     def stage_factory(rngs_key):
         return PipelineStageBlock(
             config=cfg,
@@ -714,6 +734,7 @@ class Decoder(nnx.Module):
             model_mode=self.model_mode,
             num_layers=cfg.num_layers_per_pipeline_stage,
             layer_class=base_stage_cls,
+            remat_policy=policy, # PASS POLICY HERE
             rngs=rngs_key
         )
     return stage_factory
@@ -730,9 +751,10 @@ class Decoder(nnx.Module):
             params_slice, kv_cache_slice = x
             
             # Merge the layer state for this step
-            current_layer = nnx.merge(layer_graph, params_slice)
             
             def layer_forward(y_curr, kv_curr):
+                current_layer = nnx.merge(layer_graph, params_slice)
+                
                 (decoder_segment_ids, decoder_positions, deterministic, model_mode, 
                  previous_chunk, slot, page_state, attention_metadata) = broadcast_args
                 
@@ -743,25 +765,21 @@ class Decoder(nnx.Module):
                     kv_cache=kv_curr, attention_metadata=attention_metadata
                 )
 
-            policy = self.get_remat_policy()
             if self.config.remat_policy != "none":
-                layer_forward = jax.checkpoint(layer_forward, policy=policy)
+                policy = self.get_remat_policy()
+                # Check if we should prevent CSE (crucial for TPU performance in MaxText)
+                prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
+                
+                layer_forward = jax.checkpoint(
+                    layer_forward, 
+                    policy=policy, 
+                    prevent_cse=prevent_cse # <--- KEY MISSING ARG
+                )
 
-            # --- DEBUG LOGGING START ---
             result = layer_forward(y_in, kv_cache_slice)
             
-            # Use jax.debug.print for runtime tracing, or standard print for compile-time structure check
-            print(f"\n[DEBUG _scan_single_block]")
-            print(f"  Layer type: {type(current_layer)}")
-            print(f"  Result type: {type(result)}")
-            if isinstance(result, tuple):
-                print(f"  Result length: {len(result)}")
-            else:
-                print(f"  Result is not a tuple!")
-
             # Attempt to unpack based on inspection
             if isinstance(result, tuple) and len(result) == 2:
-                print("  WARNING: Layer returned 2 values. Filling metrics with None.")
                 y_out, kv_out = result
                 mets = None
             elif isinstance(result, tuple) and len(result) == 3:
@@ -1204,11 +1222,24 @@ class Decoder(nnx.Module):
                                 kv_cache=kv_c, attention_metadata=attention_metadata
                             )
                         
-                        policy = self.get_remat_policy()
-                        if policy is not None:
-                            y, kv_out, mets = jax.checkpoint(layer_run_explicit, policy=policy)(y, kv_in)
+
+                        if cfg.remat_policy != "none":
+                            policy = self.get_remat_policy()
+                            prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
+                            
+                            result = jax.checkpoint(
+                                layer_run_explicit, 
+                                policy=policy,
+                                prevent_cse=prevent_cse
+                            )(y, kv_in)
                         else:
-                            y, kv_out, mets = layer_run_explicit(y, kv_in)
+                            result = layer_run_explicit(y, kv_in)
+
+                        if isinstance(result, tuple) and len(result) == 2:
+                            y, kv_out = result
+                            mets = None
+                        else:
+                            y, kv_out, mets = result
                         collect_kvs(kv_out)
                         collect_metrics(mets)
                 
