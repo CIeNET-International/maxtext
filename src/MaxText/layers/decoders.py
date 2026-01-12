@@ -36,7 +36,7 @@ from MaxText.inference import page_manager
 from MaxText.layers import linears
 from MaxText.layers import normalizations
 from MaxText.layers import quantizations
-from MaxText.layers import pipeline
+from MaxText.layers import pipeline_test as pipeline
 from MaxText import maxtext_utils
 from MaxText import multimodal_utils
 from MaxText import sharding
@@ -407,20 +407,17 @@ class Decoder(nnx.Module):
         self.first_dense_layers = cfg.first_num_dense_layers
         DenseCls = block_classes[0]
         
-        dense_keys = rngs.split(self.first_dense_layers)
-        def create_dense(k):
-                return DenseCls(config=cfg, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=k)
+        # Generate keys
+        dense_p_keys = jax.random.split(rngs.params(), self.first_dense_layers)
+        dense_d_keys = jax.random.split(rngs.dropout(), self.first_dense_layers)
         
-        if cfg.scan_layers:
-            self.local_dense_stack = nnx.vmap(create_dense)(dense_keys)
-        else:
-            self.local_dense_stack = [create_dense(k) for k in dense_keys]
+        # Use helper
+        self.local_dense_stack = self._create_layer_stack(DenseCls, dense_p_keys, dense_d_keys)
     else:
         self.first_dense_layers = 0
         self.local_dense_stack = None
 
     stage_factory = self.get_pipeline_stage_module(block_classes)
-    
     self.pipeline_module = pipeline.Pipeline(
         config=cfg,
         mesh=self.mesh,
@@ -429,19 +426,17 @@ class Decoder(nnx.Module):
         rngs=rngs 
     )
 
+    # 3. Remaining Layers
     pp_layers = cfg.pipeline_parallel_layers
     remaining_count = cfg.num_decoder_layers - pp_layers - self.first_dense_layers
     
     if remaining_count > 0:
         RemCls = block_classes[-1]
-        rem_keys = rngs.split(remaining_count)
-        def create_rem(k):
-            return RemCls(config=cfg, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=k)
         
-        if cfg.scan_layers:
-            self.remaining_stack = nnx.vmap(create_rem)(rem_keys)
-        else:
-            self.remaining_stack = [create_rem(k) for k in rem_keys]
+        rem_p_keys = jax.random.split(rngs.params(), remaining_count)
+        rem_d_keys = jax.random.split(rngs.dropout(), remaining_count)
+        
+        self.remaining_stack = self._create_layer_stack(RemCls, rem_p_keys, rem_d_keys)
     else:
         self.remaining_stack = None
 
@@ -479,34 +474,81 @@ class Decoder(nnx.Module):
   def _init_standard_layers(self, rngs):
     cfg = self.config
     block_classes = self.get_decoder_layer_class()
-    self.layer_stacks = []
-    
+    layer_stacks = []
+
+    # 1. Determine topology
     if len(block_classes) == 2 and cfg.decoder_block == DecoderBlockType.DEEPSEEK:
         self.layer_counts = [cfg.first_num_dense_layers, cfg.num_decoder_layers - cfg.first_num_dense_layers]
     else:
         self.layer_counts = [cfg.num_decoder_layers]
         if len(block_classes) > 1: block_classes = [block_classes[0]]
 
+    # 2. Split RNGs for *all* layers upfront (Implementation A's stability fix)
     total_layers = sum(self.layer_counts)
-    all_keys = rngs.split(total_layers)
+    if total_layers > 0:
+        all_param_keys = jax.random.split(rngs.params(), total_layers)
+        all_dropout_keys = jax.random.split(rngs.dropout(), total_layers)
+    
     key_idx = 0
     
+    # 3. Create Stacks
     for i, count in enumerate(self.layer_counts):
         if count == 0:
-            self.layer_stacks.append(None)
+            layer_stacks.append(None)
             continue
             
         BlockClass = block_classes[i] if i < len(block_classes) else block_classes[0]
-        stack_keys = all_keys[key_idx : key_idx + count]
+        
+        # Slice keys for this stack
+        stack_param_keys = all_param_keys[key_idx : key_idx + count]
+        stack_dropout_keys = all_dropout_keys[key_idx : key_idx + count]
+        
+        # Use the new helper to create the stack/list
+        # This integrates the "is_scanned" check logic from Implementation B
+        stack = self._create_layer_stack(BlockClass, stack_param_keys, stack_dropout_keys)
+        
+        layer_stacks.append(stack)
+        
         key_idx += count
 
-        def create_layer_factory(k):
-                return BlockClass(config=cfg, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=k)
+    self.layer_stacks = nnx.List(layer_stacks)
 
-        if cfg.scan_layers:
-            self.layer_stacks.append(nnx.vmap(create_layer_factory)(stack_keys))
+
+  def _create_layer_stack(self, BlockClass, param_keys, dropout_keys):
+        """
+        Factory to create either a vmapped stack (for scan) or a list of layers (for loop),
+        depending on self.is_scanned.
+        
+        Args:
+            BlockClass: The layer class to instantiate.
+            param_keys: A list/array of RNG keys for parameters (one per layer).
+            dropout_keys: A list/array of RNG keys for dropout (one per layer).
+        """
+        cfg = self.config
+        
+        # Factory function used by both paths
+        def create_layer(p_key, d_key):
+            layer_rngs = nnx.Rngs(params=p_key, dropout=d_key)
+            return BlockClass(
+                config=cfg,
+                mesh=self.mesh,
+                quant=self.quant,
+                model_mode=self.model_mode,
+                rngs=layer_rngs
+            )
+
+        if self.is_scanned:
+            # === SCANNED PATH ===
+            # Use nnx.vmap to create a module where parameters have a leading 'layers' axis.
+            # We pass the split keys directly to the vmapped function.
+            stack = nnx.vmap(create_layer)(param_keys, dropout_keys)
+            return stack
         else:
-            self.layer_stacks.append([create_layer_factory(stack_keys[k]) for k in range(count)])
+            # === SEQUENTIAL PATH ===
+            # Create a standard Python list of independent layer modules.
+            # We assume param_keys is indexable (result of jax.random.split).
+            count = len(param_keys)
+            return [create_layer(param_keys[i], dropout_keys[i]) for i in range(count)]
 
   def _minimal_policy(self, with_context=False):
     """Helper for creating minimal checkpoint policies."""
@@ -677,16 +719,20 @@ class Decoder(nnx.Module):
     return stage_factory
 
   def _scan_single_block(self, layer_stack, init_y, init_kv_stack, broadcast_args):
+        # Split the NNX module into static graph and parameters
         layer_graph, layer_params = nnx.split(layer_stack)
+        
+        # Prepare the input sequence for scan
         scan_xs = (layer_params, init_kv_stack) if init_kv_stack is not None else (layer_params, None)
 
         def scan_fn(carry, x):
             y_in = carry
             params_slice, kv_cache_slice = x
+            
+            # Merge the layer state for this step
             current_layer = nnx.merge(layer_graph, params_slice)
             
             def layer_forward(y_curr, kv_curr):
-                # Unpacking the tuple of args
                 (decoder_segment_ids, decoder_positions, deterministic, model_mode, 
                  previous_chunk, slot, page_state, attention_metadata) = broadcast_args
                 
@@ -698,21 +744,57 @@ class Decoder(nnx.Module):
                 )
 
             policy = self.get_remat_policy()
-            if policy is not None:
+            if self.config.remat_policy != "none":
                 layer_forward = jax.checkpoint(layer_forward, policy=policy)
 
-            # DecoderLayer returns 3 items
-            y_out, kv_out, mets = layer_forward(y_in, kv_cache_slice)
-            return y_out, (kv_out, mets)
+            # --- DEBUG LOGGING START ---
+            result = layer_forward(y_in, kv_cache_slice)
+            
+            # Use jax.debug.print for runtime tracing, or standard print for compile-time structure check
+            print(f"\n[DEBUG _scan_single_block]")
+            print(f"  Layer type: {type(current_layer)}")
+            print(f"  Result type: {type(result)}")
+            if isinstance(result, tuple):
+                print(f"  Result length: {len(result)}")
+            else:
+                print(f"  Result is not a tuple!")
 
+            # Attempt to unpack based on inspection
+            if isinstance(result, tuple) and len(result) == 2:
+                print("  WARNING: Layer returned 2 values. Filling metrics with None.")
+                y_out, kv_out = result
+                mets = None
+            elif isinstance(result, tuple) and len(result) == 3:
+                y_out, kv_out, mets = result
+            else:
+                # Let it crash naturally or raise specific error
+                raise ValueError(f"Unexpected layer return structure: {result}")
+            # --- DEBUG LOGGING END ---
+            
+            # Return a DICTIONARY for the accumulated values.
+            accumulate = {"kv": kv_out, "metrics": mets}
+            return y_out, accumulate
+
+        # Run Scan
         if init_kv_stack is None:
+             # Wrapper to adapt signature when no KV stack is provided
              def scan_fn_no_kv(carry, params_slice):
+                 # We explicitly pass None as the 2nd part of 'x'
                  return scan_fn(carry, (params_slice, None))
-             y_final, (stacked_kv_out, stacked_metrics) = jax.lax.scan(scan_fn_no_kv, init_y, layer_params)
+             
+             scan_result = jax.lax.scan(scan_fn_no_kv, init_y, layer_params)
         else:
-             y_final, (stacked_kv_out, stacked_metrics) = jax.lax.scan(scan_fn, init_y, scan_xs)
+             scan_result = jax.lax.scan(scan_fn, init_y, scan_xs)
+
+        # Unpack result safely using dictionary keys
+        y_final, stacked_accumulate = scan_result
+        
+        stacked_kv_out = stacked_accumulate["kv"]
+        stacked_metrics = stacked_accumulate["metrics"]
 
         return y_final, stacked_kv_out, stacked_metrics
+
+
 
   def _apply_embedding(
       self,
