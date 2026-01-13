@@ -421,14 +421,22 @@ def _build_single_axis_stacked_tensor(
       The final, assembled NumPy array for the MaxText parameter.
   """
   tensors_to_stack = []
-
-  if config.scan_layers:
-    # If it's a standard scanned layer, we use the configured param_scan_axis.
-    axis_to_stack = config.param_scan_axis
+  # Heuristic to determine if we are stacking layers or experts.
+  # If the number of items to stack equals the number of layers, it's a standard
+  # scanned layer, and we use the configured param_scan_axis. Otherwise, it's
+  # an unscanned MoE layer, and we stack along the expert axis (0).
+  """
+  axis_to_stack = config.param_scan_axis if len(hf_source_keys) == config.base_num_decoder_layers else 0 
+  """
+  
+  # Workaround to load the HF model due to mismatched tensor ordering
+  if len(hf_source_keys) == config.base_num_decoder_layers:
+      if getattr(config, 'enable_nnx', False):
+          axis_to_stack = 0
+      else:
+          axis_to_stack = config.param_scan_axis
   else:
-    # Otherwise, if an unscanned MoE layer, and we stack along the expert axis (0).
-    axis_to_stack = 0
-
+      axis_to_stack = 0
   # The hook function needs the shape of an individual slice, not the full stacked tensor.
   # We calculate it by removing the stacking dimension from the final target shape.
   mt_slice_shape_list = list(target_shape)
@@ -666,7 +674,40 @@ def main(args: Sequence[str], test_args: Sequence[str]) -> None:
       use_zarr3=config.checkpoint_storage_use_zarr3,
   )
 
+<<<<<<< HEAD
   maxtext_abstract_dict, abstract_params_treedef = get_maxtext_model_info(config)
+=======
+  max_logging.log("Initializing MaxText abstract model...")
+  quant = quantizations.configure_quantization(config)
+  maxtext_model_flax = models.transformer_as_linen(config, mesh, quant=quant, model_mode=MODEL_MODE_TRAIN)
+  # Get abstract model structure (name, shape) without materializing the weights to save memory
+  abstract_params_tree = maxtext_utils.get_abstract_param(maxtext_model_flax, config)["params"]
+
+  abstract_params_flat, _ = jax.tree_util.tree_flatten_with_path(abstract_params_tree)
+  # Standardize abstract tree for later unflattening
+  abstract_params_tree = jax.tree.map(
+      lambda _: 0,
+      abstract_params_tree,
+      is_leaf=lambda x: isinstance(x, nn.LogicallyPartitioned),
+  )
+  abstract_params_treedef = jax.tree_util.tree_structure(abstract_params_tree)
+  del abstract_params_tree
+
+  max_logging.log("MaxText abstract model and state initialized.")
+
+  # Get parameter mappings and hooks
+  # example of param mapping (gemma2, maxtext:huggingface):
+  # "params-decoder-layers_{maxtext_layer_idx}-pre_self_attention_norm_global-scale":
+  #   f"model.layers.{global_layer_idx}.input_layernorm.weight",
+
+  model_key = config.model_name
+  param_map_mt_to_hf = PARAM_MAPPING[model_key](hf_config_obj.to_dict(), config, config.scan_layers)
+
+  # Example of Hook FN mapping, to perform reshape:
+  # f"params-decoder-layers_{maxtext_layer_idx}-self_attention_global-key-kernel": reshape_kernel,
+  hook_fn_map_mt = HOOK_FNS[model_key](hf_config_obj.to_dict(), config, config.scan_layers, saving_to_hf=False)
+  max_logging.log("Parameter mappings and hooks obtained.")
+>>>>>>> 48856d828 (Update)
 
   # Weight transformation
   max_logging.log("Starting weight transformation...")
