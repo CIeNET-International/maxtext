@@ -762,16 +762,24 @@ class Decoder(nnx.Module):
     # Pre-fetch policy to pass to stage
     policy = self.get_remat_policy()
 
+    # Calculate layers dynamically
+    num_stages = cfg.ici_pipeline_parallelism * cfg.dcn_pipeline_parallelism
+    if num_stages <= 0: num_stages = 1 # Safety fallback
+    
+    # Ensure total PP layers are evenly divisible, or handle remainder logic if necessary
+    # (MaxText usually assumes even division or handles it via config)
+    calculated_layers_per_stage = cfg.pipeline_parallel_layers // num_stages
+
     def stage_factory(rngs_key):
         return PipelineStageBlock(
             config=cfg,
             mesh=self.mesh,
             quant=self.quant,
             model_mode=self.model_mode,
-            num_layers=cfg.num_layers_per_pipeline_stage,
+            # Use the calculated value instead of config.num_layers_per_pipeline_stage
+            num_layers=calculated_layers_per_stage, 
             layer_class=base_stage_cls,
             remat_policy=policy,
-            scan_axis_name="layers_per_stage",
             rngs=rngs_key
         )
     return stage_factory

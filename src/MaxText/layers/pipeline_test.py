@@ -27,6 +27,8 @@ import jax.ad_checkpoint
 from flax import nnx
 from flax import linen as nn
 from MaxText.layers import nnx_wrappers
+from MaxText import maxtext_utils
+
 
 from MaxText.common_types import Config, MODEL_MODE_TRAIN, EP_AS_CONTEXT, ShardMode
 from MaxText.sharding import (
@@ -400,14 +402,35 @@ class Pipeline(nnx.Module):
       return pipeline_weights
 
   def get_weight_sharding(self):
-    state = nnx.state(self.layers)
-    def get_spec(leaf):
-      if hasattr(leaf, "sharding") and isinstance(leaf.sharding, PartitionSpec):
-        return leaf.sharding
-      return PartitionSpec()
+    """Returns the PartitionSpec tree for the model weights, prepending 'stage' axis."""
+    flat_specs = {}
+    
+    # Iterate over the graph to access the actual Variable objects (which hold metadata)
+    # rather than just the values.
+    for path, var in nnx.iter_graph(self):
+        if isinstance(var, nnx.Param):
+            # 1. Get the inner sharding spec defined by the layer (e.g. {'embed', 'vocab'})
+            # If no sharding is defined, it defaults to None (fully replicated inner).
+            inner_spec = getattr(var, 'sharding', None)
+            
+            # 2. Normalize inner_spec to a tuple/PartitionSpec
+            if inner_spec is None:
+                inner_spec = PartitionSpec() # empty tuple
+            
+            # 3. Prepend the "stage" axis. 
+            # We know 'self.layers' is vmapped over the 'stage' axis.
+            # All parameters inside 'self.layers' must have this leading axis sharded.
+            if path[0] == 'layers':
+                 new_spec = PartitionSpec("stage", *inner_spec)
+                 flat_specs[path] = new_spec
+            else:
+                 # Handle non-layer parameters if any (unlikely in this Pipeline design)
+                 flat_specs[path] = inner_spec
 
-    partition_spec_tree = jax.tree.map(get_spec, state)
-    return {"params": partition_spec_tree}
+    # 4. Reconstruct the nested structure matching the parameters
+    nested_specs = nnx.State(flat_specs).to_pure_dict()
+    
+    return {"params": nested_specs}
 
   def get_functional_stage_fn(self):
     """Returns pure (weights, inputs...) -> (output, new_state)"""
@@ -456,7 +479,10 @@ class Pipeline(nnx.Module):
     # Vmap over stages (axis 0)
     # output: (stages_out, updated_weights)
     vmapped_stage_fn = jax.vmap(
-        stage_fn_pure, in_axes=(0, 0, 0, 0, None, None), out_axes=(0, 0)
+        stage_fn_pure, 
+        in_axes=(0, 0, 0, 0, None, None), 
+        out_axes=(0, 0),
+        spmd_axis_name=self.spmd_axis_name
     )
 
     stages_output, updated_stage_weights = vmapped_stage_fn(
@@ -518,7 +544,7 @@ class Pipeline(nnx.Module):
         variables,
         physical_partition_spec_no_fsdp,
     )
-
+  
   def __call__(
       self,
       inputs: jnp.ndarray,
@@ -528,79 +554,94 @@ class Pipeline(nnx.Module):
       model_mode=MODEL_MODE_TRAIN,
       logical_partition_spec=None,
   ) -> jnp.ndarray:
-    
-    inputs = inputs.reshape(
-        (
-            self.config.num_pipeline_microbatches,
-            self.pipeline_microbatch_size,
-            self.config.max_target_length,
-            self.config.emb_dim,
-        ),
-        out_sharding=self.input_sharding,
-    )
-
-    ag_sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(None, None))
-    if positions is not None:
-      positions = self._maybe_shard_with_name(positions, ag_sharding)
-      positions = positions.reshape(
-          (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
+    """The main method that maps the series of decoder layer inputs to final layer outputs."""
+    with self.mesh:
+      # 1. Reshape inputs to [microbatches, microbatch_size, seq_len, embed_dim]
+      inputs = inputs.reshape(
+          (
+              self.config.num_pipeline_microbatches,
+              self.pipeline_microbatch_size,
+              self.config.max_target_length,
+              self.config.emb_dim,
+          ),
+          out_sharding=self.input_sharding,
       )
 
-    if segment_ids is not None:
-      segment_ids = self._maybe_shard_with_name(segment_ids, ag_sharding)
-      segment_ids = segment_ids.reshape(
-          (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
-      )
-
-    loop_state = self.init_states(inputs)
-
-    bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
-    real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
-    total_iterations = real_iterations + bubble_iterations
-
-    variables = nnx.state(self.layers)
-
-    if self.config.pipeline_fsdp_ag_once:
-      all_pipeline_weights = self.all_gather_over_fsdp(variables, logical_partition_spec)
-    else:
-      all_pipeline_weights = variables
-
-    logical_partition_spec = self.get_logical_spec_repeats_removed(logical_partition_spec)
-
-    def step_fn(carry, _):
-        curr_loop_state, curr_weights = carry
-        
-        new_loop_state, new_weights = self.run_one_iteration(
-            curr_loop_state,
-            curr_weights,
-            positions,
-            segment_ids,
-            deterministic,
-            model_mode,
-            logical_partition_spec=logical_partition_spec,
+      # 2. Handle Positions and Segment IDs (All Gather if needed)
+      ag_sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(None, None))
+      
+      if positions is not None:
+        positions = self._maybe_shard_with_name(positions, ag_sharding)
+        positions = positions.reshape(
+            (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
         )
-        return (new_loop_state, new_weights), None
 
-    if self.config.set_remat_policy_on_pipeline_iterations:
-      step_fn = jax.checkpoint(step_fn, policy=self.get_pipeline_remat_policy())
+      if segment_ids is not None:
+        segment_ids = self._maybe_shard_with_name(segment_ids, ag_sharding)
+        segment_ids = segment_ids.reshape(
+            (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
+        )
 
-    if self.config.scan_pipeline_iterations:
-      scan_xs = jnp.arange(total_iterations)
-      (loop_state, final_weights), _ = jax.lax.scan(step_fn, (loop_state, all_pipeline_weights), scan_xs)
-    else:
-      curr_weights = all_pipeline_weights
-      for _ in range(total_iterations):
-        (loop_state, curr_weights), _ = step_fn((loop_state, curr_weights), None)
-      final_weights = curr_weights
+      # 3. Initialize Pipeline State Buffers
+      loop_state = self.init_states(inputs)
 
-    nnx.update(self.layers, final_weights)
+      bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
+      real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
+      total_iterations = real_iterations + bubble_iterations
 
-    final_output = self.permute_output_micro_per_stage_dim(loop_state["state_io"])
+      # 4. Prepare Weights (Capture once)
+      # We treat weights as constant for the duration of the pipeline loop (Forward Pass).
+      # This matches Linen's 'variable_broadcast' semantics and prevents OOM.
+      variables = nnx.state(self.layers)
 
-    final_output = jnp.reshape(
-        final_output,
-        (self.config.micro_batch_size_to_train_on, self.config.max_target_length, self.config.emb_dim),
-        out_sharding=self.output_sharding,
-    )
+      if self.config.pipeline_fsdp_ag_once:
+        all_pipeline_weights = self.all_gather_over_fsdp(variables, logical_partition_spec)
+      else:
+        all_pipeline_weights = variables
 
-    return final_output
+      logical_partition_spec = self.get_logical_spec_repeats_removed(logical_partition_spec)
+
+      # 5. Define the Step Function
+      def step_fn(loop_state, _):
+          # We close over 'all_pipeline_weights', treating them as constants.
+          # This tells XLA not to allocate new buffers for weights at every step.
+          new_loop_state, _ = self.run_one_iteration(
+              loop_state,
+              all_pipeline_weights,
+              positions,
+              segment_ids,
+              deterministic,
+              model_mode,
+              logical_partition_spec=logical_partition_spec,
+          )
+          # We discard the second return value (updated_stage_weights/metrics) here 
+          # to ensure the scan loop stays efficient and memory-bound.
+          return new_loop_state, None
+
+      # 6. Apply Rematerialization (Gradient Checkpointing)
+      if self.config.set_remat_policy_on_pipeline_iterations:
+        prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
+        step_fn = jax.checkpoint(step_fn, policy=self.get_pipeline_remat_policy(),prevent_cse=prevent_cse)
+
+      # 7. Execute the Loop
+      if self.config.scan_pipeline_iterations:
+        # Use jax.lax.scan for compilation efficiency
+        scan_xs = jnp.arange(total_iterations)
+        # Pass ONLY loop_state as carry. Weights are implicitly broadcasted via closure.
+        loop_state, _ = jax.lax.scan(step_fn, loop_state, scan_xs)
+      else:
+        # Standard loop (for debugging or specific configs)
+        for _ in range(total_iterations):
+          loop_state, _ = step_fn(loop_state, None)
+
+      # 8. Post-process Outputs
+      # The final output is located in the state_io buffer, potentially permuted.
+      final_output = self.permute_output_micro_per_stage_dim(loop_state["state_io"])
+
+      final_output = jnp.reshape(
+          final_output,
+          (self.config.micro_batch_size_to_train_on, self.config.max_target_length, self.config.emb_dim),
+          out_sharding=self.output_sharding,
+      )
+
+      return final_output
