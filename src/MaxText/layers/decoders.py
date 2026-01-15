@@ -222,7 +222,6 @@ class DecoderLayer(nn.Module):
     else:
       return layer_output, kv_cache
 
-
 class SequentialBlockDecoderLayers(nn.Module):
   """Sequential unscanned series of decoder layers."""
 
@@ -244,6 +243,12 @@ class SequentialBlockDecoderLayers(nn.Module):
       slot: None | int = None,
       page_state: None | page_manager.PageState = None,
   ) -> jnp.ndarray:
+    print("[DEBUG] Entering SequentialBlockDecoderLayers __call__")
+    print(f"inputs shape: {inputs.shape}")
+    print(f"decoder_segment_ids {decoder_segment_ids} shape: ")
+    print(f"decoder_positions {decoder_positions} shape: {decoder_positions.shape}")
+    print(f"num_decoder_layers: {self.num_decoder_layers}")
+    print(f"model_mode: {model_mode}")
     for lyr in range(self.num_decoder_layers):
       inputs = self.decoder_layer(
           config=self.config, mesh=self.mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=model_mode
@@ -277,8 +282,19 @@ class Decoder(nn.Module):
     self.decoder_layer = self.get_decoder_layers()
     self.norm_layer = self.get_norm_layer(num_features=self.config.emb_dim)
     if self.config.using_pipeline_parallelism:
-      rngs = nnx.Rngs()
+
+      rng_key = jax.random.PRNGKey(self.config.init_weights_seed)
+      rngs = nnx.Rngs(params=rng_key,dropout=1)
+
       pipeline_stage_module = nnx_wrappers.ToNNX(self.get_pipeline_stage_module(self.decoder_layer),rngs)
+      pipeline_stage_module.lazy_init(
+        inputs=jnp.zeros((1, 1, 1, self.config.base_emb_dim), dtype=self.config.dtype),
+        decoder_segment_ids=None,
+        decoder_positions=jnp.zeros((1, 1, 1), dtype=jnp.int32),
+        deterministic=True,
+        model_mode=self.model_mode,
+      )
+
       remat_policy = self.get_remat_policy()
       self.pipeline_module = pipeline.pipeline_as_linen(
           config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy

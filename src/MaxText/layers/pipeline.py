@@ -92,28 +92,89 @@ class Pipeline(nnx.Module):
   """NNX implementation of Pipeline parallelism with Debugging."""
 
   def __init__(
-      self,
-      config: Config,
-      mesh: Mesh,
-      layers: nnx.Module,
+      self, 
+      config: Config, 
+      mesh: Mesh, 
+      layers: nnx.Module, 
       remat_policy: Any = None,
-      rngs: nnx.Rngs | None = None,
+      **kwargs,
   ):
     print(f"[DEBUG] Initializing Pipeline Module...")
     self.config = config
     self.mesh = mesh
     self.remat_policy = remat_policy
-    self.layers = layers
-    self.rngs = rngs
-
+    
     self.num_stages = self.config.ici_pipeline_parallelism * self.config.dcn_pipeline_parallelism
+    
+    # 1. Lift the State (Arrays) to [Repeat, Stage, ...]
+    graphdef, state = nnx.split(layers)
+    
+    def lift_state(leaf):
+        if not hasattr(leaf, 'shape'): return leaf
+        if self.config.num_pipeline_repeats > 1:
+            leaf_staged = jnp.stack([leaf] * self.num_stages, axis=0)
+            leaf_repeated = jnp.stack([leaf_staged] * self.config.num_pipeline_repeats, axis=0)
+            return leaf_repeated
+        else:
+            return jnp.stack([leaf] * self.num_stages, axis=0)
+
+    lifted_state = jax.tree.map(lift_state, state)
+    
+    # 2. Update the Module with Lifted Arrays
+    nnx.update(layers, lifted_state)
+    
+    # 3. CRITICAL FIX: Update Sharding Metadata (Robust Traversal)
+    print("[DEBUG] Updating Sharding Metadata (Manual Recursive Traversal)...")
+    
+    def adjust_spec(spec):
+        if spec is None: return None
+        # Handle PartitionSpec or tuple/list representations
+        if isinstance(spec, (tuple, list, jax.sharding.PartitionSpec)):
+            new_spec = list(spec)
+            new_spec.insert(0, None) # Placeholder for Stage
+            if self.config.num_pipeline_repeats > 1:
+                new_spec.insert(0, None) # Placeholder for Repeat
+            return jax.sharding.PartitionSpec(*new_spec)
+        return spec
+
+    def recursive_update(obj, visited):
+        # Prevent infinite recursion
+        if id(obj) in visited:
+            return
+        visited.add(id(obj))
+        
+        # A. If it's a Variable/Param with sharding, update it
+        if hasattr(obj, 'sharding') and hasattr(obj, 'value'): # Duck typing for nnx.Variable
+            if obj.sharding is not None:
+                old_spec = obj.sharding
+                obj.sharding = adjust_spec(old_spec)
+                # print(f"  > Updated {type(obj).__name__}: {old_spec} -> {obj.sharding}")
+            return
+
+        # B. If it's a Module, recurse into attributes
+        if isinstance(obj, nnx.Module):
+            for name, value in vars(obj).items():
+                recursive_update(value, visited)
+        
+        # C. If it's a container, recurse into items
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                recursive_update(item, visited)
+        elif isinstance(obj, dict):
+            for value in obj.values():
+                recursive_update(value, visited)
+
+    # Start traversal
+    visited_ids = set()
+    recursive_update(layers, visited_ids)
+    print(f"[DEBUG] Traversal complete. Visited {len(visited_ids)} unique objects.")
+
+    self.layers = layers 
+
     self.forwarding_delay = 2 if self.config.pipeline_delay_activation_forwarding else 1
     self.pipeline_microbatch_size = self.config.micro_batch_size_to_train_on // self.config.num_pipeline_microbatches
     self.microbatches_per_stage = self.config.num_pipeline_microbatches // self.num_stages
     self.use_circ_storage = self.need_circ_storage()
-
-    log_debug("Config num_stages", self.num_stages)
-    log_debug("Config microbatches_per_stage", self.microbatches_per_stage)
 
     if self.config.expert_shard_attention_option == EP_AS_CONTEXT:
       self.batch_axis_name = "activation_batch_no_exp"
@@ -142,8 +203,7 @@ class Pipeline(nnx.Module):
             (None, self.batch_axis_name, self.seq_len_axis_name, "activation_embed"),
             rules=self.config.logical_axis_rules,
         )
-        if self.config.shard_mode == ShardMode.EXPLICIT
-        else None
+        if self.config.shard_mode == ShardMode.EXPLICIT else None
     )
     self.output_sharding = (
         create_sharding(
@@ -151,10 +211,9 @@ class Pipeline(nnx.Module):
             (self.batch_axis_name, self.seq_len_axis_name, "activation_embed"),
             rules=self.config.logical_axis_rules,
         )
-        if self.config.shard_mode == ShardMode.EXPLICIT
-        else None
+        if self.config.shard_mode == ShardMode.EXPLICIT else None
     )
-
+  
   def need_circ_storage(self):
     return (
         self.config.num_pipeline_repeats > 1
@@ -248,31 +307,69 @@ class Pipeline(nnx.Module):
     stages_in = self._maybe_shard_with_logical(stages_in, self.stages_in_logical)
     return stages_in
 
-  def shard_dim_by_stages(self, x, dim: int, physical_partition_spec: P | None, is_stage_weight: bool = False):
+  def shard_dim_by_stages(
+      self, 
+      x, 
+      dim: int, 
+      physical_partition_spec: P | None, 
+      is_stage_weight: bool = False,
+      insert_repeat_dim: bool = False
+  ):
+    # --- DEBUG: Catch complex specs appearing unexpectedly ---
+    if is_stage_weight and physical_partition_spec is not None:
+         # Check if spec is complex (tuples/strings)
+         is_complex = any(isinstance(dim, (tuple, str)) for dim in physical_partition_spec)
+         if is_complex:
+             print(f"[DEBUG] shard_dim_by_stages receiving COMPLEX SPEC!")
+             print(f"  > x.shape: {x.shape}")
+             print(f"  > spec: {physical_partition_spec}")
+             print(f"  > insert_repeat: {insert_repeat_dim}")
+    # -------------------------------------------------------
+
     placeholder = None if self.config.shard_mode == ShardMode.EXPLICIT else P.UNCONSTRAINED
+    
     if physical_partition_spec is None:
       dims_mapping = [placeholder] * x.ndim
     else:
       physical_partition_spec = _remove_fsdp_from_physical_partition_spec(physical_partition_spec)
       dims_mapping = list(physical_partition_spec)
-      if not is_stage_weight:
-        dims_mapping = [placeholder] * (dim + 1) + dims_mapping[dim:]
-    dims_mapping[dim] = "stage"
-    dims_mapping = tuple(dims_mapping)
+      
+      # 1. Insert Repeat Dimension (Index 0)
+      if insert_repeat_dim and self.config.num_pipeline_repeats > 1:
+          dims_mapping.insert(0, placeholder)
+          
+      # 2. Insert Stage Dimension
+      if dim <= len(dims_mapping):
+          dims_mapping.insert(dim, "stage")
+      else:
+          while len(dims_mapping) < dim:
+              dims_mapping.append(placeholder)
+          dims_mapping.append("stage")
+          
+    # Pad to match array rank
+    while len(dims_mapping) < x.ndim:
+        dims_mapping.append(placeholder)
+
+    # Truncate
+    dims_mapping = tuple(dims_mapping[:x.ndim])
+    
     if physical_partition_spec and is_stage_weight and self.config.shard_mode == ShardMode.EXPLICIT:
       batch_mesh_axis = ["data", "fsdp"]
       reduced_mark = [mesh_axis for mesh_axis in batch_mesh_axis if self.mesh.shape[mesh_axis] > 1]
       pspec = P(*dims_mapping, reduced=set(reduced_mark))
     else:
       pspec = P(*dims_mapping)
+      
     sharding = jax.sharding.NamedSharding(self.mesh, pspec)
     return self._maybe_shard_with_name(x, sharding)
+
 
   def get_microbatch_and_repeat_ids(self, loop_iteration):
     microbatches_processed = jnp.maximum(loop_iteration - self.forwarding_delay * jnp.arange(self.num_stages), 0)
     microbatch_ids = microbatches_processed % self.config.num_pipeline_microbatches
     repeat_ids = microbatches_processed // self.config.num_pipeline_microbatches
     return microbatch_ids, repeat_ids
+
 
   def vmap_parallel_gather(
       self, weights, physical_partition_spec, repeat_ids, repeat_dim_in_weights, stages_dim_in_weights
@@ -282,14 +379,29 @@ class Pipeline(nnx.Module):
 
     gathered_weights_stage_dim = 0
     repeat_ids = self.shard_dim_by_stages(repeat_ids, 0, physical_partition_spec=None)
+    
+    # 1. Shard GLOBAL weights (Has Repeats)
+    # CRITICAL: We MUST set insert_repeat_dim=True here
     weights = self.shard_dim_by_stages(
-        weights, stages_dim_in_weights, physical_partition_spec=physical_partition_spec, is_stage_weight=False
+        weights, 
+        stages_dim_in_weights, 
+        physical_partition_spec=physical_partition_spec, 
+        is_stage_weight=True, 
+        insert_repeat_dim=True 
     )
+    
     stage_weights = jax.vmap(_gather_one, in_axes=(stages_dim_in_weights, 0), out_axes=gathered_weights_stage_dim)(
         weights, repeat_ids
     )
+    
+    # 2. Shard GATHERED weights (No Repeats)
+    # CRITICAL: We MUST set insert_repeat_dim=False here (Repeats stripped)
     stage_weights = self.shard_dim_by_stages(
-        stage_weights, gathered_weights_stage_dim, physical_partition_spec=physical_partition_spec, is_stage_weight=True
+        stage_weights, 
+        gathered_weights_stage_dim, 
+        physical_partition_spec=physical_partition_spec, 
+        is_stage_weight=True,
+        insert_repeat_dim=False
     )
     return stage_weights
 
@@ -457,14 +569,69 @@ class Pipeline(nnx.Module):
     return weights
 
   def all_gather_over_fsdp(self, variables, logical_partition_spec):
+    print(f"\n[DEBUG] --- Inside all_gather_over_fsdp ---")
+    
+    # 1. Check Inputs
+    # Inspect the first leaf of variables to see rank
+    flat_vars = jax.tree.leaves(variables)
+    if flat_vars:
+        print(f"  > Variable[0] Shape: {flat_vars[0].shape}")
+    
+    # Inspect logical spec
+    if logical_partition_spec is None:
+        print(f"  > Input logical_partition_spec is None")
+    else:
+        print(f"  > Input logical_partition_spec is VALID (Not None)")
+        # Print a sample
+        flat_specs = jax.tree.leaves(logical_partition_spec)
+        if flat_specs:
+            print(f"  > Sample Logical Spec: {flat_specs[0]}")
+
+    # 2. Convert to Physical
     physical_partition_spec = logical_to_mesh(
         logical_partition_spec, mesh=self.mesh, rules=self.config.logical_axis_rules
     )
-    physical_partition_spec_no_fsdp = jax.tree.map(_remove_fsdp_from_physical_partition_spec, physical_partition_spec)
+    
+    # 3. Process Spec (The Fix logic + Logging)
+    def process_spec(spec):
+        if spec is None: 
+            return None
+        
+        # Original logic: remove fsdp
+        spec_no_fsdp = _remove_fsdp_from_physical_partition_spec(spec)
+        
+        if isinstance(spec_no_fsdp, P):
+            new_spec = list(spec_no_fsdp)
+        elif isinstance(spec_no_fsdp, (list, tuple)):
+            new_spec = list(spec_no_fsdp)
+        else:
+            return spec_no_fsdp
+
+        # Log before modification
+        # print(f"    >> Processing Spec: {new_spec} for Rank 4 Array")
+
+        # INSERT STAGE (Dim 1)
+        new_spec.insert(0, None) 
+        
+        # INSERT REPEAT (Dim 0)
+        if self.config.num_pipeline_repeats > 1:
+            new_spec.insert(0, None)
+            
+        return P(*new_spec)
+
+    final_specs = jax.tree.map(process_spec, physical_partition_spec)
+    
+    # Log sample final spec
+    flat_final = jax.tree.leaves(final_specs)
+    if flat_final:
+        print(f"  > Final Physical Spec Sample: {flat_final[0]}")
+    
+    print(f"[DEBUG] -----------------------------------\n")
+
     return jax.tree.map(
         lambda w, p: self._maybe_shard_with_name(w, NamedSharding(self.mesh, p)),
         variables,
-        physical_partition_spec_no_fsdp,
+        final_specs,
     )
 
   # --- CRITICAL SECTION: RUN_ONE_ITERATION WITH LOGGING ---
@@ -591,6 +758,16 @@ class Pipeline(nnx.Module):
 
     print(f"\n[DEBUG] Pipeline.__call__ Started")
     # log_debug("Inputs Raw", inputs)
+
+    print("\n[DEBUG] --- Logical Partition Spec in __call__ ---")
+    if logical_partition_spec is not None:
+        def log_spec(path, spec):
+            print(f"Spec: {path} | PartitionSpec: {spec}")
+        jax.tree_util.tree_map_with_path(lambda p, x: log_spec(p, x), logical_partition_spec)
+    else:
+        print("logical_partition_spec is None")
+    print("[DEBUG] ------------------------------------------\n")
+
 
     # 1. Reshape Inputs (Existing correct code)
     inputs = inputs.reshape(
