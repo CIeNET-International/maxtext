@@ -1,21 +1,6 @@
-# Copyright 2023–2025 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-""" Pipeline layer wrapping a decoder layer(s). Supports circular pipelining """
-
 import functools
-from typing import Any
+from typing import Any, Dict, Tuple, Optional, Callable
+import sys
 
 import numpy as np
 import jax
@@ -34,62 +19,43 @@ from MaxText.sharding import (
     logical_to_mesh,
 )
 
-
 # --- DEBUG HELPER ---
-def log_debug(tag, obj, show_value=False):
-  """Helper to print type, shape, and optional value for debugging."""
-  prefix = f"[DEBUG] {tag}:"
-  type_str = str(type(obj))
+def log_trace(tag, msg):
+    print(f"[PIPELINE-TRACE] [{tag}] {msg}")
 
-  if obj is None:
-    print(f"{prefix} None")
-    return
-
-  # Handle JAX/Numpy Arrays
-  if hasattr(obj, "shape"):
-    shape_str = str(obj.shape)
-    dtype_str = str(obj.dtype) if hasattr(obj, "dtype") else "unknown"
-    val_str = ""
-    if show_value or (np.prod(obj.shape) < 10):
-      val_str = f" | Value: {obj}"
-    print(f"{prefix} Type={type_str} | Shape={shape_str} | Dtype={dtype_str}{val_str}")
-
-  # Handle Lists/Tuples
-  elif isinstance(obj, (list, tuple)):
-    print(f"{prefix} Type={type_str} | Len={len(obj)}")
-    for i, item in enumerate(obj):
-      log_debug(f"  {tag}[{i}]", item, show_value)
-
-  # Handle Scalars
-  else:
-    print(f"{prefix} Type={type_str} | Value={obj}")
-
-
+def log_shape(tag, name, obj):
+    if hasattr(obj, 'shape'):
+        print(f"[PIPELINE-DATA] [{tag}] {name}: Shape={obj.shape}, Dtype={obj.dtype}")
+    elif isinstance(obj, (list, tuple)):
+        print(f"[PIPELINE-DATA] [{tag}] {name}: Type={type(obj)}, Len={len(obj)}")
+    elif obj is None:
+        print(f"[PIPELINE-DATA] [{tag}] {name}: None")
+    else:
+        print(f"[PIPELINE-DATA] [{tag}] {name}: Type={type(obj)}")
 # --------------------
 
-
 def _remove_fsdp_from_physical_partition_spec(pps):
-  if isinstance(pps, P):
-    new_spec = []
-    for axis in pps:
-      if axis is None:
-        new_spec.append(None)
-      elif isinstance(axis, str):
-        if axis not in ("fsdp", "fsdp_transpose"):
-          new_spec.append(axis)
-        else:
-          new_spec.append(None)
-      elif isinstance(axis, (list, tuple)):
-        new_axis = [a for a in axis if a not in ("fsdp", "fsdp_transpose")]
-        new_spec.append(tuple(new_axis))
-      else:
-        raise ValueError(f"Unsupported_axis_type: {type(axis)}")
-    return P(*new_spec)
-  return pps
+    if isinstance(pps, P):
+        new_spec = []
+        for axis in pps:
+            if axis is None:
+                new_spec.append(None)
+            elif isinstance(axis, str):
+                if axis not in ("fsdp", "fsdp_transpose"):
+                    new_spec.append(axis)
+                else:
+                    new_spec.append(None)
+            elif isinstance(axis, (list, tuple)):
+                new_axis = [a for a in axis if a not in ("fsdp", "fsdp_transpose")]
+                new_spec.append(tuple(new_axis))
+            else:
+                raise ValueError(f"Unsupported_axis_type: {type(axis)}")
+        return P(*new_spec)
+    return pps
 
 
 class Pipeline(nnx.Module):
-  """NNX implementation of Pipeline parallelism with Debugging."""
+  """NNX implementation of Pipeline parallelism."""
 
   def __init__(
       self, 
@@ -97,77 +63,121 @@ class Pipeline(nnx.Module):
       mesh: Mesh, 
       layers: nnx.Module, 
       remat_policy: Any = None,
-      **kwargs,
+      *,
+      rngs: nnx.Rngs = None
   ):
-    print(f"[DEBUG] Initializing Pipeline Module...")
+    log_trace("__init__", "Start")
     self.config = config
     self.mesh = mesh
     self.remat_policy = remat_policy
     
     self.num_stages = self.config.ici_pipeline_parallelism * self.config.dcn_pipeline_parallelism
+    log_trace("__init__", f"Num Stages: {self.num_stages}")
     
-    # 1. Lift the State (Arrays) to [Repeat, Stage, ...]
+    # -------------------------------------------------------------------------
+    # 1. Lift the State (Arrays)
+    # -------------------------------------------------------------------------
+    log_trace("__init__", "Splitting layers into graph/state...")
     graphdef, state = nnx.split(layers)
     
-    def lift_state(leaf):
-        if not hasattr(leaf, 'shape'): return leaf
+    def lift_state(path, leaf):
+        if not hasattr(leaf, 'shape'): 
+            return leaf
+        
+        is_scalar = (len(leaf.shape) == 0)
+        is_already_staged = False
+        if not is_scalar:
+            is_already_staged = (leaf.shape[0] == self.num_stages)
+        
         if self.config.num_pipeline_repeats > 1:
-            leaf_staged = jnp.stack([leaf] * self.num_stages, axis=0)
-            leaf_repeated = jnp.stack([leaf_staged] * self.config.num_pipeline_repeats, axis=0)
-            return leaf_repeated
+            if is_already_staged:
+                res = jnp.stack([leaf] * self.config.num_pipeline_repeats, axis=0)
+            else:
+                leaf_staged = jnp.stack([leaf] * self.num_stages, axis=0)
+                res = jnp.stack([leaf_staged] * self.config.num_pipeline_repeats, axis=0)
         else:
-            return jnp.stack([leaf] * self.num_stages, axis=0)
+            if is_already_staged:
+                res = leaf
+            else:
+                res = jnp.stack([leaf] * self.num_stages, axis=0)
+        
+        return res
 
-    lifted_state = jax.tree.map(lift_state, state)
+    log_trace("__init__", "Applying lift_state to tree...")
+    lifted_state = jax.tree_util.tree_map_with_path(lift_state, state)
     
-    # 2. Update the Module with Lifted Arrays
+    # CRITICAL: Update the module with the lifted (Rank 4) arrays
+    log_trace("__init__", "Updating layers with lifted state...")
     nnx.update(layers, lifted_state)
     
-    # 3. CRITICAL FIX: Update Sharding Metadata (Robust Traversal)
-    print("[DEBUG] Updating Sharding Metadata (Manual Recursive Traversal)...")
+    # -------------------------------------------------------------------------
+    # 2. CRITICAL FIX: Sharding Metadata Patching
+    # -------------------------------------------------------------------------
+    log_trace("patching", "Starting State-Guided Patching...")
     
-    def adjust_spec(spec):
-        if spec is None: return None
-        # Handle PartitionSpec or tuple/list representations
-        if isinstance(spec, (tuple, list, jax.sharding.PartitionSpec)):
-            new_spec = list(spec)
-            new_spec.insert(0, None) # Placeholder for Stage
-            if self.config.num_pipeline_repeats > 1:
-                new_spec.insert(0, None) # Placeholder for Repeat
-            return jax.sharding.PartitionSpec(*new_spec)
-        return spec
+    patched_count = 0
+    scanned_count = 0
+    
+    def get_node_from_path(root, path_keys):
+        curr = root
+        try:
+            for key in path_keys:
+                if hasattr(key, 'key'):
+                    k = key.key
+                else:
+                    k = key
+                
+                if isinstance(curr, (list, tuple, nnx.List, nnx.Sequential)):
+                    curr = curr[int(k)]
+                elif isinstance(curr, (dict, nnx.Dict)):
+                    curr = curr[k]
+                elif hasattr(curr, str(k)):
+                    curr = getattr(curr, str(k))
+                else:
+                    return None
+            return curr
+        except (KeyError, IndexError, AttributeError, TypeError):
+            return None
 
-    def recursive_update(obj, visited):
-        # Prevent infinite recursion
-        if id(obj) in visited:
-            return
-        visited.add(id(obj))
+    flat_lifted_state = nnx.traversals.flatten_mapping(lifted_state)
+    
+    for path, val in flat_lifted_state.items():
+        scanned_count += 1
+        if len(path) < 1: continue
+        param_path = path[:-1]
         
-        # A. If it's a Variable/Param with sharding, update it
-        if hasattr(obj, 'sharding') and hasattr(obj, 'value'): # Duck typing for nnx.Variable
-            if obj.sharding is not None:
-                old_spec = obj.sharding
-                obj.sharding = adjust_spec(old_spec)
-                # print(f"  > Updated {type(obj).__name__}: {old_spec} -> {obj.sharding}")
-            return
-
-        # B. If it's a Module, recurse into attributes
-        if isinstance(obj, nnx.Module):
-            for name, value in vars(obj).items():
-                recursive_update(value, visited)
+        node = get_node_from_path(layers, param_path)
         
-        # C. If it's a container, recurse into items
-        elif isinstance(obj, (list, tuple)):
-            for item in obj:
-                recursive_update(item, visited)
-        elif isinstance(obj, dict):
-            for value in obj.values():
-                recursive_update(value, visited)
+        if node is not None:
+            spec = getattr(node, 'sharding', None)
+            
+            if spec is not None and isinstance(spec, (tuple, list, jax.sharding.PartitionSpec)):
+                if hasattr(val, 'ndim'):
+                    array_rank = val.ndim
+                    spec_len = len(spec)
+                    
+                    if array_rank > spec_len:
+                        diff = array_rank - spec_len
+                        
+                        spec_list = list(spec) if isinstance(spec, (tuple, list)) else list(spec)
+                        current_nones = 0
+                        for x in spec_list:
+                            if x is None: current_nones += 1
+                            else: break
+                        
+                        if current_nones < diff:
+                            needed = diff - current_nones
+                            prefix = [None] * needed
+                            new_spec_list = prefix + spec_list
+                            new_spec = jax.sharding.PartitionSpec(*new_spec_list)
+                            
+                            try:
+                                node.sharding = new_spec
+                                patched_count += 1
+                            except Exception as e:
+                                log_trace("patching", f"Error updating {param_path}: {e}")
 
-    # Start traversal
-    visited_ids = set()
-    recursive_update(layers, visited_ids)
-    print(f"[DEBUG] Traversal complete. Visited {len(visited_ids)} unique objects.")
+    log_trace("patching", f"Patch complete. Fixed {patched_count} parameters.")
 
     self.layers = layers 
 
@@ -176,44 +186,33 @@ class Pipeline(nnx.Module):
     self.microbatches_per_stage = self.config.num_pipeline_microbatches // self.num_stages
     self.use_circ_storage = self.need_circ_storage()
 
-    if self.config.expert_shard_attention_option == EP_AS_CONTEXT:
-      self.batch_axis_name = "activation_batch_no_exp"
-      self.seq_len_axis_name = "activation_length"
-    else:
-      self.batch_axis_name = "activation_batch"
-      self.seq_len_axis_name = "activation_length_no_exp"
-
     self.spmd_axis_name = "stage" if self.config.shard_mode == ShardMode.AUTO else None
 
     # Sharding Configs
-    self.stages_in_logical = ("activation_stage", self.batch_axis_name, self.seq_len_axis_name, "activation_embed")
+    self.stages_in_logical = ("activation_stage", "activation_batch_no_exp", "activation_length", "activation_embed") if self.config.expert_shard_attention_option == EP_AS_CONTEXT else ("activation_stage", "activation_batch", "activation_length_no_exp", "activation_embed")
     self.stages_in_spec = logical_to_mesh_axes(self.stages_in_logical, self.mesh, rules=self.config.logical_axis_rules)
     self.stages_in_sharding = (
         NamedSharding(self.mesh, self.stages_in_spec) if self.config.shard_mode == ShardMode.EXPLICIT else None
     )
 
-    self.state_io_logical = ("activation_stage", None, self.batch_axis_name, self.seq_len_axis_name, "activation_embed")
+    self.state_io_logical = ("activation_stage", None) + self.stages_in_logical[1:]
     self.state_io_spec = logical_to_mesh_axes(self.state_io_logical, self.mesh, rules=self.config.logical_axis_rules)
     self.state_io_sharding = (
         NamedSharding(self.mesh, self.state_io_spec) if self.config.shard_mode == ShardMode.EXPLICIT else None
     )
+    
     self.input_sharding = (
         create_sharding(
             self.mesh,
-            (None, self.batch_axis_name, self.seq_len_axis_name, "activation_embed"),
+            (None,) + self.stages_in_logical[1:],
             rules=self.config.logical_axis_rules,
         )
         if self.config.shard_mode == ShardMode.EXPLICIT else None
     )
-    self.output_sharding = (
-        create_sharding(
-            self.mesh,
-            (self.batch_axis_name, self.seq_len_axis_name, "activation_embed"),
-            rules=self.config.logical_axis_rules,
-        )
-        if self.config.shard_mode == ShardMode.EXPLICIT else None
-    )
-  
+    self.output_sharding = self.input_sharding
+
+    log_trace("__init__", "Complete")
+
   def need_circ_storage(self):
     return (
         self.config.num_pipeline_repeats > 1
@@ -231,25 +230,19 @@ class Pipeline(nnx.Module):
 
   def _maybe_shard_with_logical(self, inputs, logical_axes):
     return maybe_shard_with_logical(
-        inputs,
-        logical_axes,
-        shard_mode=self.config.shard_mode,
-        mesh=self.mesh,
-        rules=self.config.logical_axis_rules,
+        inputs, logical_axes, shard_mode=self.config.shard_mode,
+        mesh=self.mesh, rules=self.config.logical_axis_rules,
         debug_sharding=self.config.debug_sharding,
     )
 
   def _maybe_shard_with_name(self, inputs, sharding_name):
     return maybe_shard_with_name(
-        inputs,
-        sharding_name,
-        shard_mode=self.config.shard_mode,
+        inputs, sharding_name, shard_mode=self.config.shard_mode,
         debug_sharding=self.config.debug_sharding,
     )
 
   def init_states(self, inputs):
-    print(f"[DEBUG] init_states called with input shape: {inputs.shape}")
-
+    log_trace("init_states", f"Input shape: {inputs.shape}")
     shift = jnp.zeros((self.num_stages,) + inputs.shape[1:], dtype=inputs.dtype)
     shift = self._maybe_shard_with_logical(shift, self.stages_in_logical)
 
@@ -264,8 +257,6 @@ class Pipeline(nnx.Module):
     )
     state_io = self._maybe_shard_with_logical(state_io, self.state_io_logical)
 
-    log_debug("init_states.state_io", state_io)
-
     if self.use_circ_storage:
       circ_storage = jnp.zeros((self.num_stages,) + inputs.shape, dtype=inputs.dtype, out_sharding=self.state_io_sharding)
       circ_storage_mover = shift
@@ -273,6 +264,7 @@ class Pipeline(nnx.Module):
       circ_storage = None
       circ_storage_mover = None
 
+    log_shape("init_states", "state_io", state_io)
     return {
         "state_io": state_io,
         "shift": shift,
@@ -315,18 +307,12 @@ class Pipeline(nnx.Module):
       is_stage_weight: bool = False,
       insert_repeat_dim: bool = False
   ):
-    # --- DEBUG: Catch complex specs appearing unexpectedly ---
-    if is_stage_weight and physical_partition_spec is not None:
-         # Check if spec is complex (tuples/strings)
-         is_complex = any(isinstance(dim, (tuple, str)) for dim in physical_partition_spec)
-         if is_complex:
-             print(f"[DEBUG] shard_dim_by_stages receiving COMPLEX SPEC!")
-             print(f"  > x.shape: {x.shape}")
-             print(f"  > spec: {physical_partition_spec}")
-             print(f"  > insert_repeat: {insert_repeat_dim}")
-    # -------------------------------------------------------
+    # GUARD: Ignore non-array-likes
+    if not hasattr(x, 'ndim') or x.ndim == 0:
+        return x
 
-    placeholder = None if self.config.shard_mode == ShardMode.EXPLICIT else P.UNCONSTRAINED
+    # FIX: Use None instead of P.UNCONSTRAINED
+    placeholder = None 
     
     if physical_partition_spec is None:
       dims_mapping = [placeholder] * x.ndim
@@ -350,7 +336,6 @@ class Pipeline(nnx.Module):
     while len(dims_mapping) < x.ndim:
         dims_mapping.append(placeholder)
 
-    # Truncate
     dims_mapping = tuple(dims_mapping[:x.ndim])
     
     if physical_partition_spec and is_stage_weight and self.config.shard_mode == ShardMode.EXPLICIT:
@@ -363,17 +348,19 @@ class Pipeline(nnx.Module):
     sharding = jax.sharding.NamedSharding(self.mesh, pspec)
     return self._maybe_shard_with_name(x, sharding)
 
-
   def get_microbatch_and_repeat_ids(self, loop_iteration):
     microbatches_processed = jnp.maximum(loop_iteration - self.forwarding_delay * jnp.arange(self.num_stages), 0)
     microbatch_ids = microbatches_processed % self.config.num_pipeline_microbatches
     repeat_ids = microbatches_processed // self.config.num_pipeline_microbatches
     return microbatch_ids, repeat_ids
 
-
   def vmap_parallel_gather(
       self, weights, physical_partition_spec, repeat_ids, repeat_dim_in_weights, stages_dim_in_weights
   ):
+    # GUARD: Ignore non-array-likes
+    if not hasattr(weights, 'ndim') or weights.ndim < 2:
+        return weights
+
     def _gather_one(x, repeat_id):
       return jnp.squeeze(jax.lax.dynamic_slice_in_dim(x, repeat_id, 1, repeat_dim_in_weights), repeat_dim_in_weights)
 
@@ -381,13 +368,12 @@ class Pipeline(nnx.Module):
     repeat_ids = self.shard_dim_by_stages(repeat_ids, 0, physical_partition_spec=None)
     
     # 1. Shard GLOBAL weights (Has Repeats)
-    # CRITICAL: We MUST set insert_repeat_dim=True here
     weights = self.shard_dim_by_stages(
         weights, 
         stages_dim_in_weights, 
         physical_partition_spec=physical_partition_spec, 
         is_stage_weight=True, 
-        insert_repeat_dim=True 
+        insert_repeat_dim=True  # <--- MUST BE TRUE
     )
     
     stage_weights = jax.vmap(_gather_one, in_axes=(stages_dim_in_weights, 0), out_axes=gathered_weights_stage_dim)(
@@ -395,50 +381,27 @@ class Pipeline(nnx.Module):
     )
     
     # 2. Shard GATHERED weights (No Repeats)
-    # CRITICAL: We MUST set insert_repeat_dim=False here (Repeats stripped)
     stage_weights = self.shard_dim_by_stages(
         stage_weights, 
         gathered_weights_stage_dim, 
         physical_partition_spec=physical_partition_spec, 
-        is_stage_weight=True,
-        insert_repeat_dim=False
+        is_stage_weight=True, 
+        insert_repeat_dim=False # <--- MUST BE FALSE
     )
     return stage_weights
 
   def vmap_gather(self, xs, ids, ids_dim):
-    """Use vmap to implement a stage-wise sharded gather."""
-    log_debug("vmap_gather input xs", xs)
-    log_debug("vmap_gather input ids", ids)
-
-    # FIX: Convert to JAX array explicitly to avoid AttributeError on .at[...]
     xs = jnp.asarray(xs)
-    log_debug("vmap_gather xs converted to JAX", xs)
-
     def _gather_one(x, i):
-      # Helper log inside vmap
-      # print(f"DEBUG: _gather_one x.shape={x.shape}, i={i}")
       idx = tuple(i if d == ids_dim else slice(None) for d in range(x.ndim))
       replicated_sharding = NamedSharding(self.mesh, P())
       return x.at[idx].get(out_sharding=replicated_sharding)
 
     ids = self.shard_dim_by_stages(ids, 0, physical_partition_spec=None)
     outs = jax.vmap(_gather_one, in_axes=(None, 0), out_axes=ids_dim)(xs, ids)
-
-    log_debug("vmap_gather output", outs)
     return self.shard_dim_by_stages(outs, 0, physical_partition_spec=None)
 
   def get_new_loop_state(self, output, loop_state):
-    """
-    Update the various buffers given the output of the most recent iteration
-    * state_io: rotates left/up by 1 (the whole created in the last slot is filled with the most recent pipeline output)
-       * Pushing inputs up from top of state_io into first stage of shift
-       * Pulling outputs up from last stage of shift into bottom of state_io
-    * shift: rotate output (or prev_outputs if using delay) right/down by 1 - we imagine the pipeline moves to
-               right/down
-    * circ_storage: pushes circ_storage_mover (the output of the previous iteration) into rotating index of circ_storage
-    * circ_storage_mover: assigned to rotated output and pushed into circ_storage on the next iteration
-    * prev_outputs: is set to the current output
-    """
     old_state_io = loop_state["state_io"]
     old_circ_storage = loop_state["circ_storage"]
     old_circ_storage_mover = loop_state["circ_storage_mover"]
@@ -469,14 +432,11 @@ class Pipeline(nnx.Module):
       arr = jax.lax.ppermute(arr, axis_name="stage", perm=perm)
       return jnp.where(stage_idx == 0, jnp.zeros_like(arr), arr)
 
-    # Shift either rotates or shifts depending on if the last stage immediately must send to first or not
-    # For non-circular pipelines, the last stage does not need to send to first
-    # For circular pipelines with #micro = #stages, last stage immediately sends to first
-    # For circular pipelines with #micro > stages (circ_storage), last stage sends to circ storage
     def _update_shift(output_in):
       if self.config.num_pipeline_repeats == 1 or self.use_circ_storage:
         return _shift_right(output_in)
-      return _rotate_right(output_in)
+      else:
+        return _rotate_right(output_in)
 
     if self.config.pipeline_delay_activation_forwarding:
       new_shift = _update_shift(old_prev_outputs)
@@ -486,7 +446,6 @@ class Pipeline(nnx.Module):
       new_prev_outputs = None
 
     if self.use_circ_storage:
-
       def _rotate_right_and_update(circ_storage_mover_in, circ_storage_in):
         rotated = _rotate_right(circ_storage_mover_in)
         rotated = jnp.expand_dims(rotated, 1)
@@ -552,7 +511,7 @@ class Pipeline(nnx.Module):
 
   def get_current_repeat_from_stages(self, weights, loop_iteration, physical_partition_spec=None):
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
-
+    
     def gather_weights_for_stages_in(w, spec=None):
       return self.vmap_parallel_gather(
           w,
@@ -569,35 +528,13 @@ class Pipeline(nnx.Module):
     return weights
 
   def all_gather_over_fsdp(self, variables, logical_partition_spec):
-    print(f"\n[DEBUG] --- Inside all_gather_over_fsdp ---")
-    
-    # 1. Check Inputs
-    # Inspect the first leaf of variables to see rank
-    flat_vars = jax.tree.leaves(variables)
-    if flat_vars:
-        print(f"  > Variable[0] Shape: {flat_vars[0].shape}")
-    
-    # Inspect logical spec
-    if logical_partition_spec is None:
-        print(f"  > Input logical_partition_spec is None")
-    else:
-        print(f"  > Input logical_partition_spec is VALID (Not None)")
-        # Print a sample
-        flat_specs = jax.tree.leaves(logical_partition_spec)
-        if flat_specs:
-            print(f"  > Sample Logical Spec: {flat_specs[0]}")
-
-    # 2. Convert to Physical
+    log_trace("all_gather_over_fsdp", "Start")
     physical_partition_spec = logical_to_mesh(
         logical_partition_spec, mesh=self.mesh, rules=self.config.logical_axis_rules
     )
     
-    # 3. Process Spec (The Fix logic + Logging)
     def process_spec(spec):
-        if spec is None: 
-            return None
-        
-        # Original logic: remove fsdp
+        if spec is None: return None
         spec_no_fsdp = _remove_fsdp_from_physical_partition_spec(spec)
         
         if isinstance(spec_no_fsdp, P):
@@ -607,13 +544,7 @@ class Pipeline(nnx.Module):
         else:
             return spec_no_fsdp
 
-        # Log before modification
-        # print(f"    >> Processing Spec: {new_spec} for Rank 4 Array")
-
-        # INSERT STAGE (Dim 1)
         new_spec.insert(0, None) 
-        
-        # INSERT REPEAT (Dim 0)
         if self.config.num_pipeline_repeats > 1:
             new_spec.insert(0, None)
             
@@ -621,20 +552,12 @@ class Pipeline(nnx.Module):
 
     final_specs = jax.tree.map(process_spec, physical_partition_spec)
     
-    # Log sample final spec
-    flat_final = jax.tree.leaves(final_specs)
-    if flat_final:
-        print(f"  > Final Physical Spec Sample: {flat_final[0]}")
-    
-    print(f"[DEBUG] -----------------------------------\n")
-
     return jax.tree.map(
         lambda w, p: self._maybe_shard_with_name(w, NamedSharding(self.mesh, p)),
         variables,
         final_specs,
     )
 
-  # --- CRITICAL SECTION: RUN_ONE_ITERATION WITH LOGGING ---
   def run_one_iteration(
       self,
       loop_state,
@@ -646,8 +569,7 @@ class Pipeline(nnx.Module):
       graphdef,
       logical_partition_spec=None,
   ):
-    """Run one loop iteration with robust None handling and logging."""
-    # print(f"[DEBUG] --- Starting run_one_iteration ---")
+    # log_trace("run_one_iteration", "Start")
     state_io = loop_state["state_io"]
     shift = loop_state["shift"]
     circ_storage = loop_state["circ_storage"]
@@ -659,83 +581,58 @@ class Pipeline(nnx.Module):
 
     stages_inputs = self.get_iteration_inputs(loop_iteration, state_io, circ_storage, shift)
     stages_inputs = jax.ad_checkpoint.checkpoint_name(stages_inputs, "iteration_input")
-
-    # log_debug("stages_inputs", stages_inputs)
-
-    # Gather inputs or set to None
+    
     if positions is not None:
-      stages_positions = self.vmap_gather(positions, microbatch_ids, 0)
-      # log_debug("stages_positions (gathered)", stages_positions)
+        stages_positions = self.vmap_gather(positions, microbatch_ids, 0)
     else:
-      # print("[DEBUG] positions is None")
-      stages_positions = None
-
+        stages_positions = None
+        
     if segment_ids is not None:
-      stages_segment_ids = self.vmap_gather(segment_ids, microbatch_ids, 0)
-      # log_debug("stages_segment_ids (gathered)", stages_segment_ids)
+        stages_segment_ids = self.vmap_gather(segment_ids, microbatch_ids, 0)
     else:
-      # print("[DEBUG] segment_ids is None")
-      stages_segment_ids = None
+        stages_segment_ids = None
 
     stage_weights = self.get_current_stage_weights(
         pipeline_weights_state, loop_iteration, physical_partition_spec=physical_partition_spec
     )
-
-    # --- FUNCTIONAL CALL DEFINITION ---
-    # Define this clearly to avoid lambda confusion
+    
     def functional_call(weights, x, seg, pos):
-      # DEBUG LOG inside the vmapped function
-      # This will print dimensions AFTER vmap slicing (should be Batch x Seq, not Stage x Batch x Seq)
-      print(f"[DEBUG] Inside functional_call:")
-      log_debug("  Input x", x)
-      log_debug("  Input seg", seg)
-      log_debug("  Input pos", pos)
+        model = nnx.merge(graphdef, weights)
+        return model(x, seg, pos, deterministic, model_mode)
 
-      # Merge state back into graph to get callable module
-      model = nnx.merge(graphdef, weights)
-      return model(x, seg, pos, deterministic, model_mode)
-
-    # --- DYNAMIC VMAP CONSTRUCTION ---
     vmap_args = [stage_weights, stages_inputs]
-    vmap_in_axes = [0, 0]
-
-    # Handle segment_ids
+    vmap_in_axes = [0, 0] 
+    
     if stages_segment_ids is not None:
-      vmap_args.append(stages_segment_ids)
-      vmap_in_axes.append(0)
+        vmap_args.append(stages_segment_ids)
+        vmap_in_axes.append(0) 
     else:
-      vmap_args.append(None)
-      vmap_in_axes.append(None)
+        vmap_args.append(None)
+        vmap_in_axes.append(None) 
 
-    # Handle positions
     if stages_positions is not None:
-      vmap_args.append(stages_positions)
-      vmap_in_axes.append(0)
+        vmap_args.append(stages_positions)
+        vmap_in_axes.append(0) 
     else:
-      vmap_args.append(None)
-      vmap_in_axes.append(None)
+        vmap_args.append(None)
+        vmap_in_axes.append(None)
 
-    # Log what we are about to call
-    # log_debug("VMAP Arguments count", len(vmap_args))
-    # log_debug("VMAP Axes", vmap_in_axes)
+    vmapped_call = jax.vmap(
+        lambda w, x, s, p: functional_call(w, x, s, p), 
+        in_axes=tuple(vmap_in_axes)
+    )
 
-    # Construct the vmap
-    # We must match the args to (weights, x, seg, pos)
-    vmapped_call = jax.vmap(lambda w, x, s, p: functional_call(w, x, s, p), in_axes=tuple(vmap_in_axes))
-
-    # Execute
     stages_output = vmapped_call(*vmap_args)
 
     if self.config.scan_layers:
-      stages_output = stages_output[0]
+      # FIX: Handle tuple vs tensor return types
+      if isinstance(stages_output, (tuple, list)):
+          stages_output = stages_output[0]
 
     new_state = self.get_new_loop_state(stages_output, loop_state)
     return new_state
 
   def get_pipeline_remat_policy(self):
-    """Returns the pipeline remat policy for this pipeline."""
-    # We ensure that the decoder layer inputs are saved, although we leave it to a custom
-    # policy if they should be saved to device or offloaded.
     if self.config.remat_policy == "custom":
       return self.remat_policy
 
@@ -753,23 +650,12 @@ class Pipeline(nnx.Module):
       positions: jnp.ndarray,
       deterministic: bool,
       model_mode=MODEL_MODE_TRAIN,
-      logical_partition_spec=None,
+      logical_partition_spec=None, 
   ) -> jnp.ndarray:
-
-    print(f"\n[DEBUG] Pipeline.__call__ Started")
-    # log_debug("Inputs Raw", inputs)
-
-    print("\n[DEBUG] --- Logical Partition Spec in __call__ ---")
-    if logical_partition_spec is not None:
-        def log_spec(path, spec):
-            print(f"Spec: {path} | PartitionSpec: {spec}")
-        jax.tree_util.tree_map_with_path(lambda p, x: log_spec(p, x), logical_partition_spec)
-    else:
-        print("logical_partition_spec is None")
-    print("[DEBUG] ------------------------------------------\n")
-
-
-    # 1. Reshape Inputs (Existing correct code)
+    
+    log_trace("__call__", "Start")
+    log_shape("__call__", "inputs", inputs)
+    
     inputs = inputs.reshape(
         (
             self.config.num_pipeline_microbatches,
@@ -780,71 +666,74 @@ class Pipeline(nnx.Module):
         out_sharding=self.input_sharding,
     )
 
-    # 2. FIX: Reshape Positions and Segment IDs
-    # We must break the global batch (e.g. 16) into (NumMicro, MicroSize) -> (4, 4)
-    # The sharding logic ensures they are distributed correctly before reshape.
-
     ag_sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(None, None))
 
     if positions is not None:
-      positions = self._maybe_shard_with_name(positions, ag_sharding)
-      positions = positions.reshape(
-          (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
-      )
-      # log_debug("Positions Reshaped", positions)
-
+        positions = self._maybe_shard_with_name(positions, ag_sharding)
+        positions = positions.reshape(
+            (
+                self.config.num_pipeline_microbatches, 
+                self.pipeline_microbatch_size, 
+                self.config.max_target_length
+            )
+        )
+    
     if segment_ids is not None:
-      segment_ids = self._maybe_shard_with_name(segment_ids, ag_sharding)
-      segment_ids = segment_ids.reshape(
-          (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
-      )
-      # log_debug("Segment IDs Reshaped", segment_ids)
+        segment_ids = self._maybe_shard_with_name(segment_ids, ag_sharding)
+        segment_ids = segment_ids.reshape(
+            (
+                self.config.num_pipeline_microbatches, 
+                self.pipeline_microbatch_size, 
+                self.config.max_target_length
+            )
+        )
 
-    # 3. Initialize Loop
     loop_state = self.init_states(inputs)
-
+    
     graphdef, layer_state = nnx.split(self.layers)
 
     if self.config.pipeline_fsdp_ag_once:
       layer_state = self.all_gather_over_fsdp(layer_state, logical_partition_spec)
 
-    # Each microbatch should go through each stage (with repeats) - so there is num_micro * (num_stages * repeats)
-    # compute to perform
-    # Each iteration is vmapped by num_stages, so the number of iterations should be
-    # num_micro * num_stages * repeats / num_stages = num_micro * repeats
-    # However due to the pipeline bubble some iterations process less than num_stages microbatches. It takes
-    # num_micro * repeat iterations for the last microbatch to start the final repeat, then an additional
-    # num_stages - 1 to finish the final repeat.
-    # Thus the total iterations is num_micro * repeat + num_stages - 1, & we may consider the num_stages - 1 as bubble.
-    # The bubble doubles when we use forwarding delay.
     bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
     real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
     total_iterations = real_iterations + bubble_iterations
-
-    print(f"[DEBUG] Scan Configuration: Total Iterations={total_iterations}")
+    log_trace("__call__", f"Total Iterations: {total_iterations}")
 
     def scan_body(carry, _):
-      new_loop_state = self.run_one_iteration(
-          carry, layer_state, positions, segment_ids, deterministic, model_mode, graphdef, logical_partition_spec
-      )
-      return new_loop_state, None
+        new_loop_state = self.run_one_iteration(
+            carry,
+            layer_state,
+            positions,
+            segment_ids,
+            deterministic,
+            model_mode,
+            graphdef,
+            logical_partition_spec
+        )
+        return new_loop_state, None
 
     if self.config.set_remat_policy_on_pipeline_iterations:
-      scan_body = jax.checkpoint(scan_body, policy=self.get_pipeline_remat_policy())
+        scan_body = jax.checkpoint(
+            scan_body, 
+            policy=self.get_pipeline_remat_policy()
+        )
 
     if self.config.scan_pipeline_iterations:
-      loop_state, _ = jax.lax.scan(scan_body, loop_state, None, length=total_iterations)
+         final_loop_state, _ = jax.lax.scan(scan_body, loop_state, None, length=total_iterations)
     else:
-      for _ in range(total_iterations):
-        loop_state, _ = scan_body(loop_state, None)
+         final_loop_state = loop_state
+         for i in range(total_iterations):
+             final_loop_state, _ = scan_body(final_loop_state, None)
 
-    final_output = self.permute_output_micro_per_stage_dim(loop_state["state_io"])
+    final_output = self.permute_output_micro_per_stage_dim(final_loop_state["state_io"])
     final_output = jnp.reshape(
         final_output,
         (self.config.micro_batch_size_to_train_on, self.config.max_target_length, self.config.emb_dim),
         out_sharding=self.output_sharding,
     )
-
+    
+    log_trace("__call__", "Complete")
     return final_output
 
 
