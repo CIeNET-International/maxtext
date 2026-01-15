@@ -9,7 +9,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import jax.ad_checkpoint
 
 from flax import nnx
-
+from MaxText.layers.initializers import variable_to_logically_partitioned
 from MaxText.common_types import Config, MODEL_MODE_TRAIN, EP_AS_CONTEXT, ShardMode
 from MaxText.sharding import (
     maybe_shard_with_logical,
@@ -109,76 +109,7 @@ class Pipeline(nnx.Module):
     # CRITICAL: Update the module with the lifted (Rank 4) arrays
     log_trace("__init__", "Updating layers with lifted state...")
     nnx.update(layers, lifted_state)
-    
-    # -------------------------------------------------------------------------
-    # 2. CRITICAL FIX: Sharding Metadata Patching
-    # -------------------------------------------------------------------------
-    log_trace("patching", "Starting State-Guided Patching...")
-    
-    patched_count = 0
-    scanned_count = 0
-    
-    def get_node_from_path(root, path_keys):
-        curr = root
-        try:
-            for key in path_keys:
-                if hasattr(key, 'key'):
-                    k = key.key
-                else:
-                    k = key
-                
-                if isinstance(curr, (list, tuple, nnx.List, nnx.Sequential)):
-                    curr = curr[int(k)]
-                elif isinstance(curr, (dict, nnx.Dict)):
-                    curr = curr[k]
-                elif hasattr(curr, str(k)):
-                    curr = getattr(curr, str(k))
-                else:
-                    return None
-            return curr
-        except (KeyError, IndexError, AttributeError, TypeError):
-            return None
-
-    flat_lifted_state = nnx.traversals.flatten_mapping(lifted_state)
-    
-    for path, val in flat_lifted_state.items():
-        scanned_count += 1
-        if len(path) < 1: continue
-        param_path = path[:-1]
-        
-        node = get_node_from_path(layers, param_path)
-        
-        if node is not None:
-            spec = getattr(node, 'sharding', None)
-            
-            if spec is not None and isinstance(spec, (tuple, list, jax.sharding.PartitionSpec)):
-                if hasattr(val, 'ndim'):
-                    array_rank = val.ndim
-                    spec_len = len(spec)
-                    
-                    if array_rank > spec_len:
-                        diff = array_rank - spec_len
-                        
-                        spec_list = list(spec) if isinstance(spec, (tuple, list)) else list(spec)
-                        current_nones = 0
-                        for x in spec_list:
-                            if x is None: current_nones += 1
-                            else: break
-                        
-                        if current_nones < diff:
-                            needed = diff - current_nones
-                            prefix = [None] * needed
-                            new_spec_list = prefix + spec_list
-                            new_spec = jax.sharding.PartitionSpec(*new_spec_list)
-                            
-                            try:
-                                node.sharding = new_spec
-                                patched_count += 1
-                            except Exception as e:
-                                log_trace("patching", f"Error updating {param_path}: {e}")
-
-    log_trace("patching", f"Patch complete. Fixed {patched_count} parameters.")
-
+ 
     self.layers = layers 
 
     self.forwarding_delay = 2 if self.config.pipeline_delay_activation_forwarding else 1
@@ -753,7 +684,10 @@ def pipeline_as_linen(
       config=config,
       mesh=mesh,
       layers=layers,
-      remat_policy=remat_policy,
+      remat_policy=remat_policy,      
+      metadata_fn=variable_to_logically_partitioned,
+      abstract_init=False,
+
   )
 
 
