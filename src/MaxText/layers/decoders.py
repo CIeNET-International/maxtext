@@ -36,6 +36,7 @@ from MaxText.sharding import create_sharding
 from MaxText.inference import page_manager
 from MaxText.layers import linears
 from MaxText.layers import normalizations
+from MaxText.layers import nnx_wrappers
 from MaxText.layers import quantizations
 from MaxText.layers import pipeline
 from MaxText import maxtext_utils
@@ -276,9 +277,10 @@ class Decoder(nn.Module):
     self.decoder_layer = self.get_decoder_layers()
     self.norm_layer = self.get_norm_layer(num_features=self.config.emb_dim)
     if self.config.using_pipeline_parallelism:
-      pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer)
+      rngs = nnx.Rngs()
+      pipeline_stage_module = nnx_wrappers.ToNNX(self.get_pipeline_stage_module(self.decoder_layer),rngs)
       remat_policy = self.get_remat_policy()
-      self.pipeline_module = pipeline.Pipeline(
+      self.pipeline_module = pipeline.pipeline_as_linen(
           config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy
       )
 
