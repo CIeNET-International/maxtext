@@ -64,7 +64,7 @@ class Pipeline(nnx.Module):
       layers: nnx.Module, 
       remat_policy: Any = None,
       *,
-      rngs: nnx.Rngs = None
+      rngs: nnx.Rngs | None= None
   ):
     log_trace("__init__", "Start")
     self.config = config
@@ -72,41 +72,74 @@ class Pipeline(nnx.Module):
     self.remat_policy = remat_policy
     
     self.num_stages = self.config.ici_pipeline_parallelism * self.config.dcn_pipeline_parallelism
-    log_trace("__init__", f"Num Stages: {self.num_stages}")
-    
+
     # -------------------------------------------------------------------------
-    # 1. Lift the State (Arrays)
+    # 1. Lift the State (Arrays) with Symmetry Breaking
     # -------------------------------------------------------------------------
     log_trace("__init__", "Splitting layers into graph/state...")
     graphdef, state = nnx.split(layers)
     
+    # Generate perturbation keys if RNG is available
+    perturb_key = None
+    if rngs is not None:
+        perturb_key = rngs.params() # Use params stream
+    
     def lift_state(path, leaf):
-        if not hasattr(leaf, 'shape'): 
-            return leaf
+        if not hasattr(leaf, 'shape'): return leaf
         
         is_scalar = (len(leaf.shape) == 0)
         is_already_staged = False
         if not is_scalar:
             is_already_staged = (leaf.shape[0] == self.num_stages)
+            
+        # Helper to stack and perturb
+        def stack_and_perturb(item, count, key):
+            stacked = jnp.stack([item] * count, axis=0)
+            
+            # CRITICAL: Break Symmetry
+            # We only perturb floating point weights (not integers/masks)
+            if key is not None and jnp.issubdtype(item.dtype, jnp.floating):
+                # Small noise: 1e-4 * standard_deviation of weights
+                # This ensures stages are distinct but keeps training stable
+                noise_scale = 1e-3
+                noise = jax.random.normal(key, stacked.shape, dtype=item.dtype) * noise_scale * jnp.std(item)
+                stacked = stacked + noise
+            return stacked
+
+        # Logic for lifting
+        res = leaf
         
         if self.config.num_pipeline_repeats > 1:
             if is_already_staged:
-                res = jnp.stack([leaf] * self.config.num_pipeline_repeats, axis=0)
+                # Repeats usually share weights (circular), so we just stack NO PERTURBATION
+                res = jnp.stack([res] * self.config.num_pipeline_repeats, axis=0)
             else:
-                leaf_staged = jnp.stack([leaf] * self.num_stages, axis=0)
+                # Add Stage (Unique)
+                if perturb_key is not None:
+                    # Split key for this specific leaf to keep it deterministic per-parameter
+                    # path is a tuple of keys, hash it to mix
+                    leaf_key = jax.random.fold_in(perturb_key, hash(path))
+                else:
+                    leaf_key = None
+                    
+                leaf_staged = stack_and_perturb(leaf, self.num_stages, leaf_key)
+                
+                # Add Repeat (Shared)
                 res = jnp.stack([leaf_staged] * self.config.num_pipeline_repeats, axis=0)
         else:
-            if is_already_staged:
-                res = leaf
-            else:
-                res = jnp.stack([leaf] * self.num_stages, axis=0)
+            if not is_already_staged:
+                # Add Stage (Unique)
+                if perturb_key is not None:
+                    leaf_key = jax.random.fold_in(perturb_key, hash(path))
+                else:
+                    leaf_key = None
+                res = stack_and_perturb(leaf, self.num_stages, leaf_key)
         
         return res
 
     log_trace("__init__", "Applying lift_state to tree...")
     lifted_state = jax.tree_util.tree_map_with_path(lift_state, state)
     
-    # CRITICAL: Update the module with the lifted (Rank 4) arrays
     log_trace("__init__", "Updating layers with lifted state...")
     nnx.update(layers, lifted_state)
  
