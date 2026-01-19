@@ -439,7 +439,56 @@ class Pipeline(nnx.Module):
       )
     else:
       return pipeline_weights_state
+  
+  def _get_node_from_path(self, root, path_keys):
+    """Helper to traverse object graph using keys from state."""
+    curr = root
+    try:
+        for key in path_keys:
+            if hasattr(key, 'key'): k = key.key
+            else: k = key
+            
+            if isinstance(curr, (list, tuple, nnx.List, nnx.Sequential)): 
+                curr = curr[int(k)]
+            elif isinstance(curr, (dict, nnx.Dict)): 
+                curr = curr[k]
+            elif hasattr(curr, str(k)): 
+                curr = getattr(curr, str(k))
+            else: 
+                return None
+        return curr
+    except (KeyError, IndexError, AttributeError, TypeError):
+        return None
 
+  def get_weight_sharding(self, *args, **kwargs):
+    """
+    Returns the sharding PartitionSpecs for the pipeline layers.
+    Args are ignored in NNX because the module is already initialized.
+    """
+    # 1. Get the flattened state of parameters (ignoring RNGs/BatchStats if only Params needed)
+    # Use nnx.Param to filter for trainable weights
+    flat_state = nnx.traversals.flatten_mapping(nnx.state(self.layers, nnx.Param))
+    flat_sharding = {}
+
+    for path, _ in flat_state.items():
+        # path is like ('layers', '0', 'dense', 'kernel', 'value')
+        # The Param object is at path[:-1]
+        if len(path) < 1: continue
+        param_path = path[:-1]
+        
+        node = self._get_node_from_path(self.layers, param_path)
+        
+        # Extract sharding or default to None
+        spec = getattr(node, 'sharding', None)
+        
+        # We map it to the same path as the value
+        flat_sharding[path] = spec
+
+    # 2. Reconstruct the PyTree
+    # This returns a dict-like structure mirroring the params
+    return nnx.traversals.unflatten_mapping(flat_sharding)
+
+    
   def get_current_repeat_from_stages(self, weights, loop_iteration, physical_partition_spec=None):
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     
