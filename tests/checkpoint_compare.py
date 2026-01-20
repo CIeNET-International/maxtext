@@ -8,10 +8,8 @@ from jax.tree_util import PyTreeDef, tree_flatten_with_path, keystr
 from absl import app
 from absl import flags
 import collections
+from jax.experimental import multihost_utils
 
-jax.config.update("jax_platform_name", "cpu")
-
-# Define command-line flags for the checkpoint paths
 _LINEN_CKPT_PATH = flags.DEFINE_string(
     'linen_ckpt_path', None, 'Path to the Linen model checkpoint items directory.', required=True)
 _NNX_CKPT_PATH = flags.DEFINE_string(
@@ -98,34 +96,62 @@ def compare_params(params1: Dict[str, Any], params2: Dict[str, Any], prefix: str
 
     all_match = True
 
-    def compare_leaf_with_path(path: Tuple[jax.tree_util.DictKey, ...], x: jax.Array, y: jax.Array):
+def compare_leaf_with_path(path: Tuple[jax.tree_util.DictKey, ...], x: jax.Array, y: jax.Array):
         nonlocal all_match
         key_str = keystr(path)
 
-        # Shape and dtype equality are already guaranteed by the structure check above
-        # if struct1 == struct2 for jax trees.
+        # Check for numeric types (handles both JAX arrays and numpy scalars)
+        is_x_numeric = np.issubdtype(x.dtype, np.number) if hasattr(x, 'dtype') else False
+        is_y_numeric = np.issubdtype(y.dtype, np.number) if hasattr(y, 'dtype') else False
 
-        # Always calculate and print numerical differences for numeric arrays
-        if np.issubdtype(x.dtype, np.number) and np.issubdtype(y.dtype, np.number):
-            x_np, y_np = np.asarray(x), np.asarray(y)
-            abs_diff = np.abs(x_np - y_np)
-            mean_diff = np.mean(abs_diff)
-            max_diff = np.max(abs_diff)
-            is_close = np.allclose(x_np, y_np)
+        if is_x_numeric and is_y_numeric:
+            try:
+                # --- STRATEGY: COMPUTE ON DEVICE, GATHER ONLY SCALARS ---
+                
+                # 1. Compute difference statistics strictly on the TPU (distributed)
+                #    JAX will keep these operations sharded across devices.
+                diff = x - y
+                abs_diff = jnp.abs(diff)
+                
+                # These reductions return scalars (0-d arrays)
+                mean_diff_scalar = jnp.mean(abs_diff)
+                max_diff_scalar = jnp.max(abs_diff)
+                
+                # 2. Check for equality/closeness on device
+                #    Using standard allclose locally on device
+                is_close_scalar = jnp.allclose(x, y) 
 
-            print(f"[{prefix}{key_str}] "
-                  f"Mean abs diff: {mean_diff:.2e}, "
-                  f"Max abs diff: {max_diff:.2e}, "
-                  f"AllClose: {is_close}")
+                # 3. Explicitly convert the SCALAR results to Python/Numpy
+                #    Since these are just single numbers, they transfer cheaply.
+                #    We cast to native Python types to force the transfer.
+                mean_diff = float(mean_diff_scalar)
+                max_diff = float(max_diff_scalar)
+                is_close = bool(is_close_scalar)
 
-            if not is_close:
+                print(f"[{prefix}{key_str}] "
+                      f"Mean abs diff: {mean_diff:.2e}, "
+                      f"Max abs diff: {max_diff:.2e}, "
+                      f"AllClose: {is_close}")
+
+                if not is_close:
+                    all_match = False
+
+            except Exception as e:
+                # Fallback / Debugging info if something goes wrong with sharding
+                print(f"[{prefix}{key_str}] Error during comparison: {e}")
                 all_match = False
         else:
-            # Handle non-numerical types if any
-            is_equal = np.array_equal(np.asarray(x), np.asarray(y))
-            print(f"[{prefix}{key_str}] Non-numeric. Equal: {is_equal}")
-            if not is_equal:
-                all_match = False
+            # Handle non-numerical types (strings, Nones, etc)
+            # Safe to convert to numpy as they are usually tiny metadata
+            try:
+                x_np, y_np = np.asarray(x), np.asarray(y)
+                is_equal = np.array_equal(x_np, y_np)
+                print(f"[{prefix}{key_str}] Non-numeric. Equal: {is_equal}")
+                if not is_equal:
+                    all_match = False
+            except Exception as e:
+                 print(f"[{prefix}{key_str}] Error comparing non-numeric: {e}")
+                 all_match = False
 
     jax.tree_util.tree_map_with_path(compare_leaf_with_path, params1, params2)
     return all_match
