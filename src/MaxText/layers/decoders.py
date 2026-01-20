@@ -291,16 +291,22 @@ class Decoder(nnx.Module):
                 )
         else:
             self.layers = []
+            layer = None
             if self.is_deepseek:
-                dense_cls, moe_cls = decoder_block_classes
-                for i in range(config.first_num_dense_layers):
-                    self.layers.append(self._create_single_layer(dense_cls, rngs, name=f"dense_layer_{i}"))
-                for i in range(config.num_decoder_layers - config.first_num_dense_layers):
-                    self.layers.append(self._create_single_layer(moe_cls, rngs, name=f"moe_layer_{i}"))
+              for i in range(config.first_num_dense_layers):
+                  self._create_and_register_layer(dense_cls, rngs, "dense_layer", i)
+              for i in range(config.num_decoder_layers - config.first_num_dense_layers):
+                  self._create_and_register_layer(moe_cls, rngs, "moe_layer", i)
             else:
                 layer_cls = decoder_block_classes[0]
                 for i in range(config.num_decoder_layers):
-                    self.layers.append(self._create_single_layer(layer_cls, rngs, name=f"layers_{i}"))
+                    self._create_and_register_layer(layer_cls, rngs, "layers", i)
+  
+    def _create_and_register_layer(self, layer_cls, rngs, base_name, i):
+        attr_name = f"{base_name}_{i}"
+        layer = self._create_single_layer(layer_cls, rngs)
+        setattr(self, attr_name, layer)
+        self.layers.append(layer) 
 
     def _create_single_layer(self, decoder_layer_class, rngs, **kwargs):
         """Helper to create a single layer (Linen or NNX)."""
