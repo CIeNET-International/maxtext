@@ -290,7 +290,7 @@ class Decoder(nnx.Module):
                     layer_cls, length=num_layers, rngs=rngs
                 )
         else:
-            self.layers = []
+            self.layers = nnx.List([])
             layer = None
             if self.is_deepseek:
               for i in range(config.first_num_dense_layers):
