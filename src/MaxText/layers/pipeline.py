@@ -1,18 +1,4 @@
-# Copyright 2023–2025 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-""" Pipeline layer wrapping a decoder layer(s). Supports circular pipelining """
+""" Pipeline layer wrapping a decoder layer(s). Supports circular pipelining - NNX Version """
 
 import functools
 from typing import Any
@@ -40,25 +26,22 @@ from MaxText.sharding import (
 from MaxText.layers import nnx_wrappers
 
 class Pipeline(nnx.Module):
-  """Module that implements pipelining across stages.
+  """Module that implements pipelining across stages (NNX Version).
 
   This module will loop over microbatches and execute the main body with a vmap for both the inputs and weights.
   This will produce a pipeline pattern if the stage dimension is sharded.
 
-  Supports circular pipelines, and multiple layers per stage are used when a module that executes multiple layers
-  is passed as the layers input.
-
   Attributes:
     config: Importantly contains num_pipeline_microbatches, num_pipeline_repeats.
-    layers: A module instance that each stage can execute. It can either be a single layer such as a
-      LlamaDecoderLayer instance or scanned/looped set of decoder layers to execute multiple layers per stage.
+    layers: An NNX module instance that each stage can execute.
     mesh:  The device mesh of the system.
-    remat_policy: Remat policy to use for the loop iterations
+    remat_policy: Remat policy to use for the loop iterations.
   """
+
   def __init__(
       self,
       config: Config,
-      layers: nn.Module,
+      layers: nnx.Module, # Must be an NNX Module
       mesh: Mesh,
       remat_policy: Any = None,
       *,
@@ -69,8 +52,10 @@ class Pipeline(nnx.Module):
     self.remat_policy = remat_policy
     self.rngs = rngs
 
-    self.layers = nnx_wrappers.ToNNX(layers, rngs=rngs)
-    self.layers_initialized = False 
+    self.layers = layers
+    
+    # Flag to track if we have vectorized the state for stages/repeats
+    self.layers_vectorized = False 
 
     self.num_stages = self.config.ici_pipeline_parallelism * self.config.dcn_pipeline_parallelism
     self.forwarding_delay = 2 if self.config.pipeline_delay_activation_forwarding else 1
@@ -252,10 +237,8 @@ class Pipeline(nnx.Module):
     # Debug logging
     try:
         x_shape = weights.shape
-        x_ndim = weights.ndim
     except AttributeError:
         x_shape = "unknown"
-        x_ndim = "unknown"
     print(f"DEBUG_PIPELINE: vmap_parallel_gather calling shard_dim_by_stages for weights. shape={x_shape}")
 
     repeat_ids = self.shard_dim_by_stages(repeat_ids, 0, physical_partition_spec=None)
@@ -421,7 +404,6 @@ class Pipeline(nnx.Module):
         func_to_vmap,
         in_axes=(None, 0, 0, 0, 0, None, None), 
         axis_name=self.spmd_axis_name,
-        # transform_metadata={nnx.PARTITION_NAME:"layers"}
     )
     return vmap_func
 
@@ -495,7 +477,6 @@ class Pipeline(nnx.Module):
       return jax.sharding.PartitionSpec(*[dim for dim in spec if dim != "circular_repeats"])
     return jax.tree.map(_remove_from_spec, full_logical)
 
-
   @staticmethod
   def _remove_fsdp_from_physical_partition_spec(pps):
     if isinstance(pps, P):
@@ -534,11 +515,7 @@ class Pipeline(nnx.Module):
       model_mode=MODEL_MODE_TRAIN,
       logical_partition_spec=None,
   ) -> jnp.ndarray:
-    """The main method that maps the series of decoder layer inputs to final layer outputs.
-    Has the same signature of a single decoder layer, and expects the same shapes, e.g. the inputs should have shape
-    [global_batch], and internally this will be reshapped into microbatches.
-    """
-    # Reshape inputs of [global_batch, ...] to [microbatches, pipeline_microbatch_sizes, ...]
+    
     inputs = inputs.reshape(
         (
             self.config.num_pipeline_microbatches,
@@ -548,7 +525,6 @@ class Pipeline(nnx.Module):
         ),
         out_sharding=self.input_sharding,
     )
-
     ag_sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(None, None))
     if positions is not None:
       positions = self._maybe_shard_with_name(positions, ag_sharding)
@@ -561,60 +537,28 @@ class Pipeline(nnx.Module):
           (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
       )
 
-    if not self.layers_initialized:
-       dummy_input = inputs[0, 0:1] 
+    if not self.layers_vectorized:
+       # Extract state of the ALREADY INITIALIZED module
+       initial_state = nnx.state(self.layers)
        
-       from MaxText.layers.nnx_wrappers import _set_initializing
-       
-       graph, initial_state = nnx.split(self.layers)
-       
-       def init_pure(graph, state, rng_key, inputs, segment_ids, positions, deterministic, model_mode):
-           m = nnx.merge(graph, state)
-           _set_initializing(m, True)
-           split_rngs = nnx.Rngs(params=rng_key, dropout=rng_key)
-           m(inputs, segment_ids, positions, deterministic, model_mode, rngs=split_rngs)
-           return nnx.state(m)
-
-       if hasattr(self.rngs, 'params'):
-           root_key = self.rngs.params()
-       elif hasattr(self.rngs, 'default'):
-           root_key = self.rngs.default()
-       else:
-           avail_keys = list(self.rngs.keys())
-           if not avail_keys:
-               raise ValueError("Pipeline initialization requires at least one RNG stream.")
-           root_key = getattr(self.rngs, avail_keys[0])()
-
+       # Broadcast state to create vectorized weights: [repeats, stages, ...]
+       # Note: This creates TIED weights across stages (copies).
+       # If distinct initialization is required, the input module must be provided as a factory or re-seeded list.
        num_repeats = self.config.num_pipeline_repeats if self.config.num_pipeline_repeats > 1 else 1
-       total_slices = self.num_stages * num_repeats
-       keys = jax.random.split(root_key, total_slices)
        
-       states = []
-       for i in range(total_slices):
-           s = init_pure(
-               graph, 
-               initial_state, 
-               keys[i], 
-               dummy_input, 
-               None, 
-               None, 
-               deterministic, 
-               model_mode
-           )
-           states.append(s)
-           
-       vectorized_state = jax.tree.map(lambda *xs: jnp.stack(xs), *states)
-       
+       broadcast_shape = []
        if num_repeats > 1:
-           vectorized_state = jax.tree.map(
-               lambda x: x.reshape((num_repeats, self.num_stages) + x.shape[1:]), 
-               vectorized_state
-           )
+           broadcast_shape.append(num_repeats)
+       broadcast_shape.append(self.num_stages)
        
-       # Update self.layers with the fully initialized, vectorized state
+       vectorized_state = jax.tree.map(
+           lambda x: jax.lax.broadcast(x, broadcast_shape), 
+           initial_state
+       )
+       
+       # Update self.layers with the vectorized state so it holds the full pipeline stack
        nnx.update(self.layers, vectorized_state)
-
-       self.layers_initialized = True
+       self.layers_vectorized = True
 
     loop_state = self.init_states(inputs)
     bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
