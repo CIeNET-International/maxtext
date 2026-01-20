@@ -9,6 +9,8 @@ from absl import app
 from absl import flags
 import collections
 
+jax.config.update("jax_platform_name", "cpu")
+
 # Define command-line flags for the checkpoint paths
 _LINEN_CKPT_PATH = flags.DEFINE_string(
     'linen_ckpt_path', None, 'Path to the Linen model checkpoint items directory.', required=True)
