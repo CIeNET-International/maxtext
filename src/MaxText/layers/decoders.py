@@ -389,7 +389,6 @@ class Decoder(nnx.Module):
       nnx.update(layers, scanned_state)
 
       return final_carry, None
-  
 
     def get_decoder_layers(self):
       """Retrieves decoder layer classes based on config using a dictionary lookup."""
@@ -433,6 +432,22 @@ class Decoder(nnx.Module):
       
       return layer_map[cfg.decoder_block]
     
+    def minimal_policy(self, with_context=False):
+      """Helper for creating minimal checkpoint policies."""
+      names = [
+          "query_proj",
+          "value_proj",
+          "key_proj",
+          "qkv_proj",
+          "out_proj",
+          "mlpwi_0",
+          "mlpwi_1",
+          "mlpwi",
+          "mlpwo",
+      ]
+      if with_context:
+        names.append("context")
+      return jax.checkpoint_policies.save_only_these_names(*names)
 
     def get_remat_policy(self):
       """Get remat policy for jax.checkpoint."""
