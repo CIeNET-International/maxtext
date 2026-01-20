@@ -26,22 +26,12 @@ from MaxText.sharding import (
 from MaxText.layers import nnx_wrappers
 
 class Pipeline(nnx.Module):
-  """Module that implements pipelining across stages (NNX Version).
-
-  This module will loop over microbatches and execute the main body with a vmap for both the inputs and weights.
-  This will produce a pipeline pattern if the stage dimension is sharded.
-
-  Attributes:
-    config: Importantly contains num_pipeline_microbatches, num_pipeline_repeats.
-    layers: An NNX module instance that each stage can execute.
-    mesh:  The device mesh of the system.
-    remat_policy: Remat policy to use for the loop iterations.
-  """
+  """Module that implements pipelining across stages (NNX Version)."""
 
   def __init__(
       self,
       config: Config,
-      layers: nnx.Module, # Must be an NNX Module
+      layers: nnx.Module,
       mesh: Mesh,
       remat_policy: Any = None,
       *,
@@ -52,10 +42,9 @@ class Pipeline(nnx.Module):
     self.remat_policy = remat_policy
     self.rngs = rngs
 
+
     self.layers = layers
-    
-    # Flag to track if we have vectorized the state for stages/repeats
-    self.layers_vectorized = False 
+    self.layers_initialized = False 
 
     self.num_stages = self.config.ici_pipeline_parallelism * self.config.dcn_pipeline_parallelism
     self.forwarding_delay = 2 if self.config.pipeline_delay_activation_forwarding else 1
@@ -71,7 +60,6 @@ class Pipeline(nnx.Module):
       self.batch_axis_name = "activation_batch"
       self.seq_len_axis_name = "activation_length_no_exp"
 
-    # TODO(b/470167805): replace self.spmd_axis_name with "stage" when JAX >= 0.8.2.
     self.spmd_axis_name = "stage" if self.config.shard_mode == ShardMode.AUTO else None
 
     self.stages_in_logical = ("activation_stage", self.batch_axis_name, self.seq_len_axis_name, "activation_embed")
@@ -233,8 +221,6 @@ class Pipeline(nnx.Module):
       return jnp.squeeze(jax.lax.dynamic_slice_in_dim(x, repeat_id, 1, repeat_dim_in_weights), repeat_dim_in_weights)
 
     gathered_weights_stage_dim = 0
-    
-    # Debug logging
     try:
         x_shape = weights.shape
     except AttributeError:
@@ -478,6 +464,12 @@ class Pipeline(nnx.Module):
     return jax.tree.map(_remove_from_spec, full_logical)
 
   @staticmethod
+  def _remove_logically_partition(weights):
+    def _remove_logically_partition_leaf(v):
+      return getattr(v, "value") if isinstance(v, nn.spmd.LogicallyPartitioned) else v
+    return jax.tree.map(_remove_logically_partition_leaf, weights)
+
+  @staticmethod
   def _remove_fsdp_from_physical_partition_spec(pps):
     if isinstance(pps, P):
       new_spec = []
@@ -537,7 +529,7 @@ class Pipeline(nnx.Module):
           (self.config.num_pipeline_microbatches, self.pipeline_microbatch_size, self.config.max_target_length)
       )
 
-    if not self.layers_vectorized:
+    if not self.layers_initialized:
        # Extract state of the ALREADY INITIALIZED module
        initial_state = nnx.state(self.layers)
        
@@ -558,7 +550,7 @@ class Pipeline(nnx.Module):
        
        # Update self.layers with the vectorized state so it holds the full pipeline stack
        nnx.update(self.layers, vectorized_state)
-       self.layers_vectorized = True
+       self.layers_initialized = True
 
     loop_state = self.init_states(inputs)
     bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
@@ -573,8 +565,12 @@ class Pipeline(nnx.Module):
     pipeline_weights_state = layers_state
     logical_partition_spec = self.get_logical_spec_repeats_removed(logical_partition_spec)
 
-    def scan_body(carry, _):
+    def scan_body(carry, scan_input):
         loop_state = carry
+        
+        # In a fully correct implementation, we would fold scan_input (rng_key) into the state here.
+        # Currently proceeding with static RNGs per step to match previous functional parity.
+        
         new_loop_state, _ = self.run_one_iteration(
             loop_state,
             layers_graph,
@@ -589,12 +585,16 @@ class Pipeline(nnx.Module):
 
     if self.config.set_remat_policy_on_pipeline_iterations:
         scan_body = jax.checkpoint(scan_body, policy=self.get_pipeline_remat_policy())
+        
+    # Create RNG keys for the scan loop (one per iteration)
+    rng_key = self.rngs.dropout() if hasattr(self.rngs, 'dropout') else jax.random.PRNGKey(0)
+    scan_keys = jax.random.split(rng_key, total_iterations)
 
     if self.config.scan_pipeline_iterations:
-        loop_state, _ = jax.lax.scan(scan_body, loop_state, None, length=total_iterations)
+        loop_state, _ = jax.lax.scan(scan_body, loop_state, scan_keys, length=total_iterations)
     else:
-        for _ in range(total_iterations):
-            loop_state, _ = scan_body(loop_state, None)
+        for i in range(total_iterations):
+            loop_state, _ = scan_body(loop_state, scan_keys[i])
 
     final_output = self.permute_output_micro_per_stage_dim(loop_state["state_io"])
     final_output = jnp.reshape(

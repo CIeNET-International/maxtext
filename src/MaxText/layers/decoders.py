@@ -2,7 +2,7 @@
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Optional
 import functools
 import inspect
 
@@ -62,6 +62,7 @@ class DecoderLayer(nnx.Module):
         rngs: nnx.Rngs,
         quant: None | Quant = None,
         name: str = "decoder_layer",
+        **kwargs
     ):
         self.config = config
         self.mesh = mesh
@@ -78,6 +79,13 @@ class DecoderLayer(nnx.Module):
             kernel_axes=("norm",),
             rngs=rngs
         )
+
+        # Handle specific layer arguments (Llama4, Qwen3, etc.) passed via kwargs
+        attn_kwargs = {}
+        if "is_nope_layer" in kwargs:
+             attn_kwargs["is_nope_layer"] = kwargs["is_nope_layer"]
+        if "layer_idx" in kwargs: 
+             pass 
 
         self.self_attention = Attention(
             config=self.config,
@@ -103,7 +111,12 @@ class DecoderLayer(nnx.Module):
             reshape_q=cfg.reshape_q,
             model_mode=model_mode,
             rngs=rngs,
+            **attn_kwargs
         )
+
+        mlp_kwargs = {}
+        if "is_moe_layer" in kwargs:
+             mlp_kwargs["is_moe_layer"] = kwargs["is_moe_layer"]
 
         self.mlp = linears.MlpBlock(
             in_features=cfg.emb_dim,
@@ -116,7 +129,8 @@ class DecoderLayer(nnx.Module):
             config=cfg,
             quant=self.quant,
             mesh=self.mesh,
-            rngs=rngs
+            rngs=rngs,
+            **mlp_kwargs
         )
         
         self.dropout = linears.Dropout(rate=cfg.dropout_rate, rngs=rngs, broadcast_dims=(-2,))
@@ -133,6 +147,7 @@ class DecoderLayer(nnx.Module):
         page_state: None | page_manager.PageState = None,
         kv_cache: jax.Array | None = None,
         attention_metadata: dict[str, Any] | None = None,
+        **kwargs
     ):
         cfg = self.config
         mesh = self.mesh
@@ -156,6 +171,10 @@ class DecoderLayer(nnx.Module):
         lnx = self.pre_self_attention_norm(inputs)
         lnx = _maybe_shard_with_logical(lnx, logical_axis_names)
 
+        attn_call_kwargs = {}
+        if "bidirectional_mask" in kwargs:
+             attn_call_kwargs["bidirectional_mask"] = kwargs["bidirectional_mask"]
+
         attention_lnx, kv_cache = self.self_attention(
             lnx,
             lnx,
@@ -165,6 +184,7 @@ class DecoderLayer(nnx.Module):
             model_mode=model_mode,
             kv_cache=kv_cache,
             attention_metadata=attention_metadata,
+            **attn_call_kwargs
         )
         attention_lnx = _maybe_shard_with_logical(attention_lnx, logical_axis_names)
 
@@ -197,7 +217,6 @@ class DecoderLayer(nnx.Module):
 class SequentialDecoderLayers(nnx.Module):
     """Sequential unscanned series of decoder layers (NNX)."""
     def __init__(self, layer_class, num_layers, config, mesh, model_mode, rngs, **kwargs):
-        # Use nnx.List to register the list of submodules correctly in the Pytree
         layers_list = []
         for i in range(num_layers):
             layers_list.append(
@@ -268,7 +287,6 @@ class Decoder(nnx.Module):
         self.model_mode = model_mode
         self.rngs = rngs
         
-        # -- Shared Components --
         self.decoder_norm = self.get_norm_layer(num_features=config.emb_dim, rngs=rngs)(
             dtype=config.dtype,
             weight_dtype=config.weight_dtype,
@@ -311,7 +329,6 @@ class Decoder(nnx.Module):
         self.is_deepseek = (self.config.decoder_block == DecoderBlockType.DEEPSEEK)
         self.decoder_block_classes = self.get_decoder_layers()
 
-        # --- Layer Construction ---
         if self.config.using_pipeline_parallelism:
             self.pipeline_module = self.get_pipeline_stage_module(self.decoder_block_classes)
             
@@ -342,10 +359,7 @@ class Decoder(nnx.Module):
             else:
                 layer_cls = self.decoder_block_classes[0]
                 for i in range(config.num_decoder_layers):
-                    # Handle per-layer arguments for heterogeneous models
                     kwargs = {}
-                    if self.config.decoder_block == DecoderBlockType.GEMMA3:
-                        kwargs = {"attention_type": gemma3.get_attention_type(layer_id=i)}
                     if self.config.decoder_block == DecoderBlockType.LLAMA4:
                         kwargs = {
                             "is_nope_layer": llama4.determine_is_nope_layer(i, self.config.nope_layer_interval),
@@ -358,7 +372,6 @@ class Decoder(nnx.Module):
 
                     layers_list.append(self._create_single_layer(layer_cls, rngs, name=f"layers_{i}", **kwargs))
             
-            # Use nnx.List to register the list of modules
             self.layers = nnx.List(layers_list)
 
     def get_pipeline_stage_module(self, decoder_blocks):
@@ -373,8 +386,11 @@ class Decoder(nnx.Module):
 
         base_stage_cls = get_layer_to_pipeline(decoder_blocks, cfg)
         
+        # FIX: Fork RNGs before passing to stage module to avoid sharing with Pipeline
+        stage_rngs = self.rngs.fork() if hasattr(self.rngs, 'fork') else nnx.Rngs(params=self.rngs.params())
+
         if cfg.num_layers_per_pipeline_stage == 1:
-            stage_module = self._create_single_layer(base_stage_cls, self.rngs)
+            stage_module = self._create_single_layer(base_stage_cls, stage_rngs)
         elif cfg.scan_layers_per_stage:
             stage_module = ScannedDecoderLayers(
                 base_stage_cls, 
@@ -382,7 +398,7 @@ class Decoder(nnx.Module):
                 config=cfg,
                 mesh=self.mesh,
                 model_mode=self.model_mode,
-                rngs=self.rngs
+                rngs=stage_rngs
             )
         else:
             stage_module = SequentialDecoderLayers(
@@ -391,7 +407,7 @@ class Decoder(nnx.Module):
                 config=cfg,
                 mesh=self.mesh,
                 model_mode=self.model_mode,
-                rngs=self.rngs
+                rngs=stage_rngs
             )
         
         return pipeline.Pipeline(
@@ -399,7 +415,7 @@ class Decoder(nnx.Module):
             layers=stage_module,
             mesh=self.mesh,
             remat_policy=self.get_remat_policy(),
-            rngs=self.rngs
+            rngs=self.rngs # Pipeline keeps original RNGs
         )
 
     def _create_single_layer(self, decoder_layer_class, rngs, **kwargs):
@@ -409,7 +425,6 @@ class Decoder(nnx.Module):
                 config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=rngs, **kwargs
             )
         else:
-            # Wrap legacy Linen layers
             layer_linen = decoder_layer_class(
                 config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, **kwargs
             )
@@ -445,8 +460,7 @@ class Decoder(nnx.Module):
           layer = nnx.merge(graphdef, layer_state_slice)
           
           if self.config.parameter_memory_host_offload:
-              # Host offload placeholder
-              pass 
+              pass
 
           out = layer(carry, *args, **kwargs)
           if isinstance(out, tuple):
@@ -470,20 +484,16 @@ class Decoder(nnx.Module):
       layer_map = {
           DecoderBlockType.DEFAULT: [DecoderLayer],
           DecoderBlockType.GPT3: [gpt3.Gpt3DecoderLayer], 
-          # Add others...
       }
       if cfg.decoder_block not in layer_map:
            return [DecoderLayer]
       return layer_map[cfg.decoder_block]
 
     def get_remat_policy(self):
-      """Get remat policy"""
-      # (Port logic from original decoders.py)
       policy = None
       cfg = self.config
       if cfg.remat_policy == "minimal":
           return jax.checkpoint_policies.save_only_these_names("query_proj", "value_proj", "key_proj", "qkv_proj", "out_proj")
-      # ... other policies ...
       return policy 
     
     def get_norm_layer(self, num_features: int, rngs: nnx.Rngs):
