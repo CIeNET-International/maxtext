@@ -115,6 +115,7 @@ class MultiTokenPredictionLayer(nnx.Module):
         mesh=mesh,
         model_mode=MODEL_MODE_TRAIN,
         name=f"mtp_{k}_transformer_layer",
+        rngs=rngs,
     )
     self.transformer_layer = nnx_wrappers.ToNNX(mtp_transformer_layer, rngs=rngs)
 

@@ -261,7 +261,6 @@ def transformer_as_linen(
         name=name,
     )
   else:
-    breakpoint()
     return TransformerLinenPure(config, mesh, quant, model_mode=model_mode, name=name)
 
 
