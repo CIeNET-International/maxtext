@@ -94,6 +94,7 @@ class DecoderLayer(nnx.Module):
             weight_dtype=cfg.weight_dtype,
             epsilon=cfg.normalization_layer_epsilon,
             kernel_axes=("norm",),
+            rngs=rngs
         )
 
         self.self_attention = Attention(
