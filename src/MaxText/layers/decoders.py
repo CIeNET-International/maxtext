@@ -76,9 +76,10 @@ class DecoderLayer(nnx.Module):
         config: Config,
         mesh: Mesh,
         model_mode: str,
-        rngs: nnx.Rngs,
         quant: None | Quant = None,
         name: str = "decoder_layer",
+        *,
+        rngs: nnx.Rngs,
     ):
         self.config = config
         self.mesh = mesh
@@ -216,9 +217,10 @@ class Decoder(nnx.Module):
         self,
         config: Config,
         mesh: Mesh,
-        rngs: nnx.Rngs,
         quant: None | Quant = None,
         model_mode: str = MODEL_MODE_TRAIN,
+        *,
+        rngs: nnx.Rngs,
     ):
         self.config = config
         self.mesh = mesh
