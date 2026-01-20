@@ -63,5 +63,4 @@ posttraining/rl_on_multi_host.md
 posttraining/knowledge_distillation.md
 posttraining/multimodal.md
 posttraining/full_finetuning.md
-posttraining/convert_hf_checkpoint.md
 ```

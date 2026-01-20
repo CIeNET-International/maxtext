@@ -75,8 +75,11 @@ export PRE_TRAINED_MODEL_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs:
 
 ### Option 2: Converting a Hugging Face checkpoint
 
-Refer the steps in [Convert from a Hugging Face checkpoint to MaxText for post training](./convert_hf_checkpoint.md)
-Make sure you have correct checkpoint files saved in `MAXTEXT_CKPT_PATH`.
+Refer the steps in [Hugging Face to MaxText](../../guides/checkpointing_solutions/convert_checkpoint.md#hugging-face-to-maxtext) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Similar as Option 1, you can set the following environment and move on.
+
+```sh
+export PRE_TRAINED_MODEL_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-bucket/my-model-checkpoint/0/items
+```
 
 ## Run SFT on Hugging Face Dataset
 Now you are ready to run SFT using the following command:
@@ -86,7 +89,7 @@ python3 -m MaxText.sft.sft_trainer src/MaxText/configs/sft.yml \
     run_name=${RUN_NAME} \
     base_output_directory=${BASE_OUTPUT_DIRECTORY} \
     model_name=${PRE_TRAINED_MODEL} \
-    load_parameters_path=${MAXTEXT_CKPT_PATH} \
+    load_parameters_path=${PRE_TRAINED_MODEL_CKPT_PATH} \
     hf_access_token=${HF_TOKEN} \
     tokenizer_path=${PRE_TRAINED_MODEL_TOKENIZER} \
     per_device_batch_size=${PER_DEVICE_BATCH_SIZE} \

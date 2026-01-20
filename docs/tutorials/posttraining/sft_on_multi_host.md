@@ -105,12 +105,10 @@ export MODEL_CHECKPOINT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-b
 
 ### Option 2: Converting a Hugging Face checkpoint
 
-Refer the steps in [Convert from a Hugging Face checkpoint to MaxText for post training](./convert_hf_checkpoint.md)
-Make sure you have correct checkpoint converted from above document saved in `MAXTEXT_CKPT_PATH`. 
-Then set the `MODEL_CHECKPOINT_PATH` to `$MAXTEXT_CKPT_PATH`
+Refer the steps in [Hugging Face to MaxText](../../guides/checkpointing_solutions/convert_checkpoint.md#hugging-face-to-maxtext) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Similar as Option 1, you can set the following environment and move on.
 
 ```bash
-export MODEL_CHECKPOINT_PATH=$MAXTEXT_CKPT_PATH
+export MODEL_CHECKPOINT_PATH=<gcs path for MaxText checkpoint> # gs://my-bucket/my-checkpoint-directory/0/items
 ```
 
 ## 6. Submit workload on GKE cluster

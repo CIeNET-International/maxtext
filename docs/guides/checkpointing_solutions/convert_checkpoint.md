@@ -31,15 +31,49 @@ Use the `to_maxtext.py` script to convert a Hugging Face model into a MaxText ch
 
 ### Usage
 
-The following command demonstrates how to run the conversion. You must provide your Hugging Face token in the `src/MaxText/configs/base.yml` file (hf_access_token).
+First, make sure python3 virtual environment for MaxText is set up and enabled.
+```bash
+export VENV_NAME=<your virtual env name> # e.g., maxtext_venv
+pip install uv
+uv venv --python 3.12 --seed $VENV_NAME
+source $VENV_NAME/bin/activate
+```
+
+Second, ensure you have the necessary dependencies installed (PyTorch for the conversion script).
 
 ```bash
-python3 -m MaxText.utils.ckpt_conversion.to_maxtext src/MaxText/configs/base.yml \
-    model_name=<model-name> \
-    base_output_directory=<gcs-path-to-save-checkpoint> \
-    hf_access_token=<your-hf-token> \
+python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+Third, setup following environment variables for conversion script
+
+```bash
+# -- Model configuration --
+export HF_MODEL=<Hugging Face Model to be converted to MaxText> # e.g. 'llama3.1-8b-Instruct'
+export HF_TOKEN=<Hugging Face access token> # your token to access gated HF repos
+
+# -- MaxText configuration --
+export MODEL_CHECKPOINT_DIRECTORY=<output directory to store output of checking point> # e.g., gs://my-bucket/my-checkpoint-directory
+
+# -- storage and format options
+USE_ZARR3=<Flag to use zarr3> # True to run SFT with McJAX, False to run SFT with Pathways
+USE_OCDBT=<Flag to use ocdbt> # True to run SFT with McJAX, False to run SFT with Pathways
+```
+
+Finally, run below command to complete the conversion
+
+```bash
+python3 -m MaxText.utils.ckpt_conversion.to_maxtext MaxText/configs/base.yml \
+    model_name=${HF_MODEL} \
+    hf_access_token=${HF_TOKEN} \
+    base_output_directory=${MODEL_CHECKPOINT_DIRECTORY} \
+    scan_layers=True \
     use_multimodal=false \
-    scan_layers=false
+    hardware=cpu \
+    skip_jax_distributed_system=true \
+    checkpoint_storage_use_zarr3=${USE_ZARR3} \
+    checkpoint_storage_use_ocdbt=${USE_OCDBT} \
+    --lazy_load_tensors=true
 ```
 
 **Key arguments:**
@@ -49,9 +83,13 @@ python3 -m MaxText.utils.ckpt_conversion.to_maxtext src/MaxText/configs/base.yml
   * `use_multimodal`: Indicates if multimodality is used, important for Gemma3.
   * `hf_access_token`: Your Hugging Face token.
   * `base_output_directory`: The path where the converted Orbax checkpoint will be stored; it can be Googld Cloud Storage (GCS) or local. If not set, the default output directory is `Maxtext/tmp`.
-  * `--lazy_load_tensors` (optional): If `true`, loads Hugging Face weights on-demand to minimize RAM usage.
+  * `hardware=cpu`: run the conversion script on a CPU machine.
+  * `checkpoint_storage_use_zarr3`: storage and format option, True to run SFT with McJAX, False to run SFT with Pathways
+  * `checkpoint_storage_use_ocdbt`: storage and format option, True to run SFT with McJAX, False to run SFT with Pathways
+  * `--lazy_load_tensors` (optional): If `true`, loads Hugging Face weights on-demand to minimize RAM usage. For large models, it is recommended to use the `--lazy_load_tensors=true` flag to reduce memory usage during conversion. For example, converting a Llama3.1-70B model with `--lazy_load_tensors=true` uses around 200GB of RAM and completes in ~10 minutes.
   * `--hf_model_path` (optional): Specifies a local directory containing the model weights. If unspecified, we use the [default Hugging Face repository ID](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/utils/ckpt_conversion/utils/utils.py#L58-L85) (e.g., openai/gpt-oss-20b). This is necessary for locally dequantized models like GPT-OSS or DeepSeek. 
 
+Above command will download the Hugging Face model to local machine, convert it to the MaxText format and save it to `${MODEL_CHECKPOINT_DIRECTORY}/0/items`.
 
 ## MaxText to Hugging Face
 
