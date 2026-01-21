@@ -786,13 +786,23 @@ class Decoder(nnx.Module):
 
   def apply_output_head(self, shared_embedding: nnx.Module, y, deterministic, model_mode):
     cfg = self.config
-    y = self.norm_layer(y)
+    if cfg.shard_mode == ShardMode.EXPLICIT:
+      norm_out_sharding = create_sharding(self.mesh, ("activation_batch", "activation_length_no_exp", "activation_embed"))
+    else:
+      norm_out_sharding = None
+    y = self.norm_layer(y,out_sharding=norm_out_sharding)
     y = self.dropout(y, deterministic=deterministic)
 
+    if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
+      out_sharding = create_sharding(self.mesh, (None, None, "activation_vocab"))
+    else:
+      out_sharding = create_sharding(
+          self.mesh, ("activation_embed_and_logits_batch", "activation_length_no_exp", "activation_vocab")
+      )
     if cfg.logits_via_embedding:
       embedding_table = shared_embedding.embedding.value
       attend_dtype = jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype
-      logits = attend_on_embedding(y, embedding_table, attend_dtype, self.config, None)
+      logits = attend_on_embedding(y, embedding_table, attend_dtype, self.config, out_sharding)
 
       if self.config.normalize_embedding_logits:
         logits = logits / jnp.sqrt(y.shape[-1])
@@ -800,7 +810,7 @@ class Decoder(nnx.Module):
         logits = logits / cfg.final_logits_soft_cap
         logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
     else:
-      logits = self.logits_dense(y)
+      logits = self.logits_dense(y,out_sharding=out_sharding)
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
     return logits
