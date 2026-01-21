@@ -312,6 +312,20 @@ class Decoder(nnx.Module):
     self.dropout = linears.Dropout(rate=config.dropout_rate, rngs=rngs, broadcast_dims=(-2,))
     self.positional_embedding = PositionalEmbedding(embedding_dims=config.base_emb_dim)
 
+
+    if not self.config.logits_via_embedding:
+      self.logits_dense = linears.DenseGeneral(
+        in_features_shape=config.emb_dim,
+        out_features_shape=config.vocab_size,
+        weight_dtype=config.weight_dtype,
+        dtype=jnp.float32 if config.logits_dot_in_fp32 else config.dtype,
+        kernel_axes=("embed", "vocab"),
+        shard_mode=config.shard_mode,
+        matmul_precision=self.config.matmul_precision,
+        parameter_memory_host_offload=config.parameter_memory_host_offload,
+        rngs=rngs
+      )
+
     # 2. Strategy Flags
     self.using_pipeline = config.using_pipeline_parallelism
     self.is_gemma3 = (config.decoder_block == DecoderBlockType.GEMMA3)
@@ -793,8 +807,7 @@ class Decoder(nnx.Module):
             logits = logits / cfg.final_logits_soft_cap
             logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
     else:
-        raise NotImplementedError("Separate logits dense layer requires init in NNX")
-
+        logits = self.logits_dense(y)
     if self.config.cast_logits_to_fp32:
         logits = logits.astype(jnp.float32)
     return logits
