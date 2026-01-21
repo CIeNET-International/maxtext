@@ -49,6 +49,8 @@ from MaxText.layers.normalizations import RMSNorm
 from MaxText.layers.embeddings import Embed, attend_on_embedding, embed_as_linen, positional_embedding_as_linen
 from MaxText.layers.quantizations import AqtQuantization as Quant
 
+from MaxText.layers.attentions import Attention 
+
 # Import specific layer definitions (assuming these files exist)
 from MaxText.layers import (
     deepseek,
@@ -98,7 +100,7 @@ class DecoderLayer(nnx.Module):
         )
 
         self.self_attention = Attention(
-            config=self.config,
+            config=cfg,
             num_query_heads=cfg.num_query_heads,
             num_kv_heads=cfg.num_kv_heads,
             head_dim=cfg.head_dim,
@@ -122,7 +124,7 @@ class DecoderLayer(nnx.Module):
             model_mode=model_mode,
         )
 
-        self.mlp = linears.MLPBlock(
+        self.mlp = linears.MlpBlock(
             in_features=cfg.emb_dim,
             intermediate_dim=cfg.mlp_dim,
             activations=cfg.mlp_activations,
@@ -197,10 +199,10 @@ class DecoderLayer(nnx.Module):
         layer_output = _maybe_shard_with_logical(layer_output, logical_axis_names)
 
         if cfg.record_internal_nn_metrics:
-           self.sow("intermediates", "activation_mean", jnp.mean(layer_output))
-           self.sow("intermediates", "activation_stdev", jnp.std(layer_output))
+           self.sow(nnx.Intermediate, "activation_mean", jnp.mean(layer_output))
+           self.sow(nnx.Intermediate, "activation_stdev", jnp.std(layer_output))
            self.sow(
-               "intermediates",
+               nnx.Intermediate,
                "activation_fraction_zero",
                jnp.sum(layer_output == 0) / jnp.size(layer_output),
            ) 
@@ -210,6 +212,90 @@ class DecoderLayer(nnx.Module):
         else:
             return layer_output, kv_cache
 
+
+class ScannedDecoderLayers(nnx.Module):
+    """Scanned series of decoder layers (NNX)."""
+    def __init__(self, layer_class, num_layers, config, mesh, model_mode, rngs, **kwargs):
+        self.config = config
+        
+        if hasattr(rngs, 'params'):
+            nnx.split_rngs(rngs, splits=num_layers)
+        
+        def create_layer(rng):
+            return layer_class(config=config, mesh=mesh, model_mode=model_mode, rngs=rng, **kwargs)
+        
+        self.layers_stack = nnx.vmap(
+            create_layer, in_axes=0, out_axes=0, axis_name="layers"
+        )(rngs)
+
+    def __call__(self, inputs, *args, **kwargs):
+        graphdef, state = nnx.split(self.layers_stack)
+        
+        def scan_fn(carry, layer_state):
+            layer = nnx.merge(graphdef, layer_state)
+            out = layer(carry, *args, **kwargs)
+            if isinstance(out, tuple):
+                new_carry, _ = out
+            else:
+                new_carry = out
+            return new_carry, nnx.state(layer)
+
+        final_carry, new_stack_state = jax.lax.scan(
+            scan_fn, inputs, state, length=len(state.params['pre_self_attention_norm']['scale'])
+        )
+        
+        nnx.update(self.layers_stack, new_stack_state)
+        return final_carry, None
+
+class SequentialBlockDecoderLayers(nn.Module):
+  """Sequential unscanned series of decoder layers."""
+
+  decoder_layer: Any
+  num_decoder_layers: int
+  config: Config
+  mesh: Mesh
+  quant: Quant
+  model_mode: str
+
+  def __init__(self, decoder_layer: Any, num_decoder_layers:int, config: Config, mesh: Mesh, quant: Quant, model_mode: str):
+    self.num_decoder_layers = num_decoder_layers
+    self.config = config
+    self.mesh = mesh
+    self.quant = quant
+    self.model_mode = model_mode
+      
+    for i in range(self.num_decoder_layers):
+        setattr(self,f"layers_{i}",nnx.clone(decoder_layer(config=self.config, mesh=self.mesh, name=f"layers_{i}", quant=self.quant, model_mode=model_mode)))
+
+     
+  def __call__(
+      self,
+      inputs: jnp.ndarray,
+      decoder_segment_ids,
+      decoder_positions,
+      deterministic: bool,
+      model_mode,
+      slot: None | int = None,
+      page_state: None | page_manager.PageState = None,
+  ) -> jnp.ndarray | tuple:
+    for lyr in range(self.num_decoder_layers):
+      layer = getattr(self,f"layers_{lyr}")
+      if layer is None:
+        raise AttributeError(f"Missing required attribute 'layers_{lyr}'")
+      inputs = layer(
+          inputs,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+          slot=slot,
+          page_state=page_state,
+      )
+      if self.config.scan_layers:
+        inputs = inputs[0]  #  When scan_layers is True the decoder layers return (outputs, None).
+    if self.config.scan_layers:
+      return inputs, None  # pytype: disable=bad-return-type
+    return inputs
 
 class Decoder(nnx.Module):
     """A stack of decoder layers as a part of an encoder-decoder architecture, using NNX."""
@@ -244,7 +330,7 @@ class Decoder(nnx.Module):
               num_embeddings=config.trainable_position_size,
               num_features=config.emb_dim,
               dtype=config.dtype,
-              embedding_init=nn.initializers.normal(stddev=1.0),
+              embedding_init=nnx.initializers.normal(stddev=1.0),
               config=config,
               mesh=self.mesh,
               rngs=rngs,
@@ -292,7 +378,6 @@ class Decoder(nnx.Module):
                 )
         else:
             self.layers = nnx.List([])
-            layer = None
             if self.is_deepseek:
               for i in range(config.first_num_dense_layers):
                   self._create_and_register_layer(dense_cls, rngs, "dense_layer", i)
@@ -343,7 +428,6 @@ class Decoder(nnx.Module):
           axis_name="layers",
           transform_metadata={nnx.PARTITION_NAME: "layers"},
         )(rngs)
-
         return layers_vmapped
     
     def _apply_layers_sequentially(self, layers, x_in, *args, length: int, **kwargs):
@@ -606,7 +690,7 @@ class Decoder(nnx.Module):
         else:
             norm_out_sharding = None
 
-        y = self.decoder_norm(y)
+        y = self.decoder_norm(y, out_sharding=norm_out_sharding)
         y = self.dropout(y, deterministic=deterministic) # NNX call
 
         if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
@@ -634,7 +718,7 @@ class Decoder(nnx.Module):
                 logits = logits / cfg.final_logits_soft_cap
                 logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
         else:
-            logits = self.logits_dense(y)
+            logits = self.logits_dense(y,out_sharding=out_sharding)
         
         if self.config.cast_logits_to_fp32:
             logits = logits.astype(jnp.float32)
@@ -727,9 +811,12 @@ class Decoder(nnx.Module):
 
         assert isinstance(y, jax.Array)
         hidden_state = y
-
-        if cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN:
+        
+        if cfg.attention == "vllm_rpa":
             logits = None
+        elif cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN:
+            logits = None
+            self.sow(nnx.Intermediate,"hidden_states",hidden_state)
         else:
             logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
 
