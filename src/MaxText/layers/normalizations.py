@@ -74,8 +74,12 @@ class RMSNorm(nnx.Module):
     # out_sharding must be None in auto shard mode
     if self.shard_mode != ShardMode.EXPLICIT:
       out_sharding = None
-
-    scale = jnp.asarray(scale, self.dtype)
+    
+    if isinstance(scale, jax.ShapeDtypeStruct):
+      scale = jnp.zeros(scale.shape, dtype=scale.dtype)
+    else:
+      scale = jnp.asarray(scale, self.dtype)
+      
     effective_scale = scale + self.scale_offset  # Apply offset
     return jnp.einsum("i...k,...k->i...k", y, effective_scale, out_sharding=out_sharding)
 

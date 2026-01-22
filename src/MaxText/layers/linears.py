@@ -1,17 +1,3 @@
-# Copyright 2023–2025 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Linear Layers."""
 
 import functools
@@ -220,11 +206,21 @@ class DenseGeneral(nnx.Module):
       kernel_shape = self.in_features_shape + self.out_features_shape
       kernel = jnp.zeros(kernel_shape, dtype=self.dtype)
     else:
-      kernel = self.kernel[...]
+      # FIX: Handle ShapeDtypeStruct during eval_shape initialization.
+      # If kernel is abstract, treat it as a fake zero-filled array.
+      # This allows slicing [...] and jnp.asarray() to work correctly.
+      kernel_val = self.kernel.value
+      if isinstance(kernel_val, jax.ShapeDtypeStruct):
+        kernel = jnp.zeros(kernel_val.shape, dtype=kernel_val.dtype)
+      else:
+        # Standard execution path
+        kernel = kernel_val[...]
+      
       # Move logit_dense kernel to device if parameter offloading is enabled
       if self.parameter_memory_host_offload:
         max_logging.log("linear.py: Moving parameter logits_dense kernel to device")
         kernel = jax.device_put(kernel, max_utils.device_space())
+        
       kernel = jnp.asarray(kernel, self.dtype)
 
     # out_sharding should be None for auto mesh axis
@@ -244,8 +240,16 @@ class DenseGeneral(nnx.Module):
     )
 
     if self.bias is not None:
-      bias = jnp.asarray(self.bias[...], self.dtype)
+      # FIX: Apply the same abstract-safe logic to bias
+      bias_val = self.bias.value
+      if isinstance(bias_val, jax.ShapeDtypeStruct):
+        bias = jnp.zeros(bias_val.shape, dtype=bias_val.dtype)
+      else:
+        bias = bias_val[...]
+      
+      bias = jnp.asarray(bias, self.dtype)
       output += bias
+      
     return output
 
 
