@@ -36,6 +36,7 @@ from pydantic.types import PositiveInt, NonNegativeFloat, NonNegativeInt
 from MaxText import accelerator_to_spec_map, max_utils
 from MaxText.common_types import AttentionType, DecoderBlockType, ShardMode
 from MaxText.globals import MAXTEXT_ASSETS_ROOT
+from MaxText.utils import gcs_utils
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +187,7 @@ class ProfilerType(str, Enum):
 # Pydantic models for configuration
 # ----------------------------------------------------------------------------
 
-type ModelName = Literal[
+ModelName = Literal[
     "default",
     "llama2-7b",
     "llama2-13b",
@@ -1821,6 +1822,29 @@ class MaxTextConfig(
     if self.final_logits_soft_cap == 0.0:
       self.final_logits_soft_cap = None
 
+    # This must be invoked before initializing the backend
+    # pylint: disable=access-member-before-definition
+    def validate_and_set_hlo_dump_defaults():
+      if os.environ.get("XLA_FLAGS") and self.dump_hlo_xla_flags:
+        raise ValueError("You must set either XLA_FLAGS or dump_hlo_xla_flags to dump HLO, but not both.")
+      if not os.environ.get("XLA_FLAGS") and not self.dump_hlo_xla_flags:
+        self.dump_hlo_xla_flags = f"--xla_dump_to={self.dump_hlo_local_dir} --xla_dump_large_constants"
+        if self.dump_hlo_local_module_name:
+          self.dump_hlo_xla_flags = (
+              f"{self.dump_hlo_xla_flags} --xla_dump_hlo_module_re={self.dump_hlo_local_module_name}"
+          )
+      if not self.dump_hlo_gcs_dir:
+        self.dump_hlo_gcs_dir = os.path.join(self.base_output_directory, self.run_name, "xla_dump")
+      else:
+        self.dump_hlo_gcs_dir = gcs_utils.add_trailing_slash(self.dump_hlo_gcs_dir)
+      if not os.environ.get("XLA_FLAGS"):
+        os.environ["XLA_FLAGS"] = self.dump_hlo_xla_flags
+
+    # pylint: enable=access-member-before-definition
+
+    # Validate and initiate hlo dump related configs
+    validate_and_set_hlo_dump_defaults()
+
     # D. CALCULATE MODEL DIMENSIONS from global_parameter_scale
     # This allows scaling the model size up or down easily with a single power-of-two factor.
     emb_scale, num_head_scale, mlp_dim_scale, layer_scale = get_individual_scales(self.global_parameter_scale)
@@ -2254,6 +2278,7 @@ class MaxTextConfig(
           "model": self.ici_tensor_parallelism,
           "expert": self.ici_expert_parallelism,
           "autoregressive": self.ici_autoregressive_parallelism,
+          "attn_dp": 1,  # initialized to 1, vLLM will auto calculate this value based on TP and num_kv_heads
       }
       self.ici_parallelism = [ici_map[axis] for axis in self.mesh_axes]
 
@@ -2271,6 +2296,7 @@ class MaxTextConfig(
           "model": self.dcn_tensor_parallelism,
           "expert": self.dcn_expert_parallelism,
           "autoregressive": self.dcn_autoregressive_parallelism,
+          "attn_dp": 1,  # initialized to 1, vLLM will auto calculate this value based on TP and num_kv_heads
       }
       self.dcn_parallelism = [dcn_map[axis] for axis in self.mesh_axes]
 
