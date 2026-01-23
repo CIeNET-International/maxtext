@@ -14,7 +14,6 @@
  limitations under the License.
  -->
 
-
 # Monitoring and debugging
 
 ::::{grid} 1 2 2 2

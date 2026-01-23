@@ -28,14 +28,14 @@ Based on resources like [Language Modeling from Scratch](https://github.com/stan
 
 Dense models
 
-*   `mlp_dim / emb_dim`: 2.5-4
-*   `head_dim * num_query_heads / emb_dim`: 1-2
-*   `emb_dim / num_decoder_layers`: 100-200
+- `mlp_dim / emb_dim`: 2.5-4
+- `head_dim * num_query_heads / emb_dim`: 1-2
+- `emb_dim / num_decoder_layers`: 100-200
 
 MoE models
 
-*   sparsity (`num_experts / num_experts_per_tok`): 4-32
-*   `moe_mlp_dim / emb_dim`: 0.3-3
+- sparsity (`num_experts / num_experts_per_tok`): 4-32
+- `moe_mlp_dim / emb_dim`: 0.3-3
 
 ## Step 2. Consider TPU best practices
 
@@ -45,8 +45,8 @@ To unlock peak performance on [TPUs](https://cloud.google.com/tpu/docs/system-ar
 
 Therefore, for optimal efficiency:
 
-*   Model and MLP Dimensions: Design your model's emb_dim and mlp_dim to be multiples of 256 (for Trillium and Ironwood) or 128 (for older TPUs).
-*   Self-Attention Head Dimension: Ensure your attention head_dim are also multiples of 256 (for Trillium and Ironwood) or 128 (for older TPUs).
+- Model and MLP Dimensions: Design your model's emb_dim and mlp_dim to be multiples of 256 (for Trillium and Ironwood) or 128 (for older TPUs).
+- Self-Attention Head Dimension: Ensure your attention head_dim are also multiples of 256 (for Trillium and Ironwood) or 128 (for older TPUs).
 
 Generally, larger multiples are more efficient. If achieving these specific multiples isn't possible, prioritize dimensions to a multiple of either 8 or 128 to help the XLA compiler optimize memory and computation.
 
@@ -59,35 +59,37 @@ Ironwood is engineered for cutting-edge, large-scale AI model training and infer
 We have published optimized recipes for models like DeepSeek v3, GPT-OSS, Qwen3, and Llama3 on Ironwood, covering both BF16 and FP8 precision, available in this [guide](https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/training/ironwood).
 
 Key strategies to maximize performance on Ironwood include:
-* Adopt FP8 Precision: Ironwood delivers 2x throughput with FP8 compared to BF16. Design models to use mixed-precision training, employing FP8 for weights and activations where possible to maximize computational speed.
-* Offload to SparseCores: Ironwood's enhanced SparseCores are crucial for efficiency. Offloading collective communication and data management to keep TensorCores focused on compute.
-* Leverage the dual-chiplet architecture: Each Ironwood chip contains two TensorCores with an ultra-fast interconnect (die-to-die, 6x faster than 1D ICI link).
+
+- Adopt FP8 Precision: Ironwood delivers 2x throughput with FP8 compared to BF16. Design models to use mixed-precision training, employing FP8 for weights and activations where possible to maximize computational speed.
+- Offload to SparseCores: Ironwood's enhanced SparseCores are crucial for efficiency. Offloading collective communication and data management to keep TensorCores focused on compute.
+- Leverage the dual-chiplet architecture: Each Ironwood chip contains two TensorCores with an ultra-fast interconnect (die-to-die, 6x faster than 1D ICI link).
 
 Given Ironwood's high compute power, communication bandwidth can easily become the limiting factor. To address this:
-* Enable SparseCore offloading for collectives: By setting the appropriate [XLA flags](https://github.com/AI-Hypercomputer/maxtext/blob/ed517cf80d9aa81f76e236c5516dacebfe39e96d/benchmarks/xla_flags_library.py#L70-L116), you can offload collective operations (like All-Reduce, All-Gather, etc.) to the SparseCores. These operations then run in parallel with the TensorCore computations, effectively hiding communication latency and improving Model Flop Utilization (MFU).
-* Optimize sharding strategies: Align your model distribution with the hardware topology. Choose sharding strategies (e.g., data, tensor, pipeline parallelism) that minimize data transfer over the ICI and maximize the overlap between computation and communication.
+
+- Enable SparseCore offloading for collectives: By setting the appropriate [XLA flags](https://github.com/AI-Hypercomputer/maxtext/blob/ed517cf80d9aa81f76e236c5516dacebfe39e96d/benchmarks/xla_flags_library.py#L70-L116), you can offload collective operations (like All-Reduce, All-Gather, etc.) to the SparseCores. These operations then run in parallel with the TensorCore computations, effectively hiding communication latency and improving Model Flop Utilization (MFU).
+- Optimize sharding strategies: Align your model distribution with the hardware topology. Choose sharding strategies (e.g., data, tensor, pipeline parallelism) that minimize data transfer over the ICI and maximize the overlap between computation and communication.
 
 ### Performance configs
 
 Use these general runtime configurations to improve your model's performance.
 
-* **Multi-Head Attention (MHA)**. If you are using MHA, we recommend to set `fused_qkv=True` to fuse the query, key, and value computations into a single, more efficient operation.
+- **Multi-Head Attention (MHA)**. If you are using MHA, we recommend to set `fused_qkv=True` to fuse the query, key, and value computations into a single, more efficient operation.
 
-* **Flash Attention**. Use the largest possible block size to maximize throughput.
+- **Flash Attention**. Use the largest possible block size to maximize throughput.
 
-* **Memory usage**. To free up memory with large models, use custom remat policy to offload layer activations (including inputs, attention, and MLP blocks) to the host CPU.
+- **Memory usage**. To free up memory with large models, use custom remat policy to offload layer activations (including inputs, attention, and MLP blocks) to the host CPU.
 
-* **Compiler flags**. XLA is the backend compiler for TPUs. Many critical performance settings can be controlled directly through XLA flags. We suggest beginning with the proven flags we have tested and provided [here](https://github.com/AI-Hypercomputer/maxtext/blob/b53bf3bef6b54b1d4939a4b700bc11fe149d1128/benchmarks/xla_flags_library.py).
+- **Compiler flags**. XLA is the backend compiler for TPUs. Many critical performance settings can be controlled directly through XLA flags. We suggest beginning with the proven flags we have tested and provided [here](https://github.com/AI-Hypercomputer/maxtext/blob/b53bf3bef6b54b1d4939a4b700bc11fe149d1128/benchmarks/xla_flags_library.py).
 
-* **Benchmark**. For consistent speed tests, set `reuse_example_batch=1` to repeatedly use the same data batch, isolating computation speed from data loading. Or use on-the-fly generated data by setting `dataset_type=synthetic`.
+- **Benchmark**. For consistent speed tests, set `reuse_example_batch=1` to repeatedly use the same data batch, isolating computation speed from data loading. Or use on-the-fly generated data by setting `dataset_type=synthetic`.
 
 ## Step 3. Choose efficient sharding strategies using Roofline Analysis
 
 To achieve good performance, it's often necessary to co-design the model's dimensions (like the MLP dimension) along with the sharding strategy. We have included examples for [v5p](https://docs.cloud.google.com/tpu/docs/v5p), [Trillium](https://docs.cloud.google.com/tpu/docs/v6e), and [Ironwood](https://docs.cloud.google.com/tpu/docs/tpu7x) that demonstrate which sharding approaches work well for specific models. We recommend reading [](sharding) and Jax’s [scaling book](https://jax-ml.github.io/scaling-book/sharding/).
 
-| TPU Type |  ICI Arithmetic Intensity |
+| TPU Type | ICI Arithmetic Intensity |
 |---|---|
-| v5p | 2550 for 1D-ICI  |
+| v5p | 2550 for 1D-ICI |
 | Trillium | 5100 for 1D-ICI (1D with wrapound or 2D without wraparound) <br> 2550 for 2D-ICI (2D with wraparound on both dimensions), particularly for v6e-256 |
 | Ironwood | 12800 for 1D-ICI|
 
@@ -95,27 +97,30 @@ To achieve good performance, it's often necessary to co-design the model's dimen
 
 #### Pure FSDP
 
-For pure FSDP to be effective, it must have enough memory to hold both a large data batch and a full, single layer of weights at the same time. 
+For pure FSDP to be effective, it must have enough memory to hold both a large data batch and a full, single layer of weights at the same time.
 
 FSPD AI: `global batch / sparsity` (`sparsity = num_experts / num_experts_per_tok`).
 
 **Example with a sparsity of 16**:
-  * `global batch / sparsity > hardware AI`
+
+- `global batch / sparsity > hardware AI`
 
 v5p:
-  * `global batch / 16 > 2550`
-  * `global batch > 40k` (in tokens)
+
+- `global batch / 16 > 2550`
+- `global batch > 40k` (in tokens)
 
 Trillium:
-  * `global batch / 16 > 2550` (16x16 with wraparound)
-  * `global batch > 40k` (in tokens)
+
+- `global batch / 16 > 2550` (16x16 with wraparound)
+- `global batch > 40k` (in tokens)
 
 We also need a single layer of weights to fit into memory which can be an issue for medium/large MoE models, e.g. DeepSeek has roughly 10B params per layer, which corresponds to 40GiB of bf16 weights and gradients, which will not fit into Trillium’s 32GiB of HBM. So the use of pure FSDP on Trillium is feasible for models with layers not exceeding roughly 5B parameters. For these larger models need Expert or Tensor Parallelism.
 
 Ironwood:
-  * `global batch / 16 > 12800`
-  * `global batch > 205k` (in tokens)
 
+- `global batch / 16 > 12800`
+- `global batch > 205k` (in tokens)
 
 #### Mix FSDP
 
@@ -124,19 +129,23 @@ For sparse models, large models, or when scaling to a large number of chips FSDP
 The same AI as derived in the Pure FSDP section above still hold, we need `global batch / sparsity * FSDP > hardware AI` which is equivalently to `per device batch (pdb) / sparsity * TP * EP * PP > hardware AI`.
 
 **Example with EP=16, FSDP=16, and sparsity=32**:
-  * `pdb * EP / sparsity > hardware AI`
+
+- `pdb * EP / sparsity > hardware AI`
 
 v5p:
-  * `pdb * 16 / 32 > 2550`
-  * `pdb > 2550 * 32 / 16 = 5k` (in tokens)
+
+- `pdb * 16 / 32 > 2550`
+- `pdb > 2550 * 32 / 16 = 5k` (in tokens)
 
 Trillium:
-  * `pdb * 16 / 32 > 5100`
-  * `pdb > 5100 * 32 / 16 = 10k` (in tokens)
+
+- `pdb * 16 / 32 > 5100`
+- `pdb > 5100 * 32 / 16 = 10k` (in tokens)
 
 Ironwood:
-  * `pdb * 16 / 32 > 12800`
-  * `pdb > 12800 * 32 / 16 = 26k` (in tokens)
+
+- `pdb * 16 / 32 > 12800`
+- `pdb > 12800 * 32 / 16 = 26k` (in tokens)
 
 We need a per device batch of at least 5k for v5p, 10k for Trillium, and 26k for Ironwood in this case.
 
@@ -149,16 +158,19 @@ AI of 1D EP on ICI rings `= 4 * mlp_dim / EP`. Communication cost of all-to-all 
 **Example with EP=4**
 
 v5p:
-* `4 * M > 2550 * 4`
-* `M > 2.5k`
+
+- `4 * M > 2550 * 4`
+- `M > 2.5k`
 
 Trillium:
-* `4 * M > 5100 * 4`
-* `M > 5k`
+
+- `4 * M > 5100 * 4`
+- `M > 5k`
 
 Ironwood:
-* `4 * M > 12800 * 4`
-* `M > 13k`
+
+- `4 * M > 12800 * 4`
+- `M > 13k`
 
 These examples show that to use EP, we need a large enough MLP dimension.
 
@@ -171,32 +183,39 @@ Tensor parallelism can be used for large dense models or super large sparse mode
 AI of TP: M / TP
 
 **Example with TP=4**
-* `M / TP > hardware AI`
+
+- `M / TP > hardware AI`
 
 v5p:
-* `M / 4 > 2550`
-* `M > 10k`
+
+- `M / 4 > 2550`
+- `M > 10k`
 
 Trillium:
-* `M / 4 > 5100`
-* `M > 20k`
+
+- `M / 4 > 5100`
+- `M > 20k`
 
 We have seen in practice M should be even larger - ideally 40k+. This is what we use for Llama-405B (M=53k), and was used for a custom sparse 10T model (M=40k, 64 experts). TP=4 corresponds to a custom Trillium mesh, an 8x8 ring of 2x2 subrings (the TP communication operates on the 2x2 ring). This 2x2 ring performs well (near roofline), but the 8x8 rings perform poorly (0.5 x 1 axis). E.g. if we use FSDP=64, TP=4, the FSDP=64 communications will be slower than the hardware ICI roofline, so we prefer to use the full 16 axis when M is large enough.
 
 Ironwood:
-* `M / 4 > 12800`
-* `M > 51k`
+
+- `M / 4 > 12800`
+- `M > 51k`
 
 **Example with TP=16**
-* `M / TP > hardware AI`
+
+- `M / TP > hardware AI`
 
 v5p:
-* `M / 16 > 2550`
-* `M > 41k`
+
+- `M / 16 > 2550`
+- `M > 41k`
 
 Trillium:
-* `M / 16 > 5100`
-* `M > 82k`
+
+- `M / 16 > 5100`
+- `M > 82k`
 
 To use TP=16, we need M > 80k (ideally larger, 100k+). We have used this in a custom dense model (900B, M=131k), which performs very well even at 1k per device tokens (scaling to 25k+ with a reasonable global batch).
 
@@ -207,27 +226,33 @@ Pipeline Parallelism is advantageous when global batch size limits per device ba
 AI of PP: 3/2 * layers_per_pipeline_stage * M * num_experts_per_tok
 
 **Example with PP=16, layers_per_pipeline_stage=1, num_experts_per_tok=8**
-* `layers_per_pipeline_stage * M * num_experts_per_tok > hardware AI`
+
+- `layers_per_pipeline_stage * M * num_experts_per_tok > hardware AI`
 
 v5p - PP over ICI:
-* `3 * M * 8 / 2 > 2550`
-* `M > 210`
+
+- `3 * M * 8 / 2 > 2550`
+- `M > 210`
 
 v5p - PP over DCN:
-* `3 * M * 8 / 2 > 73000`
-* `M > 6k`
+
+- `3 * M * 8 / 2 > 73000`
+- `M > 6k`
 
 Trillium over ICI:
-* `3 * M * 8 / 2 > 5100`
-* `M > 420`
+
+- `3 * M * 8 / 2 > 5100`
+- `M > 420`
 
 Trillium over DCN:
-* `3 * M * 8 / 2 > 73000`
-* `M > 6k`
+
+- `3 * M * 8 / 2 > 73000`
+- `M > 6k`
 
 Ironwood over ICI:
-* `3 * M * 8 / 2 > 12800`
-* `M > 1100`
+
+- `3 * M * 8 / 2 > 12800`
+- `M > 1100`
 
 It is important to emphasize that this is a theoretical roofline analysis. Real-world performance will depend on the efficiency of the implementation and XLA compilation on the TPU. Refer to the [link](https://github.com/AI-Hypercomputer/maxtext/blob/main/docs/explanations/sharding.md#pp--fsdpdp) for specific challenges regarding PP + FSDP/DP.
 
@@ -260,8 +285,8 @@ To use Trillium's 16x16 mesh efficiently for a large dense model, we would like 
 
 Our objective was to develop a custom Mixtral-like MoE model capable of high MFU on Trillium TPUs, targeting a 1.5 capacity factor (The **capacity factor** is a multiplier used to determine the processing capacity of each expert. it is used as Expert Capacity = (Tokens in Batch / Number of Experts) * Capacity Factor). We established an initial baseline of 43.1% MFU with a 1.0 capacity factor. Profiling revealed this configuration utilized approximately 20GiB HBM. To better leverage Trillium's 32GiB HBM and avoid potential convergence issues with large global batch sizes during scaling (maintaining a per device batch size of 8k), we made the following architectural adjustments:
 
-*   Increased the MLP dimension from 3x to 4x of the model dimension (32,768 : 8,192).
-*   Increased query heads from 32 to 128 for each layer, while reducing the number of layers from 72 to 56 to preserve overall model size around 700B.
+- Increased the MLP dimension from 3x to 4x of the model dimension (32,768 : 8,192).
+- Increased query heads from 32 to 128 for each layer, while reducing the number of layers from 72 to 56 to preserve overall model size around 700B.
 
 These changes, without updating sharding strategies, initially yielded nearly 50% MFU. Upon increasing the capacity factor to 1.5 (adding a buffer to allow experts to handle imbalance in token routing), MFU slightly decreased to 38.1% and scaling to 4 pods to get 35.3% MFU, which still exceeded our target of 35%. More detailed configs can be found [here](https://github.com/AI-Hypercomputer/maxtext/blob/3662540ee852d0d8f8333a36c04ddc0f1316ebfb/benchmarks/maxtext_trillium_model_configs.py#L1743) in the repo.
 

@@ -11,15 +11,15 @@ bucket.
 
 The system follows a specific order when deciding which checkpoint to load at startup. The first valid condition met is the one executed:
 
-1.  **Resume Current Run**: If a checkpoint already exists for the current
-    `run_name`, the system loads the latest fully-saved checkpoint. This is the
-    default behavior to ensure minimal state loss when resuming after an
-    interruption.
-2.  **Load from Specific Path**: The system checks for a user-specified path.
-    * If `load_parameters_path` is set, we load a parameter only checkpoint from that path..
-    * If `load_full_state_path` is set, we load a full state checkpoint from that path.
-    * **Note**: These two options are mutually exclusive and will cause an error if both are set.
-3.  **Initialize from Scratch**: We don't load a checkpoint and initialize state instead.
+1. **Resume Current Run**: If a checkpoint already exists for the current
+   `run_name`, the system loads the latest fully-saved checkpoint. This is the
+   default behavior to ensure minimal state loss when resuming after an
+   interruption.
+1. **Load from Specific Path**: The system checks for a user-specified path.
+   - If `load_parameters_path` is set, we load a parameter only checkpoint from that path..
+   - If `load_full_state_path` is set, we load a full state checkpoint from that path.
+   - **Note**: These two options are mutually exclusive and will cause an error if both are set.
+1. **Initialize from Scratch**: We don't load a checkpoint and initialize state instead.
 
 ### MaxText configuration
 

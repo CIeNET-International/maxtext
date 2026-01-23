@@ -17,17 +17,20 @@
 # Knowledge distillation
 
 ## Overview
+
 Knowledge Distillation is a compression technique that transfers knowledge from a larger (teacher) model to a smaller (student) model. This allows the smaller model to achieve performance levels closer to the larger one, but with significantly fewer parameters and computational resources.
 
 This guide focuses on **response-based knowledge distillation**, a technique where the student model is trained to replicate the outputs and behaviors of the teacher model. Within response-based knowledge distillation, two primary methods are often employed:
 
-1.  **Offline Distillation (Dataset Generation):**
-    *   The pre-trained teacher model first generates a new dataset of input-output pairs.
-    *   The student model is then trained on this teacher-generated dataset using standard fine-tuning techniques.
+1. **Offline Distillation (Dataset Generation):**
 
-2.  **Online Distillation (Logit Matching):**
-    *   During the training process, both the teacher model (which is typically frozen) and the student model process the same input data simultaneously.
-    *   The student model is trained by minimizing a loss function that encourages its output logits to match the logits produced by the teacher model for the same inputs.
+   - The pre-trained teacher model first generates a new dataset of input-output pairs.
+   - The student model is then trained on this teacher-generated dataset using standard fine-tuning techniques.
+
+1. **Online Distillation (Logit Matching):**
+
+   - During the training process, both the teacher model (which is typically frozen) and the student model process the same input data simultaneously.
+   - The student model is trained by minimizing a loss function that encourages its output logits to match the logits produced by the teacher model for the same inputs.
 
 ## Running Offline Distillation with MaxText
 
@@ -66,6 +69,7 @@ huggingface-cli download deepseek-ai/DeepSeek-V2-Lite-Chat --repo-type model --l
 ```
 
 #### b. Convert checkpoint to MaxText format
+
 MaxText requires checkpoints to be in a specific format. You'll need to convert the downloaded Hugging Face checkpoints to a MaxText-compatible checkpoint.
 
 ```bash
@@ -86,6 +90,7 @@ huggingface-cli download meta-llama/Llama-2-7b-chat-hf --repo-type model --local
 ```
 
 #### b. Convert checkpoint to MaxText format
+
 MaxText requires checkpoints to be in a specific format. You'll need to convert the downloaded Hugging Face checkpoints to a MaxText-compatible checkpoint.
 
 ```bash
@@ -98,6 +103,7 @@ python3 -m MaxText.utils.ckpt_scripts.llama_or_mistral_ckpt \
 ```
 
 ### 3. Generate dataset using the teacher model
+
 Once the teacher model's checkpoint is in the MaxText format, you can run inference to generate the dataset that will be used to fine-tune the student model.
 
 ### 3.a. Run the JetStream server
@@ -118,8 +124,8 @@ python3 -m MaxText.maxengine_server src/MaxText/configs/base.yml \
 
 Set `multi_sampling` to `True` to generate multiple independent completions per prompt.
 
-
 ### 3.b. Generate dataset using JetStream server
+
 In a new tab in your terminal, run the following command to generate dataset from teacher model. Note that this is an example command to run on `v4-8`:
 
 ```bash
@@ -143,6 +149,7 @@ It's important to note that some prompts may be filtered out by pre-processing l
 Additionally, the generated dataset can be uploaded to either Hugging Face or Google Cloud Storage (GCS). To upload to Hugging Face, use the `upload-to-hf --hf-repo-id <hf_repo_name>` flags. To upload to GCS, use the `upload-to-gcs --gcs-bucket <gcs bucket name> --gcs-data-path <path in gcs bucket>` flags.
 
 ### 4. Fine-tune the student model using Supervised Fine Tuning (SFT)
+
 You can now fine-tune your smaller student model using supervised fine-tuning technique in MaxText.
 
 ### 4.a. Fine-tune the student model using dataset generated in Step 3

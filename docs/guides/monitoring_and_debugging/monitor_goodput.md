@@ -15,6 +15,7 @@
 -->
 
 (monitor-goodput)=
+
 # ML Goodput measurement
 
 MaxText supports automatic measurement and upload of workload metrics such as Goodput, Badput Breakdown and Step Time Deviation using the ML Goodput Measurement library.
@@ -22,10 +23,12 @@ MaxText supports automatic measurement and upload of workload metrics such as Go
 The [ML Goodput Measurement](https://github.com/AI-Hypercomputer/ml-goodput-measurement) library currently supports monitoring workloads running on Google Cloud Platform. For more information on details of the library, visit the Github page or the [ml-goodput-measurement](https://pypi.org/project/ml-goodput-measurement/) PyPI package documentation.
 
 ## What is Goodput
-Goodput is the metric that measures the efficiency of model training jobs, i.e. productive time spent on training progress proportional to the total time spent by the workload. It is an actionable way for users to monitor where they can improve to get the most value from their accelerators. 
+
+Goodput is the metric that measures the efficiency of model training jobs, i.e. productive time spent on training progress proportional to the total time spent by the workload. It is an actionable way for users to monitor where they can improve to get the most value from their accelerators.
 
 ## What is Badput
-Badput is the metric that measures time that a workload spent on anything that is not productive training proportional to the total time spent by the workload. For example, the time spent in accelerator initialization, training preparation, program startup, data loading, portions of checkpointing, disruptions and wasted progress since the last checkpoint etc. all contribute to Badput. 
+
+Badput is the metric that measures time that a workload spent on anything that is not productive training proportional to the total time spent by the workload. For example, the time spent in accelerator initialization, training preparation, program startup, data loading, portions of checkpointing, disruptions and wasted progress since the last checkpoint etc. all contribute to Badput.
 
 The ML Goodput Measurement library exposes Badput Breakdown. Further details of each bucket can be found [here](https://github.com/AI-Hypercomputer/ml-goodput-measurement?tab=readme-ov-file#badput-breakdown-details)
 
@@ -38,21 +41,22 @@ The ML Goodput Measurement library exposes step time deviation by computing idea
 ## How to use ML Goodput Measurement in MaxText
 
 ### Prerequisites
+
 The usage of this package requires the setup of a Google Cloud project with
 billing enabled to properly use Google Cloud Logging. If you don't have a Google
 Cloud project, or if you don't have billing enabled for your Google Cloud
 project, then do the following:
 
 1. In the Google Cloud console, on the project selector page,
- [select or create a Google Cloud project](https://cloud.google.com/resource-manager/docs/creating-managing-projects).
+   [select or create a Google Cloud project](https://cloud.google.com/resource-manager/docs/creating-managing-projects).
 
-2. Make sure that billing is enabled for your Google Cloud project. Instructions can be found [here](https://cloud.google.com/billing/docs/how-to/verify-billing-enabled#console)
+1. Make sure that billing is enabled for your Google Cloud project. Instructions can be found [here](https://cloud.google.com/billing/docs/how-to/verify-billing-enabled#console)
 
-3. Enable the [Cloud Logging API](https://console.cloud.google.com/flows/enableapi?apiid=logging.googleapis.com&_ga=2.27841276.1571868865.1726250448-123998259.1726107009).
+1. Enable the [Cloud Logging API](https://console.cloud.google.com/flows/enableapi?apiid=logging.googleapis.com&_ga=2.27841276.1571868865.1726250448-123998259.1726107009).
 
-4. To run your training on Cloud accelerator, set up the environment by following instructions [here](https://cloud.google.com/tpu/docs/setup-gcp-account).
+1. To run your training on Cloud accelerator, set up the environment by following instructions [here](https://cloud.google.com/tpu/docs/setup-gcp-account).
 
-5. To learn more about Google Cloud Logging, visit this [page](https://cloud.google.com/logging/docs).
+1. To learn more about Google Cloud Logging, visit this [page](https://cloud.google.com/logging/docs).
 
 ### Access scopes
 
@@ -123,7 +127,7 @@ If checkpointing is enabled, please enable the `enable_checkpoint_cloud_logger` 
 ### Visualize on Tensorboard
 
 1. MaxText installs the required packages on setup: `tensorboard-plugin-profile`, `tensorflow` and `tensorboard`.
-2. Follow the Tensorboard URL on MaxText logs to view all metrics in one location.
+1. Follow the Tensorboard URL on MaxText logs to view all metrics in one location.
 
 #### Visualize Goodput, Badput and step deviation on Google Cloud Monitoring
 
@@ -176,17 +180,20 @@ monitoring.
 
 Goodput, Badput and Step Time Deviation metrics can be monitored using GCM Metrics Explorer:
 
-1.  Verify that the workload is executing with monitoring enabled. This ensures automatic data ingestion into Google Cloud Monitoring.
-2.  Navigate to [Metrics Explorer](https://console.cloud.google.com/monitoring/metrics-explorer). Initiate metric selection by clicking `Select a metric` then search for and select the `Workload` resource. Subsequently, choose the `Workload` metric category.
+1. Verify that the workload is executing with monitoring enabled. This ensures automatic data ingestion into Google Cloud Monitoring.
 
-    a.  [**Productive Time:**](https://cloud.google.com/monitoring/api/metrics_gcp#:~:text=workload/goodput_time)
-    Represents the cumulative duration the workload spent on productive tasks,
-    measured by `compute.googleapis.com/workload/goodput_time`.  
-    b.  [**Non-Productive Time:**](https://cloud.google.com/monitoring/api/metrics_gcp#:~:text=workload/badput_time)
-    Represents the cumulative duration the workload spent on non-productive tasks,
-    measured by `compute.googleapis.com/workload/badput_time`.  
-    c.  [**Performance:**](https://cloud.google.com/monitoring/api/metrics_gcp#:~:text=workload/performance)
-    Represents the workload's performance metric, specifically step deviation
-    in this context, measured by `compute.googleapis.com/workload/performance`.  
-3.  Navigate to [Dashboards](https://console.cloud.google.com/monitoring/dashboards).
-4.  Create a custom dashboard if there isn't one and add useful widgets with the above mentioned metrics.
+1. Navigate to [Metrics Explorer](https://console.cloud.google.com/monitoring/metrics-explorer). Initiate metric selection by clicking `Select a metric` then search for and select the `Workload` resource. Subsequently, choose the `Workload` metric category.
+
+   a. [**Productive Time:**](https://cloud.google.com/monitoring/api/metrics_gcp#:~:text=workload/goodput_time)
+   Represents the cumulative duration the workload spent on productive tasks,
+   measured by `compute.googleapis.com/workload/goodput_time`.\
+   b. [**Non-Productive Time:**](https://cloud.google.com/monitoring/api/metrics_gcp#:~:text=workload/badput_time)
+   Represents the cumulative duration the workload spent on non-productive tasks,
+   measured by `compute.googleapis.com/workload/badput_time`.\
+   c. [**Performance:**](https://cloud.google.com/monitoring/api/metrics_gcp#:~:text=workload/performance)
+   Represents the workload's performance metric, specifically step deviation
+   in this context, measured by `compute.googleapis.com/workload/performance`.
+
+1. Navigate to [Dashboards](https://console.cloud.google.com/monitoring/dashboards).
+
+1. Create a custom dashboard if there isn't one and add useful widgets with the above mentioned metrics.

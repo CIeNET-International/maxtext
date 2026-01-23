@@ -21,6 +21,7 @@ This is a short guide to run Maxtext on GPU. For this current set of instruction
 ## Create a GPU VM
 
 Follow the instructions to create a3 high or an a3 Mega VM
+
 - https://cloud.google.com/compute/docs/gpus/create-gpu-vm-accelerator-optimized#console
 - Add enough disk space to work through the examples (at least 500GB)
 
@@ -42,9 +43,9 @@ Related NVIDIA Content:
 
 - NVIDIA JAX Session:
 - Learn more about Jax on GPUs:
-    - https://www.nvidia.com/en-us/on-demand/session/gtc24-s62246/
+  - https://www.nvidia.com/en-us/on-demand/session/gtc24-s62246/
 - NVIDIA JAX Toolbox:
-    - https://github.com/NVIDIA/JAX-Toolbox
+  - https://github.com/NVIDIA/JAX-Toolbox
 
 ## Install Docker
 
@@ -109,7 +110,7 @@ You should see the following:
 
 Note: If you only see CPUDevice, that means there is a issue with NVIDIA Container and you need to stop and fix the issue.
 
-We will Run the next commands from inside the docker for convenience. 
+We will Run the next commands from inside the docker for convenience.
 
 ## SSH into the docker
 

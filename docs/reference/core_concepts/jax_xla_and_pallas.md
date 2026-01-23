@@ -7,9 +7,9 @@ MaxText's core design proposition is to provide a high-performance, massively sc
 MaxText builds on the following core technologies:
 
 1. [JAX](https://docs.jax.dev/en/latest/), for writing high-level numerical code
-2. [JAX Pallas](https://docs.jax.dev/en/latest/pallas/index.html), the kernel language of JAX
-3. [XLA](https://openxla.org/xla), the compiler for JAX code
-4. Mosaic, the Pallas compiler
+1. [JAX Pallas](https://docs.jax.dev/en/latest/pallas/index.html), the kernel language of JAX
+1. [XLA](https://openxla.org/xla), the compiler for JAX code
+1. Mosaic, the Pallas compiler
 
 The following table provides a high-level overview to scaffold understanding before a more detailed exploration.
 
@@ -58,7 +58,7 @@ JAX provides powerful, high-level abstractions for SPMD programming. [`jax.vmap`
 
 This unified scalability model is a key advantage of the JAX ecosystem. Training large LLMs requires different types of parallelism—data parallelism (splitting the batch), tensor parallelism (splitting a single matrix multiplication), and pipeline parallelism (splitting layers across devices). In many frameworks, implementing these requires different APIs, libraries, or coding patterns, which adds significant complexity. In JAX, all these forms of parallelism can be expressed through the single, unified concept of sharding tensors over a logical device mesh. For data parallelism, one shards the batch dimension of the input data. For tensor parallelism, one shards the weight matrices along their feature or output dimensions.
 
-MaxText leverages this unification to great effect. The core model code remains largely agnostic to the parallelism strategy. Scalability is controlled primarily by changing the level of each kind of parallelism  in configuration files. This abstraction is a primary reason MaxText can be described as both "simple" and "massively scalable," as the immense complexity of distributed execution is handled by JAX and the XLA compiler, rather than the user.
+MaxText leverages this unification to great effect. The core model code remains largely agnostic to the parallelism strategy. Scalability is controlled primarily by changing the level of each kind of parallelism in configuration files. This abstraction is a primary reason MaxText can be described as both "simple" and "massively scalable," as the immense complexity of distributed execution is handled by JAX and the XLA compiler, rather than the user.
 
 ### 1.4. Composability: the JAX superpower
 
@@ -127,9 +127,9 @@ Similar to XLA's compilation of high-level JAX code, Mosaic is a compiler for Pa
 The relationship between these technologies creates a layered journey from user code to hardware execution:
 
 1. **The User writes in MaxText:** A developer interacts with high-level concepts in Python, modifying model layers in a familiar style or adjusting parallelism strategies in YAML configuration files. For certain critical operations, they may be using a Pallas kernel without even knowing it, simply by enabling a feature.
-2. **JAX provides the language:** This Python code is interpreted by JAX, which provides the NumPy API and the powerful jit, grad, and SPMD transformations. These transformations allow the user to express a complex intent — "I want to run a parallelized, differentiable training step"—in a declarative way.
-3. **Pallas provides the sharp edge:** For the few, highly specialized operations where compilation isn't enough to match state-of-the-art performance, a pre-written Pallas kernel provides a hand-tuned, optimal implementation, ensuring MaxText stays at the cutting edge.
-4. **XLA and Mosaic do the heavy lifting:** JAX hands a graph of the program to the XLA compiler. XLA then performs optimizations like operator fusion and memory layout management to create machine code that runs incredibly fast on the target accelerator. For Pallas kernels, Mosaic does the same and the results of both compilers are combined into the final program.
+1. **JAX provides the language:** This Python code is interpreted by JAX, which provides the NumPy API and the powerful jit, grad, and SPMD transformations. These transformations allow the user to express a complex intent — "I want to run a parallelized, differentiable training step"—in a declarative way.
+1. **Pallas provides the sharp edge:** For the few, highly specialized operations where compilation isn't enough to match state-of-the-art performance, a pre-written Pallas kernel provides a hand-tuned, optimal implementation, ensuring MaxText stays at the cutting edge.
+1. **XLA and Mosaic do the heavy lifting:** JAX hands a graph of the program to the XLA compiler. XLA then performs optimizations like operator fusion and memory layout management to create machine code that runs incredibly fast on the target accelerator. For Pallas kernels, Mosaic does the same and the results of both compilers are combined into the final program.
 
 The "simplicity" of MaxText is not in having the fewest lines of code, but in its *conceptual consistency* and its reliance on a powerful, unified stack to handle the immense underlying complexity of high-performance, distributed computing.
 

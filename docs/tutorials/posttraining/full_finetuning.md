@@ -39,6 +39,7 @@ source $VENV_NAME/bin/activate
 uv pip install -e .[tpu] --resolution=lowest
 install_maxtext_github_deps
 ```
+
 ## Setup environment variables
 
 ```sh
@@ -53,9 +54,11 @@ export RUN_NAME=<name for this run> # e.g., $(date +%Y-%m-%d-%H-%M-%S)
 ```
 
 ## Hugging Face checkpoint to Maxtext checkpoint
+
 This section explains how to prepare your model checkpoint for use with MaxText. You have two options: using an existing MaxText checkpoint or converting a Hugging Face checkpoint.
 
 ### Option 1: Using an existing MaxText checkpoint
+
 If you already have a MaxText-compatible model checkpoint, simply set the following environment variable and move on to the next section.
 
 ```sh
@@ -79,7 +82,7 @@ MaxText provides examples to work with [Common Crawl](https://commoncrawl.org/).
 Run these steps once per project prior to any local development or cluster experiments.
 
 1. Create two gcs buckets in your project, one for downloading and retrieving the dataset and the other for storing the logs.
-2. Download the dataset in your gcs bucket.
+1. Download the dataset in your gcs bucket.
 
 MaxText assumes these GCS buckets are created in the same project and that it has permissions to read and write from them.
 

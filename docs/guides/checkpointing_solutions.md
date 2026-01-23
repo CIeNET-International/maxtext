@@ -1,4 +1,5 @@
 (checkpointing_solutions)=
+
 # Checkpointing
 
 ::::{grid} 1 2 2 2

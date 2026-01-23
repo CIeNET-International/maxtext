@@ -20,16 +20,18 @@ This tutorial demonstrates step-by-step instructions for setting up the environm
 
 We utilize two RL algorithms, implemented via the Tunix library, to enhance the model's reasoning capabilities:
 
-* **Group Relative Policy Optimization (GRPO)**: GRPO is an RL algorithm designed to enhance the reasoning abilities of LLMs. It is a variant of Proximal Policy Optimization (PPO) that reduces memory usage by eliminating the need for a separate value function model. GRPO works by generating multiple responses for a given prompt, evaluating these responses using a reward model, and then calculating a relative advantage based on the group's performance to update the policy.
+- **Group Relative Policy Optimization (GRPO)**: GRPO is an RL algorithm designed to enhance the reasoning abilities of LLMs. It is a variant of Proximal Policy Optimization (PPO) that reduces memory usage by eliminating the need for a separate value function model. GRPO works by generating multiple responses for a given prompt, evaluating these responses using a reward model, and then calculating a relative advantage based on the group's performance to update the policy.
 
-* **Group Sequence Policy Optimization (GSPO)**: GSPO is an RL algorithm that improves training efficiency and performance of LLMs by using sequence-level importance ratios and operations. GSPO defines the importance ratio based on sequence likelihood and performs sequence-level clipping, rewarding, and optimization.
+- **Group Sequence Policy Optimization (GSPO)**: GSPO is an RL algorithm that improves training efficiency and performance of LLMs by using sequence-level importance ratios and operations. GSPO defines the importance ratio based on sequence likelihood and performs sequence-level clipping, rewarding, and optimization.
 
 For efficient model inference and response generation during this process, we rely on the vLLM library.
 
 Let's get started!
 
 ## Create virtual environment and Install MaxText dependencies
+
 If you have already completed the [MaxText installation](../../install_maxtext.md), you can skip to the next section for post-training dependencies installations. Otherwise, please install `MaxText` using the following commands before proceeding.
+
 ```bash
 # 1. Clone the repository
 git clone https://github.com/AI-Hypercomputer/maxtext.git
@@ -87,6 +89,7 @@ export RUN_NAME=<name for this run> # e.g., $(date +%Y-%m-%d-%H-%M-%S)
 ### Option 1: Using an existing MaxText checkpoint
 
 If you already have a MaxText-compatible model checkpoint, simply set the following environment variable and move on to the next section.
+
 ```bash
 export MAXTEXT_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-bucket/my-model-checkpoint/0/items
 ```
@@ -116,9 +119,9 @@ python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
 The overview of what this run will do is as follows:
 
 1. We load a policy model and a reference model. Both are copies of the model checkpoint you specified (e.g., `Llama3.1-8b-Instruct`).
-2. Evaluate the policy model's performance on GSM8K math reasoning benchmark.
-3. Train the policy model using GRPO.
-4. Evaluate the policy model's performance on GSM8K math reasoning benchmark after the post-training with GRPO. 
+1. Evaluate the policy model's performance on GSM8K math reasoning benchmark.
+1. Train the policy model using GRPO.
+1. Evaluate the policy model's performance on GSM8K math reasoning benchmark after the post-training with GRPO.
 
 ## Run GSPO
 
@@ -138,7 +141,6 @@ python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
 The overview of what this run will do is as follows:
 
 1. We load a policy model and a reference model. Both are copies of the model checkpoint you specified (e.g., `Llama3.1-8b-Instruct`).
-2. Evaluate the policy model's performance on GSM8K math reasoning benchmark.
-3. Train the policy model using GSPO.
-4. Evaluate the policy model's performance on GSM8K math reasoning benchmark after the post-training with GSPO. 
-
+1. Evaluate the policy model's performance on GSM8K math reasoning benchmark.
+1. Train the policy model using GSPO.
+1. Evaluate the policy model's performance on GSM8K math reasoning benchmark after the post-training with GSPO.

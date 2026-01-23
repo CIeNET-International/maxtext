@@ -20,9 +20,9 @@ This tutorial provides step-by-step instructions for setting up the environment 
 
 We utilize two RL algorithms, implemented via the Tunix library, to enhance the model's reasoning capabilities:
 
-* **Group Relative Policy Optimization (GRPO)**: GRPO is an RL algorithm designed to enhance the reasoning abilities of LLMs. It is a variant of Proximal Policy Optimization (PPO) that reduces memory usage by eliminating the need for a separate value function model. GRPO works by generating multiple responses for a given prompt, evaluating these responses using a reward model, and then calculating a relative advantage based on the group's performance to update the policy.
+- **Group Relative Policy Optimization (GRPO)**: GRPO is an RL algorithm designed to enhance the reasoning abilities of LLMs. It is a variant of Proximal Policy Optimization (PPO) that reduces memory usage by eliminating the need for a separate value function model. GRPO works by generating multiple responses for a given prompt, evaluating these responses using a reward model, and then calculating a relative advantage based on the group's performance to update the policy.
 
-* **Group Sequence Policy Optimization (GSPO)**: GSPO is an RL algorithm that improves training efficiency and performance of LLMs by using sequence-level importance ratios and operations. GSPO defines the importance ratio based on sequence likelihood and performs sequence-level clipping, rewarding, and optimization.
+- **Group Sequence Policy Optimization (GSPO)**: GSPO is an RL algorithm that improves training efficiency and performance of LLMs by using sequence-level importance ratios and operations. GSPO defines the importance ratio based on sequence likelihood and performs sequence-level clipping, rewarding, and optimization.
 
 For efficient model inference and response generation during this process, we rely on the vLLM library.
 
@@ -39,6 +39,7 @@ For efficient model inference and response generation during this process, we re
 ## Prerequisites
 
 Before starting, ensure you have:
+
 - Access to a Google Cloud Project with TPU quotas.
 - A Hugging Face account with an access token for downloading models.
 - Permissions for Google Artifact Registry (Artifact Registry Writer role).
@@ -87,7 +88,9 @@ export MAXTEXT_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-bucke
 ```
 
 ## Build and upload MaxText Docker image with post-training dependencies
+
 Before building the Docker image, authenticate to [Google Artifact Registry](https://docs.cloud.google.com/artifact-registry/docs/docker/authentication#gcloud-helper) for permission to push your images and other access.
+
 ```bash
 # Authenticate your user account for gcloud CLI access
 gcloud auth login
@@ -99,8 +102,9 @@ docker run hello-world
 ```
 
 ### Option 1: Install stable releases of post-training dependencies
+
 > **Caution:** RL in MaxText is currently broken with stable releases of post-training dependencies. We are working on fixing this and recommend following [Option 2: Install from Git repositories of post-training dependencies](#option-2-install-from-git-repositories-of-post-training-dependencies) in the meantime.
- 
+
 Run the following script to create a Docker image with stable releases of MaxText, [Tunix](https://github.com/google/tunix), [vLLM](https://github.com/vllm-project/vllm), and [tpu-inference](https://github.com/vllm-project/tpu-inference) dependencies. This installs `vllm-tpu` which provides TPU inference for vLLM with unified JAX and PyTorch support. The build process takes approximately 10-15 minutes.
 
 ```bash
@@ -140,6 +144,7 @@ Ensure you have a Pathways-ready GKE cluster (as mentioned in Prerequisites) and
 > **Note:** XPK v0.14.0+ automatically discovers your cluster's location from GCP. You don't need to specify `--zone` in the commands below. If using an older XPK version, add `--zone=<zone>` to the workload commands.
 
 ### Submit GRPO workload
+
 ```
 xpk workload create-pathways --workload $WORKLOAD \
 --docker-image gcr.io/$PROJECT_ID/$CLOUD_IMAGE_NAME --cluster $TPU_CLUSTER \
@@ -156,6 +161,7 @@ python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
 ```
 
 ### Submit GSPO workload
+
 ```
 xpk workload create-pathways --workload $WORKLOAD \
 --docker-image gcr.io/$PROJECT_ID/$CLOUD_IMAGE_NAME --cluster $TPU_CLUSTER \

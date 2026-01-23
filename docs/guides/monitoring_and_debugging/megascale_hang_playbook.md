@@ -13,9 +13,9 @@ Much of this guide is geared towards providing Google with the right data to hel
 ## Before You Start
 
 1. Use `JAX` 0.6 or up, and enable JAX distributed service. This version of JAX contains additional logging that can help identify which workers are experiencing issues.
-2. Generate an HLO dump using the `--xla_dump_to` flag when initializing your workload. This is discussed in the [XLA Documentation](https://openxla.org/xla/hlo_dumps).
-3. Run your workload with stack traces enabled. XPK users should follow the [XPK-specific instructions](https://github.com/AI-Hypercomputer/xpk?tab=readme-ov-file#collect-stack-traces). Note the `--deploy-stacktrace-sidecar` flag when running the XPK workload command.
-4. Set `--vmodule=real_program_continuator=1` to enable verbose logging for the TPU program execution status.
+1. Generate an HLO dump using the `--xla_dump_to` flag when initializing your workload. This is discussed in the [XLA Documentation](https://openxla.org/xla/hlo_dumps).
+1. Run your workload with stack traces enabled. XPK users should follow the [XPK-specific instructions](https://github.com/AI-Hypercomputer/xpk?tab=readme-ov-file#collect-stack-traces). Note the `--deploy-stacktrace-sidecar` flag when running the XPK workload command.
+1. Set `--vmodule=real_program_continuator=1` to enable verbose logging for the TPU program execution status.
 
 ## Locate the Megascale Hang Detected Error
 
