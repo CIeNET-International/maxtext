@@ -26,6 +26,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from flax import linen as nn
+from flax.linen import module as linen_module_lib
 from flax import nnx
 from flax.nnx import wrappers as nnx_wrappers
 from flax.linen import partitioning as nn_partitioning
@@ -68,7 +69,9 @@ from MaxText.layers import (
 
 
 class DecoderLayer(nnx.Module):
-    """Transformer decoder layer converted to NNX."""
+    """
+    Transformer decoder layer converted to NNX.
+    """
     def __init__(
         self,
         config: Config,
@@ -229,6 +232,7 @@ class Decoder(nnx.Module):
         self.model_mode = model_mode
         self.rngs = rngs
 
+        # Ensure we are in the mesh context and using the correct logical axis rules
         with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
             decoder_block_classes = self.get_decoder_layers()
             
@@ -318,6 +322,7 @@ class Decoder(nnx.Module):
 
     def _create_single_layer(self, decoder_layer_class, rngs, **kwargs):
         """Helper to create a single layer (Linen or NNX)."""
+        # Ensure single layer creation also respects mesh/rules
         with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
             if issubclass(decoder_layer_class, nnx.Module):
                 return decoder_layer_class(
@@ -344,6 +349,7 @@ class Decoder(nnx.Module):
             )
             return layer
 
+        # Split RNGs in-place on the Decoder.rngs object
         nnx.split_rngs(rngs, splits=length)
         rng_graphdef, rng_state = nnx.split(rngs)
 
@@ -366,6 +372,7 @@ class Decoder(nnx.Module):
                 )(r)
 
         abstract_layers = jax.eval_shape(abstract_init_fn, rng_state)
+        max_logging.log("Decoder (NNX): Abstract stack created.")
         return abstract_layers
     
     def _apply_layers_sequentially(self, layers, x_in, *args, length: int, **kwargs):
@@ -383,32 +390,108 @@ class Decoder(nnx.Module):
       with self.mesh, nn_partitioning.axis_rules(extended_rules):
           graphdef, params, state = nnx.split(layers, nnx.Param, ...) 
           
-          # ----------------------------------------------------------------------
-          # FIX: Re-inject concrete RNG state if the current state is Abstract
-          # ----------------------------------------------------------------------
-          # Check if state contains abstract values (ShapeDtypeStruct)
-          is_abstract = any(isinstance(x, jax.ShapeDtypeStruct) for x in jax.tree_util.tree_leaves(state))
+          # Check for Abstract State (Placeholder) vs Concrete State (Runtime)
+          state_leaves = jax.tree_util.tree_leaves(state)
+          is_abstract = any(isinstance(x, jax.ShapeDtypeStruct) for x in state_leaves)
           
           if is_abstract:
-              max_logging.log("Decoder (NNX): Detected Abstract RNG state. Re-generating concrete RNGs from fresh seed.")
+              max_logging.log(f"Decoder (NNX): Abstract state detected ({len(state_leaves)} leaves). Regenerating...")
               
-              # We re-perform the split logic using the fresh 'self.rngs' which ToLinen populated
-              # The structure of 'state' in DecoderLayer (specifically Llama2) is generally just RngState.
-              # If there are other states (like BatchStats), they would be overwritten by self.variables anyway.
-              # But 'state' here comes from 'layers', which was abstract.
+              # 1. Fetch fresh concrete keys from active Linen context
+              try:
+                  if linen_module_lib._context.module_stack:
+                      current_module = linen_module_lib._context.module_stack[-1]
+                      dropout_key = current_module.make_rng('dropout')
+                      try:
+                          params_key = current_module.make_rng('params')
+                      except:
+                          params_key = jax.random.fold_in(dropout_key, 0)
+                  else:
+                      dropout_key = jax.random.key(0)
+                      params_key = dropout_key
+              except:
+                  dropout_key = jax.random.key(0)
+                  params_key = dropout_key
+
+              # 2. Vectorize the keys
+              ctx_rngs = nnx.Rngs(params=params_key, dropout=dropout_key)
+              nnx.split_rngs(ctx_rngs, splits=length)
+              rng_graphdef, rng_state_flat = nnx.split(ctx_rngs)
               
-              # Split the fresh root keys
-              nnx.split_rngs(self.rngs, splits=length)
-              # Extract the new concrete state representing the stack
-              _, concrete_rng_state = nnx.split(self.rngs)
+              # 3. Regenerate FULL State (excluding Params)
+              def create_full_state(r_state):
+                  r = nnx.merge(rng_graphdef, r_state)
+                  def create_layer_state(rng):
+                      if self.is_deepseek:
+                          if hasattr(self, 'dense_stack') and layers is self.dense_stack:
+                              cls = self.get_decoder_layers()[0]
+                          elif hasattr(self, 'moe_stack') and layers is self.moe_stack:
+                              cls = self.get_decoder_layers()[1]
+                          else:
+                              cls = self.get_decoder_layers()[0]
+                      else:
+                          cls = self.get_decoder_layers()[0]
+
+                      layer = cls(
+                          config=self.config,
+                          mesh=self.mesh,
+                          quant=self.quant,
+                          model_mode=self.model_mode,
+                          rngs=rng
+                      )
+                      # Return FULL state (not just RngState) to match Abstract structure
+                      # This excludes Params (which are separate)
+                      return nnx.state(layer)
+                  
+                  return nnx.vmap(create_layer_state)(r)
+
+              jit_gen = jax.jit(create_full_state)
+              concrete_state = jit_gen(rng_state_flat)
               
-              # Replace the abstract state with the concrete one
-              state = concrete_rng_state
+              max_logging.log(f"Decoder (NNX): Concrete state leaves: {len(jax.tree_util.tree_leaves(concrete_state))}")
+
+              # 4. Graft & Fill
+              # Match the structure of 'state' (abstract). Fill from 'concrete_state'.
+              # If concrete is missing keys (e.g. optimized away norms), fill with zeros.
+              def fill_missing_concrete(abstract, concrete):
+                  if isinstance(abstract, (dict, nnx.State)):
+                      if not isinstance(concrete, (dict, nnx.State)):
+                          # Mismatch or concrete missing at node level
+                          new_data = {}
+                          for k, v in abstract.items():
+                              new_data[k] = fill_missing_concrete(v, None)
+                          return nnx.State(new_data)
+                      
+                      new_data = {}
+                      for k, v in abstract.items():
+                          if k in concrete:
+                              new_data[k] = fill_missing_concrete(v, concrete[k])
+                          else:
+                              # Key missing in concrete, fill with zeros
+                              def instantiate_zeros(leaf):
+                                  if isinstance(leaf, jax.ShapeDtypeStruct):
+                                      return jnp.zeros(leaf.shape, dtype=leaf.dtype)
+                                  return leaf # Should be concrete if not ShapeDtypeStruct
+                              new_data[k] = jax.tree_util.tree_map(instantiate_zeros, v)
+                      return nnx.State(new_data)
+                  
+                  # Leaf case
+                  if concrete is not None:
+                      return concrete
+                  else:
+                      # Concrete missing at leaf
+                      return jax.tree_util.tree_map(
+                          lambda x: jnp.zeros(x.shape, dtype=x.dtype), 
+                          abstract
+                      )
+
+              state = fill_missing_concrete(state, concrete_state)
+              max_logging.log("Decoder (NNX): State fully concretized.")
+
           # ----------------------------------------------------------------------
 
           layer_cls = layers.__class__ 
           sig = inspect.signature(layer_cls.__call__)
-          
           valid_kwargs = {
               k: v for k, v in kwargs.items() 
               if k in sig.parameters or 'kwargs' in sig.parameters
@@ -416,7 +499,10 @@ class Decoder(nnx.Module):
 
           def layer_fn(carry, scanned_vars):
               current_params, current_state = scanned_vars
+              
+              # Standard Merge: Graph + Params + State
               layer = nnx.merge(graphdef, current_params, current_state)
+              
               layer_out = layer(carry, *args, **valid_kwargs)
               new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
               new_current_state = nnx.state(layer)
@@ -429,9 +515,11 @@ class Decoder(nnx.Module):
               x_in,
               (params, state)
           )
+          
           nnx.update(layers, scanned_state)
 
       return final_carry, None
+
 
     def get_decoder_layers(self):
       """Retrieves decoder layer classes based on config using a dictionary lookup."""
@@ -642,7 +730,7 @@ class Decoder(nnx.Module):
         else:
             norm_out_sharding = None
 
-        y = self.decoder_norm(y)
+        y = self.decoder_norm(y,out_sharding=norm_out_sharding)
         y = self.dropout(y, deterministic=deterministic) # NNX call
 
         if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
@@ -670,7 +758,7 @@ class Decoder(nnx.Module):
                 logits = logits / cfg.final_logits_soft_cap
                 logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
         else:
-            logits = self.logits_dense(y)
+            logits = self.logits_dense(y,out_sharding=out_sharding)
         
         if self.config.cast_logits_to_fp32:
             logits = logits.astype(jnp.float32)
@@ -788,7 +876,7 @@ def decoder_as_linen(
       quant=quant,
       name="decoder",
       # CRITICAL: abstract_init=True to prevent OOM
-      abstract_init=False,
+      abstract_init=True,
       metadata_fn=initializers.variable_to_logically_partitioned,
   )
   return module
