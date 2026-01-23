@@ -23,11 +23,12 @@ import inspect
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from flax import linen as nn
 from flax import nnx
 from flax.nnx import wrappers as nnx_wrappers
+from flax.linen import partitioning as nn_partitioning
 
 from MaxText.configs.types import PositionalEmbedding
 from MaxText.common_types import DecoderBlockType, ShardMode, Config, EP_AS_CONTEXT
@@ -44,12 +45,11 @@ from MaxText.layers import pipeline
 from MaxText import maxtext_utils
 from MaxText import multimodal_utils
 from MaxText import sharding
-from MaxText.layers.attentions import attention_as_linen
+from MaxText.layers.attentions import Attention
 from MaxText.layers.normalizations import RMSNorm
 from MaxText.layers.embeddings import Embed, attend_on_embedding, embed_as_linen, positional_embedding_as_linen
 from MaxText.layers.quantizations import AqtQuantization as Quant
 
-# Import specific layer definitions (assuming these files exist)
 from MaxText.layers import (
     deepseek,
     deepseek_batchsplit,
@@ -68,9 +68,7 @@ from MaxText.layers import (
 
 
 class DecoderLayer(nnx.Module):
-    """
-    Transformer decoder layer converted to NNX.
-    """
+    """Transformer decoder layer converted to NNX."""
     def __init__(
         self,
         config: Config,
@@ -120,9 +118,10 @@ class DecoderLayer(nnx.Module):
             compute_axis_order=tuple(map(int, cfg.compute_axis_order.split(","))),
             reshape_q=cfg.reshape_q,
             model_mode=model_mode,
+            rngs=rngs,
         )
 
-        self.mlp = linears.MLPBlock(
+        self.mlp = linears.MlpBlock(
             in_features=cfg.emb_dim,
             intermediate_dim=cfg.mlp_dim,
             activations=cfg.mlp_activations,
@@ -223,85 +222,93 @@ class Decoder(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ):
+        max_logging.log("Decoder (NNX): Initializing...")
         self.config = config
         self.mesh = mesh
         self.quant = quant
         self.model_mode = model_mode
         self.rngs = rngs
 
-        decoder_block_classes = self.get_decoder_layers()
-        
-        self.decoder_norm = self.get_norm_layer(num_features=config.emb_dim, rngs=rngs)(
-            dtype=config.dtype,
-            weight_dtype=config.weight_dtype,
-            epsilon=config.normalization_layer_epsilon,
-            kernel_axes=("norm",),
-            parameter_memory_host_offload=config.parameter_memory_host_offload,
-        )       
-        
-        if config.trainable_position_size > 0:
-          self.position_embedder = Embed(
-              num_embeddings=config.trainable_position_size,
-              num_features=config.emb_dim,
-              dtype=config.dtype,
-              embedding_init=nn.initializers.normal(stddev=1.0),
-              config=config,
-              mesh=self.mesh,
-              rngs=rngs,
-          )
-           
-        self.dropout = linears.Dropout(rate=config.dropout_rate, rngs=rngs, broadcast_dims=(-2,))
-       
-        self.positional_embedding = PositionalEmbedding(embedding_dims=config.base_emb_dim)
+        with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+            decoder_block_classes = self.get_decoder_layers()
+            
+            self.decoder_norm = self.get_norm_layer(num_features=config.emb_dim, rngs=rngs)(
+                dtype=config.dtype,
+                weight_dtype=config.weight_dtype,
+                epsilon=config.normalization_layer_epsilon,
+                kernel_axes=("norm",),
+                parameter_memory_host_offload=config.parameter_memory_host_offload,
+            )       
+            
+            if config.trainable_position_size > 0:
+              self.position_embedder = Embed(
+                  num_embeddings=config.trainable_position_size,
+                  num_features=config.emb_dim,
+                  dtype=config.dtype,
+                  embedding_init=nn.initializers.normal(stddev=1.0),
+                  config=config,
+                  mesh=self.mesh,
+                  rngs=rngs,
+              )
+              
+            self.dropout = linears.Dropout(rate=config.dropout_rate, rngs=rngs, broadcast_dims=(-2,))
+          
+            self.positional_embedding = PositionalEmbedding(embedding_dims=config.base_emb_dim)
 
-        if not config.logits_via_embedding:
-            self.logits_dense = linears.DenseGeneral(
-              in_features_shape=config.emb_dim,
-              out_features_shape=config.vocab_size,
-              weight_dtype=config.weight_dtype,
-              dtype=jnp.float32 if config.logits_dot_in_fp32 else config.dtype,
-              kernel_axes=("embed", "vocab"),
-              shard_mode=config.shard_mode,
-              matmul_precision=self.config.matmul_precision,
-              parameter_memory_host_offload=config.parameter_memory_host_offload,
-              rngs=rngs
-            )
-
-        self.scanned_layers = None
-        self.is_deepseek = (self.config.decoder_block == DecoderBlockType.DEEPSEEK)
-
-        if self.config.scan_layers:
-            if self.is_deepseek:
-                assert len(decoder_block_classes) == 2
-                dense_cls, moe_cls = decoder_block_classes
-                
-                num_dense = config.first_num_dense_layers
-                self.dense_stack = self._create_scanned_layers(
-                    dense_cls, length=num_dense, rngs=rngs
+            if not config.logits_via_embedding:
+                self.logits_dense = linears.DenseGeneral(
+                  in_features_shape=config.emb_dim,
+                  out_features_shape=config.vocab_size,
+                  weight_dtype=config.weight_dtype,
+                  dtype=jnp.float32 if config.logits_dot_in_fp32 else config.dtype,
+                  kernel_axes=("embed", "vocab"),
+                  shard_mode=config.shard_mode,
+                  matmul_precision=self.config.matmul_precision,
+                  parameter_memory_host_offload=config.parameter_memory_host_offload,
+                  rngs=rngs
                 )
-                
-                num_moe = config.num_decoder_layers - config.first_num_dense_layers
-                self.moe_stack = self._create_scanned_layers(
-                    moe_cls, length=num_moe, rngs=rngs
-                )
+
+            self.scanned_layers = None
+            self.is_deepseek = (self.config.decoder_block == DecoderBlockType.DEEPSEEK)
+
+            if self.config.scan_layers:
+                max_logging.log("Decoder (NNX): scan_layers=True.")
+                if self.is_deepseek:
+                    assert len(decoder_block_classes) == 2
+                    dense_cls, moe_cls = decoder_block_classes
+                    
+                    num_dense = config.first_num_dense_layers
+                    max_logging.log(f"Decoder (NNX): Creating dense stack ({num_dense} layers)")
+                    self.dense_stack = self._create_scanned_layers(
+                        dense_cls, length=num_dense, rngs=rngs
+                    )
+                    
+                    num_moe = config.num_decoder_layers - config.first_num_dense_layers
+                    max_logging.log(f"Decoder (NNX): Creating MoE stack ({num_moe} layers)")
+                    self.moe_stack = self._create_scanned_layers(
+                        moe_cls, length=num_moe, rngs=rngs
+                    )
+                else:
+                    layer_cls = decoder_block_classes[0]
+                    num_layers = config.num_decoder_layers
+                    max_logging.log(f"Decoder (NNX): Creating standard stack ({num_layers} layers)")
+                    self.layers = self._create_scanned_layers(
+                        layer_cls, length=num_layers, rngs=rngs
+                    )
             else:
-                layer_cls = decoder_block_classes[0]
-                num_layers = config.num_decoder_layers
-                self.layers = self._create_scanned_layers(
-                    layer_cls, length=num_layers, rngs=rngs
-                )
-        else:
-            self.layers = nnx.List([])
-            layer = None
-            if self.is_deepseek:
-              for i in range(config.first_num_dense_layers):
-                  self._create_and_register_layer(dense_cls, rngs, "dense_layer", i)
-              for i in range(config.num_decoder_layers - config.first_num_dense_layers):
-                  self._create_and_register_layer(moe_cls, rngs, "moe_layer", i)
-            else:
-                layer_cls = decoder_block_classes[0]
-                for i in range(config.num_decoder_layers):
-                    self._create_and_register_layer(layer_cls, rngs, "layers", i)
+                max_logging.log("Decoder (NNX): scan_layers=False. Creating list of layers.")
+                self.layers = nnx.List([])
+                layer = None
+                if self.is_deepseek:
+                  for i in range(config.first_num_dense_layers):
+                      self._create_and_register_layer(dense_cls, rngs, "dense_layer", i)
+                  for i in range(config.num_decoder_layers - config.first_num_dense_layers):
+                      self._create_and_register_layer(moe_cls, rngs, "moe_layer", i)
+                else:
+                    layer_cls = decoder_block_classes[0]
+                    for i in range(config.num_decoder_layers):
+                        self._create_and_register_layer(layer_cls, rngs, "layers", i)
+        max_logging.log("Decoder (NNX): Initialization complete.")
   
     def _create_and_register_layer(self, layer_cls, rngs, base_name, i):
         attr_name = f"{base_name}_{i}"
@@ -311,18 +318,21 @@ class Decoder(nnx.Module):
 
     def _create_single_layer(self, decoder_layer_class, rngs, **kwargs):
         """Helper to create a single layer (Linen or NNX)."""
-        if issubclass(decoder_layer_class, nnx.Module):
-            return decoder_layer_class(
-                config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=rngs, **kwargs
-            )
-        else:
-            layer_linen = decoder_layer_class(
-                config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, **kwargs
-            )
-            return nnx_wrappers.ToNNX(layer_linen, rngs=rngs)
+        with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+            if issubclass(decoder_layer_class, nnx.Module):
+                return decoder_layer_class(
+                    config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=rngs, **kwargs
+                )
+            else:
+                layer_linen = decoder_layer_class(
+                    config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, **kwargs
+                )
+                return nnx_wrappers.ToNNX(layer_linen, rngs=rngs)
     
     def _create_scanned_layers(self, decoder_layer_class, length: int, rngs: nnx.Rngs, **layer_kwargs):
-        """Creates a VMapped stack of layers, forcing parameter init for Compact modules."""
+        """Creates a VMapped stack of layers using eval_shape to prevents OOM."""
+        max_logging.log(f"Decoder (NNX): _create_scanned_layers start. Length={length}")
+        
         def create_layer_fn(rng):
             layer = decoder_layer_class(
                 config=self.config,
@@ -332,68 +342,94 @@ class Decoder(nnx.Module):
                 rngs=rng,
                 **layer_kwargs
             )
-            
             return layer
-      
-        nnx.split_rngs(rngs, splits=length)
-        layers_vmapped = nnx.vmap(
-          create_layer_fn,
-          in_axes=0,
-          out_axes=0,
-          axis_name="layers",
-          transform_metadata={nnx.PARTITION_NAME: "layers"},
-        )(rngs)
 
-        return layers_vmapped
+        nnx.split_rngs(rngs, splits=length)
+        rng_graphdef, rng_state = nnx.split(rngs)
+
+        scan_axis = self.config.param_scan_axis
+        extended_rules = list(self.config.logical_axis_rules)
+        if not any(r[0] == "layers" for r in extended_rules):
+            extended_rules.append(("layers", scan_axis))
+
+        max_logging.log("Decoder (NNX): Running abstract initialization (eval_shape)...")
+        
+        def abstract_init_fn(r_state):
+             r = nnx.merge(rng_graphdef, r_state)
+             with self.mesh, nn_partitioning.axis_rules(extended_rules):
+                return nnx.vmap(
+                    create_layer_fn,
+                    in_axes=0,
+                    out_axes=0,
+                    axis_name="layers",
+                    transform_metadata={nnx.PARTITION_NAME: "layers"},
+                )(r)
+
+        abstract_layers = jax.eval_shape(abstract_init_fn, rng_state)
+        return abstract_layers
     
     def _apply_layers_sequentially(self, layers, x_in, *args, length: int, **kwargs):
       """Runs the layer stack using nnx.scan."""
+      max_logging.log(f"Decoder (NNX): _apply_layers_sequentially start. Length={length}")
+      
       policy = self.get_remat_policy()
       prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
-      graphdef, params, state = nnx.split(layers, nnx.Param, ...)  # state: the mutable state we carry (KV cache, RNGs, etc.)
       
-      layer_cls = layers.__class__ # Access the underlying class
-      sig = inspect.signature(layer_cls.__call__)
-      
-      # Filter kwargs to only include keys that exist in the layer's signature
-      valid_kwargs = {
-          k: v for k, v in kwargs.items() 
-          if k in sig.parameters or 'kwargs' in sig.parameters
-      }
+      scan_axis = self.config.param_scan_axis
+      extended_rules = list(self.config.logical_axis_rules)
+      if not any(r[0] == "layers" for r in extended_rules):
+          extended_rules.append(("layers", scan_axis))
 
-      def layer_fn(carry, scanned_vars):
-          # Unpack the sliced variables for THIS layer
-          current_params, current_state = scanned_vars
+      with self.mesh, nn_partitioning.axis_rules(extended_rules):
+          graphdef, params, state = nnx.split(layers, nnx.Param, ...) 
           
-          # Merge using the SLICED state
-          layer = nnx.merge(graphdef, current_params, current_state)
+          # ----------------------------------------------------------------------
+          # FIX: Re-inject concrete RNG state if the current state is Abstract
+          # ----------------------------------------------------------------------
+          # Check if state contains abstract values (ShapeDtypeStruct)
+          is_abstract = any(isinstance(x, jax.ShapeDtypeStruct) for x in jax.tree_util.tree_leaves(state))
           
-          # Run the layer (Filter kwargs if using the solution from previous turn)
-          layer_out = layer(carry, *args, **valid_kwargs)
-          
-          new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-          
-          # Extract the updated state to return it
-          # _, new_current_state = nnx.split(layer, nnx.Param, ...)
-          new_current_state = nnx.state(layer)
-          return new_carry, new_current_state
+          if is_abstract:
+              max_logging.log("Decoder (NNX): Detected Abstract RNG state. Re-generating concrete RNGs from fresh seed.")
+              
+              # We re-perform the split logic using the fresh 'self.rngs' which ToLinen populated
+              # The structure of 'state' in DecoderLayer (specifically Llama2) is generally just RngState.
+              # If there are other states (like BatchStats), they would be overwritten by self.variables anyway.
+              # But 'state' here comes from 'layers', which was abstract.
+              
+              # Split the fresh root keys
+              nnx.split_rngs(self.rngs, splits=length)
+              # Extract the new concrete state representing the stack
+              _, concrete_rng_state = nnx.split(self.rngs)
+              
+              # Replace the abstract state with the concrete one
+              state = concrete_rng_state
+          # ----------------------------------------------------------------------
 
-      """ 
-      def layer_fn(carry, layer_params):
-          layer = nnx.merge(graphdef, layer_params, state)
-          layer_out = layer(carry, *args, **valid_kwargs)
-          new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-          new_layer_state = nnx.state(layer)
-          return new_carry, new_layer_state
-      """
-      layer_fn = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
-      
-      final_carry, scanned_state = jax.lax.scan(
-          layer_fn,
-          x_in,
-          (params, state)
-      )
-      nnx.update(layers, scanned_state)
+          layer_cls = layers.__class__ 
+          sig = inspect.signature(layer_cls.__call__)
+          
+          valid_kwargs = {
+              k: v for k, v in kwargs.items() 
+              if k in sig.parameters or 'kwargs' in sig.parameters
+          }
+
+          def layer_fn(carry, scanned_vars):
+              current_params, current_state = scanned_vars
+              layer = nnx.merge(graphdef, current_params, current_state)
+              layer_out = layer(carry, *args, **valid_kwargs)
+              new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+              new_current_state = nnx.state(layer)
+              return new_carry, new_current_state
+
+          layer_fn = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
+          
+          final_carry, scanned_state = jax.lax.scan(
+              layer_fn,
+              x_in,
+              (params, state)
+          )
+          nnx.update(layers, scanned_state)
 
       return final_carry, None
 
@@ -751,8 +787,8 @@ def decoder_as_linen(
       rngs=rngs,
       quant=quant,
       name="decoder",
+      # CRITICAL: abstract_init=True to prevent OOM
       abstract_init=False,
       metadata_fn=initializers.variable_to_logically_partitioned,
   )
   return module
-
