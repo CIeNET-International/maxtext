@@ -235,76 +235,73 @@ class Decoder(nnx.Module):
     self.quant = quant
     self.model_mode = model_mode
     self.rngs = rngs
+    decoder_block_classes = self.get_decoder_layers()
 
-    with self.mesh, nn.partitioning.axis_rules(self.config.logical_axis_rules):
+    self.decoder_norm = self.get_norm_layer(num_features=config.emb_dim, rngs=rngs)(
+        dtype=config.dtype,
+        weight_dtype=config.weight_dtype,
+        epsilon=config.normalization_layer_epsilon,
+        kernel_axes=("norm",),
+        parameter_memory_host_offload=config.parameter_memory_host_offload,
+    )
 
-      decoder_block_classes = self.get_decoder_layers()
-
-      self.decoder_norm = self.get_norm_layer(num_features=config.emb_dim, rngs=rngs)(
+    if config.trainable_position_size > 0:
+      self.position_embedder = Embed(
+          num_embeddings=config.trainable_position_size,
+          num_features=config.emb_dim,
           dtype=config.dtype,
-          weight_dtype=config.weight_dtype,
-          epsilon=config.normalization_layer_epsilon,
-          kernel_axes=("norm",),
-          parameter_memory_host_offload=config.parameter_memory_host_offload,
+          embedding_init=nn.initializers.normal(stddev=1.0),
+          config=config,
+          mesh=self.mesh,
+          rngs=rngs,
       )
 
-      if config.trainable_position_size > 0:
-        self.position_embedder = Embed(
-            num_embeddings=config.trainable_position_size,
-            num_features=config.emb_dim,
-            dtype=config.dtype,
-            embedding_init=nn.initializers.normal(stddev=1.0),
-            config=config,
-            mesh=self.mesh,
-            rngs=rngs,
-        )
+    self.dropout = linears.Dropout(rate=config.dropout_rate, rngs=rngs, broadcast_dims=(-2,))
 
-      self.dropout = linears.Dropout(rate=config.dropout_rate, rngs=rngs, broadcast_dims=(-2,))
+    self.positional_embedding = PositionalEmbedding(embedding_dims=config.base_emb_dim)
 
-      self.positional_embedding = PositionalEmbedding(embedding_dims=config.base_emb_dim)
+    if not config.logits_via_embedding:
+      self.logits_dense = linears.DenseGeneral(
+          in_features_shape=config.emb_dim,
+          out_features_shape=config.vocab_size,
+          weight_dtype=config.weight_dtype,
+          dtype=jnp.float32 if config.logits_dot_in_fp32 else config.dtype,
+          kernel_axes=("embed", "vocab"),
+          shard_mode=config.shard_mode,
+          matmul_precision=self.config.matmul_precision,
+          parameter_memory_host_offload=config.parameter_memory_host_offload,
+          rngs=rngs,
+      )
 
-      if not config.logits_via_embedding:
-        self.logits_dense = linears.DenseGeneral(
-            in_features_shape=config.emb_dim,
-            out_features_shape=config.vocab_size,
-            weight_dtype=config.weight_dtype,
-            dtype=jnp.float32 if config.logits_dot_in_fp32 else config.dtype,
-            kernel_axes=("embed", "vocab"),
-            shard_mode=config.shard_mode,
-            matmul_precision=self.config.matmul_precision,
-            parameter_memory_host_offload=config.parameter_memory_host_offload,
-            rngs=rngs,
-        )
+    self.scanned_layers = None
+    self.is_deepseek = self.config.decoder_block == DecoderBlockType.DEEPSEEK
 
-      self.scanned_layers = None
-      self.is_deepseek = self.config.decoder_block == DecoderBlockType.DEEPSEEK
+    if self.config.scan_layers:
+      if self.is_deepseek:
+        assert len(decoder_block_classes) == 2
+        dense_cls, moe_cls = decoder_block_classes
 
-      if self.config.scan_layers:
-        if self.is_deepseek:
-          assert len(decoder_block_classes) == 2
-          dense_cls, moe_cls = decoder_block_classes
+        num_dense = config.first_num_dense_layers
+        self.dense_stack = self._create_scanned_layers(dense_cls, length=num_dense, rngs=rngs)
 
-          num_dense = config.first_num_dense_layers
-          self.dense_stack = self._create_scanned_layers(dense_cls, length=num_dense, rngs=rngs)
-
-          num_moe = config.num_decoder_layers - config.first_num_dense_layers
-          self.moe_stack = self._create_scanned_layers(moe_cls, length=num_moe, rngs=rngs)
-        else:
-          layer_cls = decoder_block_classes[0]
-          num_layers = config.num_decoder_layers
-          self.layers = self._create_scanned_layers(layer_cls, length=num_layers, rngs=rngs)
+        num_moe = config.num_decoder_layers - config.first_num_dense_layers
+        self.moe_stack = self._create_scanned_layers(moe_cls, length=num_moe, rngs=rngs)
       else:
-        self.layers = nnx.List([])
-        if self.is_deepseek:
-          dense_cls, moe_cls = decoder_block_classes
-          for i in range(config.first_num_dense_layers):
-            self._create_and_register_layer(dense_cls, rngs, "dense_layer", i)
-          for i in range(config.num_decoder_layers - config.first_num_dense_layers):
-            self._create_and_register_layer(moe_cls, rngs, "moe_layer", i)
-        else:
-          layer_cls = decoder_block_classes[0]
-          for i in range(config.num_decoder_layers):
-            self._create_and_register_layer(layer_cls, rngs, "layers", i)
+        layer_cls = decoder_block_classes[0]
+        num_layers = config.num_decoder_layers
+        self.layers = self._create_scanned_layers(layer_cls, length=num_layers, rngs=rngs)
+    else:
+      self.layers = nnx.List([])
+      if self.is_deepseek:
+        dense_cls, moe_cls = decoder_block_classes
+        for i in range(config.first_num_dense_layers):
+          self._create_and_register_layer(dense_cls, rngs, "dense_layer", i)
+        for i in range(config.num_decoder_layers - config.first_num_dense_layers):
+          self._create_and_register_layer(moe_cls, rngs, "moe_layer", i)
+      else:
+        layer_cls = decoder_block_classes[0]
+        for i in range(config.num_decoder_layers):
+          self._create_and_register_layer(layer_cls, rngs, "layers", i)
 
   def _create_and_register_layer(self, layer_cls, rngs, base_name, i):
     layer = self._create_single_layer(layer_cls, rngs)
@@ -477,7 +474,17 @@ class Decoder(nnx.Module):
       elif cfg.remat_policy == "minimal_offloaded":
         policy = jax.checkpoint_policies.save_and_offload_only_these_names(
             [],
-            ["query_proj", "value_proj", "key_proj", "qkv_proj", "out_proj", "mlpwi_0", "mlpwi_1", "mlpwi", "mlpwo"],
+            [
+                "query_proj",
+                "value_proj",
+                "key_proj",
+                "qkv_proj",
+                "out_proj",
+                "mlpwi_0",
+                "mlpwi_1",
+                "mlpwi",
+                "mlpwo",
+            ],
             "device",
             "pinned_host",
         )
@@ -580,77 +587,78 @@ class Decoder(nnx.Module):
   ):
     cfg = self.config
 
-    # Prepare logical axis rules context for FSDP sharding of activations
-    logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
+    y = self._apply_embedding(
+        shared_embedding,
+        decoder_input_tokens,
+        decoder_positions,
+        deterministic,
+        model_mode,
+        image_embeddings,
+        bidirectional_mask,
+        image_masks,
+    )
+    layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
+    layer_kwargs = {
+        "previous_chunk": previous_chunk,
+        "page_state": page_state,
+        "slot": slot,
+        "attention_metadata": attention_metadata,
+    }
+    if cfg.decoder_block == DecoderBlockType.GEMMA3:
+      layer_kwargs["bidirectional_mask"] = bidirectional_mask
 
-    with self.mesh, nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp):
-      y = self._apply_embedding(
-          shared_embedding,
-          decoder_input_tokens,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          image_embeddings,
-          bidirectional_mask,
-          image_masks,
-      )
-      layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
-      layer_kwargs = {
-          "previous_chunk": previous_chunk,
-          "page_state": page_state,
-          "slot": slot,
-          "attention_metadata": attention_metadata,
-      }
-      if cfg.decoder_block == DecoderBlockType.GEMMA3:
-        layer_kwargs["bidirectional_mask"] = bidirectional_mask
-
-      if cfg.scan_layers:
-        if self.is_deepseek:
-          y, _ = self._apply_layers_sequentially(
-              self.dense_stack, y, *layer_args, length=cfg.first_num_dense_layers, **layer_kwargs
+    if cfg.scan_layers:
+      if self.is_deepseek:
+        y, _ = self._apply_layers_sequentially(
+            self.dense_stack, y, *layer_args, length=cfg.first_num_dense_layers, **layer_kwargs
+        )
+        num_moe = cfg.num_decoder_layers - cfg.first_num_dense_layers
+        y, _ = self._apply_layers_sequentially(self.moe_stack, y, *layer_args, length=num_moe, **layer_kwargs)
+      else:
+        scan_metadata = {}
+        if cfg.decoder_block == DecoderBlockType.LLAMA4:
+          scan_metadata["is_nope_layer"] = jnp.array(
+              [llama4.determine_is_nope_layer(i, cfg.nope_layer_interval) for i in range(cfg.num_decoder_layers)]
           )
-          num_moe = cfg.num_decoder_layers - cfg.first_num_dense_layers
-          y, _ = self._apply_layers_sequentially(self.moe_stack, y, *layer_args, length=num_moe, **layer_kwargs)
+          scan_metadata["is_moe_layer"] = jnp.array(
+              [llama4.determine_is_moe_layer(i, cfg.interleave_moe_layer_step) for i in range(cfg.num_decoder_layers)]
+          )
+        elif cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
+          scan_metadata["layer_idx"] = jnp.arange(cfg.num_decoder_layers)
+        y, _ = self._apply_layers_sequentially(
+            self.layers,
+            y,
+            *layer_args,
+            length=cfg.num_decoder_layers,
+            scan_metadata=scan_metadata,
+            **layer_kwargs,
+        )
+    else:
+      for i, layer in enumerate(self.layers):
+        kv_cache = kv_caches[i] if kv_caches is not None else None
+        step_kwargs = layer_kwargs.copy()
+        if cfg.decoder_block == DecoderBlockType.LLAMA4:
+          step_kwargs["is_nope_layer"] = llama4.determine_is_nope_layer(i, cfg.nope_layer_interval)
+          step_kwargs["is_moe_layer"] = llama4.determine_is_moe_layer(i, cfg.interleave_moe_layer_step)
+        if cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
+          step_kwargs["layer_idx"] = i
+        out = layer(y, *layer_args, kv_cache=kv_cache, **step_kwargs)
+        if isinstance(out, tuple):
+          y, kv_cache_out = out[0], out[1] if len(out) > 1 else None
         else:
-          scan_metadata = {}
-          if cfg.decoder_block == DecoderBlockType.LLAMA4:
-            scan_metadata["is_nope_layer"] = jnp.array(
-                [llama4.determine_is_nope_layer(i, cfg.nope_layer_interval) for i in range(cfg.num_decoder_layers)]
-            )
-            scan_metadata["is_moe_layer"] = jnp.array(
-                [llama4.determine_is_moe_layer(i, cfg.interleave_moe_layer_step) for i in range(cfg.num_decoder_layers)]
-            )
-          elif cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
-            scan_metadata["layer_idx"] = jnp.arange(cfg.num_decoder_layers)
-          y, _ = self._apply_layers_sequentially(
-              self.layers, y, *layer_args, length=cfg.num_decoder_layers, scan_metadata=scan_metadata, **layer_kwargs
-          )
-      else:
-        for i, layer in enumerate(self.layers):
-          kv_cache = kv_caches[i] if kv_caches is not None else None
-          step_kwargs = layer_kwargs.copy()
-          if cfg.decoder_block == DecoderBlockType.LLAMA4:
-            step_kwargs["is_nope_layer"] = llama4.determine_is_nope_layer(i, cfg.nope_layer_interval)
-            step_kwargs["is_moe_layer"] = llama4.determine_is_moe_layer(i, cfg.interleave_moe_layer_step)
-          if cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
-            step_kwargs["layer_idx"] = i
-          out = layer(y, *layer_args, kv_cache=kv_cache, **step_kwargs)
-          if isinstance(out, tuple):
-            y, kv_cache_out = out[0], out[1] if len(out) > 1 else None
-          else:
-            y, kv_cache_out = out, None
-          if kv_caches is not None:
-            kv_caches[i] = kv_cache_out
+          y, kv_cache_out = out, None
+        if kv_caches is not None:
+          kv_caches[i] = kv_cache_out
 
-      assert isinstance(y, jax.Array)
-      hidden_state = y
-      if cfg.attention == "vllm_rpa":
-        _ = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
-      if cfg.attention == "vllm_rpa" or (cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN):
-        logits = None
-      else:
-        logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
-      return logits, hidden_state, kv_caches
+    assert isinstance(y, jax.Array)
+    hidden_state = y
+    if cfg.attention == "vllm_rpa":
+      _ = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
+    if cfg.attention == "vllm_rpa" or (cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN):
+      logits = None
+    else:
+      logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
+    return logits, hidden_state, kv_caches
 
 
 def decoder_as_linen(config: Config, mesh: Mesh, rngs: nnx.Rngs, model_mode: str, quant: None | Quant = None):
