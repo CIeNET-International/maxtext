@@ -765,33 +765,31 @@ class NNXDecoder(nnx.Module):
     attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
     scan_length = cfg.num_decoder_layers // attention_pattern_length
 
-    layer_call_kwargs = {"bidirectional_mask": bidirectional_mask}
+    layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
+    layer_kwargs = {"bidirectional_mask": bidirectional_mask}
 
     # Apply the main scan over the full blocks
     if scan_length > 0:
-      broadcast_args = (
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
+      y, _ = self._apply_layers_sequentially(
+        self.layers, y, *layer_args, length=scan_length, **layer_kwargs
       )
-      y, _ = self.layers(y, *broadcast_args, **layer_call_kwargs)
 
     # Apply any remaining layers that did not fit into a full scanned block
     num_remaining_layers = cfg.num_decoder_layers % attention_pattern_length
     if num_remaining_layers > 0:
-      # We name the remainder block with a 'remainder' suffix to avoid parameter name collisions
+        # We name the remainder block with a 'remainder' suffix to avoid parameter name collisions
       y, _ = self.layers_remainder(
-          y,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          previous_chunk=previous_chunk,
-          page_state=page_state,
-          slot=slot,
-          **layer_call_kwargs,
-      )
+        y,
+        decoder_segment_ids,
+        decoder_positions,
+        deterministic,
+        model_mode,
+        previous_chunk=previous_chunk,
+        page_state=page_state,
+        slot=slot,
+        **layer_kwargs
+      ) 
+
     return y
 
 
