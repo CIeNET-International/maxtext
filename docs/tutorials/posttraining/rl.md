@@ -142,10 +142,25 @@ export MAXTEXT_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-bucke
 
 ### Option 2: Converting from a Hugging Face checkpoint
 
-Refer the steps in [Hugging Face to MaxText](../../guides/checkpointing_solutions/convert_checkpoint.md#hugging-face-to-maxtext) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Similar as Option 1, you can set the following environment and move on.
+Otherwise, you can convert a Hugging Face checkpoint to MaxText format using the
+`src/MaxText/utils/ckpt_conversion/to_maxtext.py` script. This is useful if you
+have a pre-trained model from Hugging Face that you want to use with MaxText.
+
+First, ensure you have the necessary dependencies installed. Then, run the
+conversion script on a CPU machine. For large models, it is recommended to use
+the `--lazy_load_tensors` flag to reduce memory usage during conversion. This
+command will download the Hugging Face model and convert it to the MaxText
+format, saving it to the specified GCS bucket.
 
 ```bash
 export MAXTEXT_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-bucket/my-model-checkpoint/0/items
+```
+
+The converted checkpoint will be saved at the following location. Set this
+environment variable to use it in the following GRPO/GSPO training sessions:
+
+```bash
+export MAXTEXT_CKPT_PATH=${BASE_OUTPUT_DIRECTORY}/${RUN_NAME}/0/items
 ```
 
 ## Run GRPO

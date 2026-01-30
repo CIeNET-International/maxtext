@@ -70,7 +70,6 @@ class DeepSeekGenericLayer(nnx.Module):
 
     self.out_sharding = create_sharding(self.mesh, self.logical_axis_names)
     self.mlp_intermediate_sharding = create_sharding(self.mesh, self.mlp_logical_axis_names)
-
     self.pre_self_attention_layer_norm = RMSNorm(
         num_features=self.dummy_inputs_shape[-1],
         dtype=self.config.dtype,
@@ -140,6 +139,7 @@ class DeepSeekGenericLayer(nnx.Module):
     return self.with_logical_constraint(self.dropout(x, deterministic=deterministic))
 
   def pre_attention_norm_op(self, x):
+    breakpoint()
     return self.with_logical_constraint(self.pre_self_attention_layer_norm(x))
 
   def post_attention_norm_op(self, x):
