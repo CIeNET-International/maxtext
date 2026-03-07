@@ -102,7 +102,7 @@ class GlobalRMSNorm(RMSNorm):
     return y_flat.reshape(input_shape)
 
 
-def Qwen3NextRMSNorm(num_features: int, eps: float, dtype: DType, weight_dtype: DType, *, rngs: nnx.Rngs):
+def Qwen3NextRMSNorm(num_features: int, eps: float, dtype: DType, weight_dtype: DType, shard_mode: ShardMode, *, rngs: nnx.Rngs):
   """
   Used for input and post attention layernorms
   in Qwen3NextDecoderLayer.
@@ -118,6 +118,7 @@ def Qwen3NextRMSNorm(num_features: int, eps: float, dtype: DType, weight_dtype: 
           epsilon=eps,
           dtype=dtype,
           weight_dtype=weight_dtype,
+          shard_mode=shard_mode,
           scale_init=linen_initializers.zeros,
           scale_offset=1.0,
           rngs=rngs,

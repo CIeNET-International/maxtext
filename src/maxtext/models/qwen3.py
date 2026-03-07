@@ -965,6 +965,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
         eps=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
+        shard_mode=cfg.shard_mode,
         rngs=rngs,
     )
 
@@ -990,6 +991,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
         eps=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
+        shard_mode=cfg.shard_mode,
         rngs=rngs,
     )
 

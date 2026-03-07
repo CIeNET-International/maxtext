@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.configs import pyconfig
+from maxtext.common.common_types import ShardMode
 from maxtext.layers import normalizations
 from maxtext.layers.normalizations import Qwen3NextRMSNorm, Qwen3NextRMSNormGated
 from maxtext.models import qwen3
@@ -1076,6 +1077,7 @@ class TestQwen3Next(unittest.TestCase):
         eps=self.cfg.normalization_layer_epsilon,
         dtype=jnp.float32,
         weight_dtype=jnp.float32,
+        shard_mode=ShardMode.AUTO
         rngs=self.nnx_rngs,
     )
 
