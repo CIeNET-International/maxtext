@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 from maxtext.configs import pyconfig
 from maxtext.utils import maxtext_utils
+from maxtext.utils.sharding import clear_input_shardings_dump
 # import optax
 
 from maxtext.layers import quantizations
@@ -124,6 +125,8 @@ def test_sharding_dump_for_model(model_name: str, topology: str, num_slice: str)
       f"compile_topology={topology}",
       f"compile_topology_num_slices={num_slice}",
       f"model_name={model_name}",
+      "log_config=false",
+      "debug_sharding=true",  # for input sharding dump
   ]
 
   root_dir = "tests/utils/sharding_info"
@@ -146,7 +149,10 @@ def test_sharding_dump_for_model(model_name: str, topology: str, num_slice: str)
   config = pyconfig.initialize(params)
   validate_config(config)
 
+  clear_input_shardings_dump()
   topology_mesh = get_topology_mesh(config)
+  learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
+  optimizers.get_optimizer(config, learning_rate_schedule)
   shaped_train_args, _, state_mesh_shardings, logical_shardings, _ = get_shaped_inputs(topology_mesh, config)
 
   error_messages = []
@@ -183,6 +189,9 @@ def test_sharding_dump_for_model(model_name: str, topology: str, num_slice: str)
   # calculate checksum
   actual_input_sum = compute_checksum(actual_input)
   expected_input_sum = compute_checksum(expected_input)
+
+  print(f"actual_input_sum {actual_input_sum}")
+  print(f"expected_input_sum {expected_input_sum}")
   input_match = actual_input_sum == expected_input_sum
 
   if not input_match:
