@@ -29,6 +29,7 @@ from maxtext.models import models
 from maxtext.optimizers import optimizers
 from maxtext.trainers.pre_train.train_compile import get_shaped_inputs, get_topology_mesh, validate_config
 from tests.utils.sharding_dump import TEST_CASES, load_json, input_sharding_to_json, named_shardings_to_json, partition_specs_to_json
+from tests.utils.sharding_dump import save_json
 from tests.utils.test_helpers import get_test_config_path
 import pytest
 
@@ -185,6 +186,8 @@ def test_sharding_dump_for_model(model_name: str, topology: str, num_slice: str)
 
   # 3. Compare Input Shardings
   actual_input = input_sharding_to_json()
+  json_path_input = os.path.join(base_path, "input_shardings_actual.json")
+  save_json(json_path_input , actual_input)
   expected_input = load_json(input_json_path)
   # calculate checksum
   actual_input_sum = compute_checksum(actual_input)

@@ -449,7 +449,9 @@ def main(argv: Sequence[str]) -> None:
   # Input
   input_shardings = input_sharding_to_json()
 
-  print(f"Got {len(named_shardings)} Physical entries and {len(logical_shardings)} Logical entries.")
+  print(f"Got {len(named_shardings)} Physical entries\n"
+        f"    {len(logical_shardings)} Logical entries\n"
+        f"    {len(input_shardings)} Input entries\n")
 
   # 2. Save New Output (Overwrite)
   print(f"\nSaving updated shardings to {base_path}...")
