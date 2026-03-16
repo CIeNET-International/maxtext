@@ -311,7 +311,7 @@ class NNXDecoder(nnx.Module):
 
         num_moe = config.num_decoder_layers - config.first_num_dense_layers
 
-        self.moe_layer = self._create_scanned_layers(moe_cls, length=num_moe, rngs=rngs)
+        self.moe_layers = self._create_scanned_layers(moe_cls, length=num_moe, rngs=rngs)
       elif self.is_gemma3:
         attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
         scan_length = config.num_decoder_layers // attention_pattern_length
@@ -337,7 +337,11 @@ class NNXDecoder(nnx.Module):
               "interleave_moe_layer_step": self.config.interleave_moe_layer_step,
           }
 
-        self.layers = self._create_scanned_layers(layer_cls, length=num_layers, rngs=rngs, **layer_kwargs)
+        if num_layers > 0:
+          self.layers = self._create_scanned_layers(layer_cls, length=num_layers, rngs=rngs, **layer_kwargs)
+        else:
+          self.layers = nnx.List([])
+   
     else:
       self.layers = nnx.List([])
 
@@ -437,15 +441,11 @@ class NNXDecoder(nnx.Module):
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
     graphdef, params, state = nnx.split(
         layers, nnx.Param, ...
-    )
+    )  # state: the mutable state we carry (KV cache, RNGs, etc.)
 
     scan_axis = self.config.param_scan_axis
     if scan_axis != 0:
       params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params)
-
-    layer_cls = layers.__class__
-    sig = inspect.signature(layer_cls.__call__)
-    valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters or "kwargs" in sig.parameters}
 
     layer_cls = layers.__class__
     sig = inspect.signature(layer_cls.__call__)
@@ -458,10 +458,9 @@ class NNXDecoder(nnx.Module):
         current_params = jax.tree.map(lambda x: jax.device_put(x, max_utils.device_space()), current_params)
 
       layer = nnx.merge(graphdef, current_params, current_state)
-
       layer_out = layer(carry, *args, **valid_kwargs)
-
       new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+      new_current_state = nnx.state(layer)
 
       return new_carry, new_current_state
 
@@ -823,43 +822,41 @@ class NNXDecoder(nnx.Module):
     graphdef, state = nnx.split(layer_stack)
     params, rest = state.split(nnx.Param, ...)
     scan_axis = self.config.param_scan_axis
-    
+
     # Helper to generate N-dimensional basic slices (e.g., x[:, idx, :])
     def _extract_slice(x, idx, axis):
       slices = tuple(idx if i == axis else slice(None) for i in range(x.ndim))
       return x[slices]
-    
+
     # Slice using native indexing instead of jnp.take
     sliced_params = jax.tree.map(lambda x: _extract_slice(x, current_idx, scan_axis), params)
     sliced_rest = jax.tree.map(lambda x: _extract_slice(x, current_idx, 0), rest)
-    
+
     single_layer = nnx.merge(graphdef, sliced_params, sliced_rest)
-    
+
     # Run the single layer
     out = single_layer(
-        y, *args, 
-        decoder_input_tokens=kwargs.get("decoder_input_tokens"), 
-        **kwargs.get("layer_kwargs", {})
+        y, *args, decoder_input_tokens=kwargs.get("decoder_input_tokens"), **kwargs.get("layer_kwargs", {})
     )
     y = out[0] if isinstance(out, tuple) else out
-    
+
     # Re-merge the updated state back into the specific slice of the stack
     new_state = nnx.state(single_layer)
     new_params, new_rest = new_state.split(nnx.Param, ...)
-    
+
     updated_params = jax.tree.map(
         lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(
             s, jnp.expand_dims(new_s, axis=scan_axis), current_idx, axis=scan_axis
-        ), 
-        params, new_params
+        ),
+        params,
+        new_params,
     )
     updated_rest = jax.tree.map(
-        lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(
-            s, jnp.expand_dims(new_s, axis=0), current_idx, axis=0
-        ), 
-        rest, new_rest
+        lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(s, jnp.expand_dims(new_s, axis=0), current_idx, axis=0),
+        rest,
+        new_rest,
     )
-    
+
     nnx.update(layer_stack, updated_params, updated_rest)
     return y
 
@@ -870,38 +867,32 @@ class NNXDecoder(nnx.Module):
       graphdef, state = nnx.split(layer_stack)
       params, rest = state.split(nnx.Param, ...)
       scan_axis = self.config.param_scan_axis
-      
+
       # Slice the chunk state along the correct axes
       chunk_params = jax.tree.map(
-          lambda x: jax.lax.dynamic_slice_in_dim(x, current_idx, scan_length, axis=scan_axis), 
-          params
+          lambda x: jax.lax.dynamic_slice_in_dim(x, current_idx, scan_length, axis=scan_axis), params
       )
-      chunk_rest = jax.tree.map(
-          lambda x: jax.lax.dynamic_slice_in_dim(x, current_idx, scan_length, axis=0), 
-          rest
-      )
+      chunk_rest = jax.tree.map(lambda x: jax.lax.dynamic_slice_in_dim(x, current_idx, scan_length, axis=0), rest)
       chunk_stack = nnx.merge(graphdef, chunk_params, chunk_rest)
-      
+
       # Apply sequentially
       y, chunk_stack = self._apply_layers_sequentially(
           chunk_stack, y, *args, length=scan_length, **kwargs.get("layer_kwargs", {})
       )
-      
+
       # Update the original stack state
       new_state = nnx.state(chunk_stack)
       new_params, new_rest = new_state.split(nnx.Param, ...)
-      
+
       updated_params = jax.tree.map(
-          lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(s, new_s, current_idx, axis=scan_axis),
-          params, new_params
+          lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(s, new_s, current_idx, axis=scan_axis), params, new_params
       )
       updated_rest = jax.tree.map(
-          lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(s, new_s, current_idx, axis=0),
-          rest, new_rest
+          lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(s, new_s, current_idx, axis=0), rest, new_rest
       )
-      
+
       nnx.update(layer_stack, updated_params, updated_rest)
-        
+
     return y
 
   def _apply_interleaved_scanned_layers(self, y, layer_stack, start_idx, end_idx, engram_indices, *args, **kwargs):
@@ -990,7 +981,7 @@ class NNXDecoder(nnx.Module):
 
           y = self._apply_interleaved_scanned_layers(
               y,
-              self.moe_layer,
+              self.moe_layers,
               0,
               (cfg.num_decoder_layers - cfg.first_num_dense_layers),
               [e - cfg.first_num_dense_layers for e in cfg.engram_layers],
@@ -1007,7 +998,7 @@ class NNXDecoder(nnx.Module):
           if cfg.use_batch_split_schedule:
             policy = self.get_remat_policy()
 
-            mock_params = self._build_linen_params(self.moe_layer)
+            mock_params = self._build_linen_params(self.moe_layers)
 
             y = deepseek_batchsplit.scan_batch_split_layers(
                 y,
@@ -1021,8 +1012,8 @@ class NNXDecoder(nnx.Module):
                 policy=policy,
             )
           else:
-            y, self.moe_layer = self._apply_layers_sequentially(
-                self.moe_layer, y, *layer_args, length=num_moe, **layer_kwargs
+            y, self.moe_layers = self._apply_layers_sequentially(
+                self.moe_layers, y, *layer_args, length=num_moe, **layer_kwargs
             )
       elif self.is_gemma3:
         y = self._apply_gemma3_scanned_blocks(
@@ -1038,7 +1029,8 @@ class NNXDecoder(nnx.Module):
         )
       else:
         scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
-        y, self.layers = self._apply_layers_sequentially(self.layers, y, *layer_args, length=scan_length, **layer_kwargs)
+        if scan_length > 0:
+          y, self.layers = self._apply_layers_sequentially(self.layers, y, *layer_args, length=scan_length, **layer_kwargs)
     else:
       prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
 
@@ -1056,7 +1048,16 @@ class NNXDecoder(nnx.Module):
 
       for lyr, layer in enumerate(self.layers):
         graphdef, state = nnx.split(layer)
-        kv_cache = kv_caches[lyr] if kv_caches is not None else None
+        if kv_caches is not None:
+          if cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
+            if (lyr + 1) % cfg.inhomogeneous_layer_cycle_interval == 0:
+              kv_cache = (kv_caches["key_cache"][lyr], kv_caches["value_cache"][lyr])
+            else:
+              kv_cache = None
+          else:
+            kv_cache = kv_caches[lyr]
+        else:
+          kv_cache = None
 
         input_tokens = decoder_input_tokens if cfg.engram_layers else None
         if input_tokens is not None:
@@ -1066,7 +1067,12 @@ class NNXDecoder(nnx.Module):
         nnx.update(layer, new_state)
 
         if kv_caches is not None and kv_cache is not None:
-          kv_caches[lyr] = kv_cache
+          if cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
+            if (lyr + 1) % cfg.inhomogeneous_layer_cycle_interval == 0:
+              kv_caches["key_cache"][lyr] = kv_cache[0]
+              kv_caches["value_cache"][lyr] = kv_cache[1]
+          else:
+            kv_caches[lyr] = kv_cache
 
         if deepstack_visual_embeds is not None and lyr < len(deepstack_visual_embeds):
           visual_embeds = deepstack_visual_embeds[lyr]
@@ -1088,7 +1094,7 @@ class NNXDecoder(nnx.Module):
 
     # When vocab tiling is enabled in training mode, full logits won't generate to reduce memory
     # Instead, we keep track on the hidden states, which has smaller size compared to full logits
-    if cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN:
+    elif cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN:
       logits = None
       self.sow(nnx.Intermediate, "hidden_states", hidden_state)
 
