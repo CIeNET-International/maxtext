@@ -38,6 +38,7 @@ _ACTIVATION_SHARDINGS_DUMP = []
 
 def clear_input_shardings_dump():
   """Clear the input shardings dump"""
+  max_logging.info(f"clear _ACTIVATION_SHARDINGS_DUMP len = {len(_ACTIVATION_SHARDINGS_DUMP)}")
   _ACTIVATION_SHARDINGS_DUMP.clear()
 
 
