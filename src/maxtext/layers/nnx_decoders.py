@@ -393,6 +393,9 @@ class NNXDecoder(nnx.Module):
   def _create_scanned_layers(self, decoder_layer_class, length: int, rngs: nnx.Rngs, **layer_kwargs):
     """Creates a VMapped stack of layers, forcing parameter init for Compact modules."""
 
+    if length == 0:
+      return nnx.List([])
+
     def create_layer_fn(rng):
       layer = decoder_layer_class(
           config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=rng, **layer_kwargs
