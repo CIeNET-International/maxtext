@@ -325,7 +325,6 @@ class NNXDecoder(nnx.Module):
           self.layers = self._create_scanned_layers(
               RemattedGemma3Block, length=scan_length, metadata_axis_name="layers", rngs=rngs, **layer_kwargs
           )
-          self.layers = self._create_scanned_layers(RemattedGemma3Block, length=scan_length, rngs=rngs, **layer_kwargs)
         self.layers_remainder = RemattedGemma3Block(
             config=self.config, mesh=mesh, quant=self.quant, model_mode=self.model_mode, **rem_layer_kwargs, rngs=rngs
         )  # pytype: disable=wrong-keyword-args
