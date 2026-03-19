@@ -322,6 +322,9 @@ class NNXDecoder(nnx.Module):
         RemattedGemma3Block = gemma3.Gemma3ScannableBlock
 
         if scan_length > 0:
+          self.layers = self._create_scanned_layers(
+              RemattedGemma3Block, length=scan_length, metadata_axis_name="layers", rngs=rngs, **layer_kwargs
+          )
           self.layers = self._create_scanned_layers(RemattedGemma3Block, length=scan_length, rngs=rngs, **layer_kwargs)
         self.layers_remainder = RemattedGemma3Block(
             config=self.config, mesh=mesh, quant=self.quant, model_mode=self.model_mode, **rem_layer_kwargs, rngs=rngs
@@ -337,7 +340,9 @@ class NNXDecoder(nnx.Module):
           }
 
         if num_layers > 0:
-          self.layers = self._create_scanned_layers(layer_cls, length=num_layers, rngs=rngs, **layer_kwargs)
+          self.layers = self._create_scanned_layers(
+              layer_cls, length=num_layers, metadata_axis_name="layers", rngs=rngs, **layer_kwargs
+          )        
         else:
           self.layers = nnx.List([])
    
