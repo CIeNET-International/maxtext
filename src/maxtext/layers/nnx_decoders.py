@@ -307,11 +307,10 @@ class NNXDecoder(nnx.Module):
         dense_cls, moe_cls = decoder_block_classes
 
         num_dense = config.first_num_dense_layers
-        self.dense_layers = self._create_scanned_layers(dense_cls, length=num_dense, rngs=rngs)
-
+        self.dense_layers = self._create_scanned_layers(dense_cls, length=num_dense, metadata_axis_name="dense_layers", rngs=rngs)
         num_moe = config.num_decoder_layers - config.first_num_dense_layers
-
-        self.moe_layers = self._create_scanned_layers(moe_cls, length=num_moe, rngs=rngs)
+        self.moe_layers = self._create_scanned_layers(moe_cls, length=num_moe, metadata_axis_name="moe_layers", rngs=rngs)      
+      
       elif self.is_gemma3:
         attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
         scan_length = config.num_decoder_layers // attention_pattern_length
@@ -390,24 +389,17 @@ class NNXDecoder(nnx.Module):
       )
       return nnx_wrappers.ToNNX(layer_linen, rngs=rngs)
 
-  def _create_scanned_layers(self, decoder_layer_class, length: int, rngs: nnx.Rngs, **layer_kwargs):
+  def _create_scanned_layers(self, decoder_layer_class, length: int, metadata_axis_name: str, rngs: nnx.Rngs, **layer_kwargs):
     """Creates a VMapped stack of layers, forcing parameter init for Compact modules."""
-
-    if length == 0:
-      return nnx.List([])
 
     def create_layer_fn(rng):
       layer = decoder_layer_class(
           config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=rng, **layer_kwargs
       )
-
       return layer
 
-    # Workaround for Deepseek MTP test failure.
-    # TODO: Handle this properly.
     try:
       forked_rngs = rngs.fork(split=length)
-
     except:  # pylint: disable=bare-except
       pass
 
@@ -416,8 +408,8 @@ class NNXDecoder(nnx.Module):
         create_layer_fn,
         in_axes=0,
         out_axes=out_axes,
-        axis_name="layers",
-        transform_metadata={nnx.PARTITION_NAME: "layers"},
+        axis_name=metadata_axis_name,
+        transform_metadata={nnx.PARTITION_NAME: metadata_axis_name},
     )(forked_rngs)
 
     return layers_vmapped
@@ -442,9 +434,7 @@ class NNXDecoder(nnx.Module):
     """Runs the layer stack using nnx.scan."""
     policy = self.get_remat_policy()
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
-    graphdef, params, state = nnx.split(
-        layers, nnx.Param, ...
-    )  # state: the mutable state we carry (KV cache, RNGs, etc.)
+    graphdef, params, state = nnx.split(layers, nnx.Param, ...)
 
     scan_axis = self.config.param_scan_axis
     if scan_axis != 0:
@@ -453,6 +443,13 @@ class NNXDecoder(nnx.Module):
     layer_cls = layers.__class__
     sig = inspect.signature(layer_cls.__call__)
     valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters or "kwargs" in sig.parameters}
+
+    def _extract_matching_state(template, full):
+      if isinstance(template, nnx.State):
+        return nnx.State({k: _extract_matching_state(v, full[k]) for k, v in template.items()})
+      elif isinstance(template, dict):
+        return {k: _extract_matching_state(v, full[k]) for k, v in template.items()}
+      return full
 
     def layer_fn(carry, scanned_vars):
       current_params, current_state = scanned_vars
@@ -463,19 +460,21 @@ class NNXDecoder(nnx.Module):
       layer = nnx.merge(graphdef, current_params, current_state)
       layer_out = layer(carry, *args, **valid_kwargs)
       new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-      new_current_state = nnx.state(layer)
-
+      
+      new_full_state = nnx.state(layer)
+      new_current_state = _extract_matching_state(current_state, new_full_state)
+      
+      # ONLY return non-param state to prevent memory duplication of weights
       return new_carry, new_current_state
 
     layer_fn = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
 
-    final_carry, scanned_state = jax.lax.scan(layer_fn, x_in, (params, state))
+    final_carry, scanned_other = jax.lax.scan(layer_fn, x_in, (params, state))
 
     if scan_axis != 0:
-      scanned_params, scanned_other = scanned_state.split(nnx.Param, ...)
-      scanned_params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), scanned_params)
-      scanned_state = nnx.State.merge(scanned_params, scanned_other)
-
+      params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), params)
+      
+    scanned_state = nnx.State.merge(params, scanned_other)
     return final_carry, nnx.merge(graphdef, scanned_state)
 
   def get_decoder_layers(self):
