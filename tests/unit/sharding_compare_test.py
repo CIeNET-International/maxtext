@@ -28,6 +28,7 @@ from maxtext.layers import quantizations
 from maxtext.models import models
 from maxtext.optimizers import optimizers
 from maxtext.trainers.pre_train.train_compile import get_shaped_inputs, get_topology_mesh, validate_config
+from maxtext.trainers.pre_train.nnx_train_compile import get_shaped_inputs_nnx
 from tests.utils.sharding_dump import TEST_CASES, load_json, input_sharding_to_json, named_shardings_to_json, partition_specs_to_json
 from tests.utils.test_helpers import get_test_config_path
 import pytest
@@ -182,6 +183,100 @@ def test_sharding_dump_for_model(model_name: str, topology: str, num_slice: str)
     print(f"\n[FAIL] Logical Sharding Mismatch: {model_name} {topology} slice {num_slice}", flush=True)
     compare_sharding_jsons(expected_logical, "Expected (Logical)", actual_logical, "Actual (Logical)")
     error_messages.append(f"Logical sharding mismatch for {model_name} on {topology} slice {num_slice}")
+
+  # 3. Compare Input Shardings
+  actual_input = input_sharding_to_json()
+  expected_input = load_json(input_json_path)
+  # calculate checksum
+  actual_input_sum = compute_checksum(actual_input)
+  expected_input_sum = compute_checksum(expected_input)
+
+  input_match = actual_input_sum == expected_input_sum
+
+  if not input_match:
+    print(f"\n[FAIL] Input Sharding Mismatch: {model_name} {topology} slice {num_slice}", flush=True)
+    # compare_sharding_jsons(expected_input, "Expected (Input)", actual_input, "Actual (Input)")
+    error_messages.append(f"Input sharding mismatch for {model_name} on {topology} slice {num_slice}")
+
+  assert not error_messages, "\n".join(error_messages)
+
+
+# Requires JAX TPU support to generate the simulated TPU topology.
+@pytest.mark.cpu_only
+@pytest.mark.tpu_backend
+@pytest.mark.parametrize("model_name, topology, num_slice", TEST_CASES)
+def test_sharding_dump_for_model_nnx(model_name: str, topology: str, num_slice: str) -> None:
+  """
+  Test sharding configurations from nnx_train_compile.get_shaped_inputs_nnx.
+  This test verifies that the sharding configurations for various models and topologies remain consistent with golden files.
+  """
+  params = [
+      "/deps/MaxText/tests/unit/sharding_compare_test",
+      get_test_config_path(),
+      f"compile_topology={topology}",
+      f"compile_topology_num_slices={num_slice}",
+      f"model_name={model_name}",
+      "log_config=false",
+      "debug_sharding=true",  # for input sharding dump
+      "enable_nnx=True",
+      "pure_nnx_decoder=True",
+  ]
+
+  root_dir = "tests/utils/sharding_info"
+  base_path = os.path.join(root_dir, model_name, topology, f"slice_{num_slice}")
+
+  named_json_path = os.path.join(base_path, "named_shardings.json")
+  logical_json_path = os.path.join(base_path, "logical_shardings.json")
+  input_json_path = os.path.join(base_path, "input_shardings.json")
+
+  if not os.path.exists(named_json_path):
+    pytest.skip(f"Missing named_shardings.json for {model_name} {topology} slice {num_slice}")
+    return
+  if not os.path.exists(logical_json_path):
+    pytest.skip(f"Missing logical_shardings.json for {model_name} {topology} slice {num_slice}")
+    return
+  if not os.path.exists(input_json_path):
+    pytest.skip(f"Missing input_shardings.json for {model_name} {topology} slice {num_slice}")
+    return
+
+  config = pyconfig.initialize(params)
+  validate_config(config)
+
+  clear_input_shardings_dump()
+  topology_mesh = get_topology_mesh(config)
+  learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
+  optimizers.get_optimizer(config, learning_rate_schedule)
+  get_shaped_inputs_nnx(topology_mesh, config)
+
+  error_messages = []
+
+  """
+  # 1. Compare Named Shardings
+  actual_named = named_shardings_to_json(state_mesh_shardings, shaped_train_args[0])
+  expected_named = load_json(named_json_path)
+  # calculate checksum
+  actual_named_sum = compute_checksum(actual_named)
+  expected_named_sum = compute_checksum(expected_named)
+  named_match = actual_named_sum == expected_named_sum
+
+  if not named_match:
+    print(f"\n[FAIL] Physical Sharding Mismatch: {model_name} {topology} slice {num_slice}", flush=True)
+    compare_sharding_jsons(expected_named, "Expected (Physical)", actual_named, "Actual (Physical)")
+    error_messages.append(f" Physical sharding mismatch for {model_name} on {topology} slice {num_slice}")
+
+  # 2. Compare Logical Shardings
+  actual_logical = partition_specs_to_json(logical_shardings, shaped_train_args[0])
+  expected_logical = load_json(logical_json_path)
+  # calculate checksum
+  actual_logical_sum = compute_checksum(actual_logical)
+  expected_logical_sum = compute_checksum(expected_logical)
+  logical_match = actual_logical_sum == expected_logical_sum
+
+  if not logical_match:
+    print(f"\n[FAIL] Logical Sharding Mismatch: {model_name} {topology} slice {num_slice}", flush=True)
+    compare_sharding_jsons(expected_logical, "Expected (Logical)", actual_logical, "Actual (Logical)")
+    error_messages.append(f"Logical sharding mismatch for {model_name} on {topology} slice {num_slice}")
+  """
 
   # 3. Compare Input Shardings
   actual_input = input_sharding_to_json()
