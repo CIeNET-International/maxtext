@@ -400,24 +400,25 @@ class NNXDecoder(nnx.Module):
       layer = decoder_layer_class(
           config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=rng, **layer_kwargs
       )
-      return layer
+      return nnx.split(layer, nnx.Param, ...)
+      # return layer
 
     try:
       forked_rngs = rngs.fork(split=length)
     except:  # pylint: disable=bare-except
       pass
 
-    out_axes = nnx.StateAxes({nnx.Param: self.config.param_scan_axis, ...: 0})
-    layers_vmapped = nnx.vmap(
+    graphdef, params, rest = nnx.vmap(
         create_layer_fn,
         in_axes=0,
-        out_axes=out_axes,
+        out_axes=(None, self.config.param_scan_axis, 0),
         axis_name=metadata_axis_name,
         transform_metadata={
             nnx.PARTITION_NAME: metadata_axis_name,
             "param_scan_axis": self.config.param_scan_axis,
         },
     )(forked_rngs)
+    layers_vmapped = nnx.merge(graphdef, params, rest)
 
     return layers_vmapped
 
