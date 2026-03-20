@@ -413,7 +413,10 @@ class NNXDecoder(nnx.Module):
         in_axes=0,
         out_axes=out_axes,
         axis_name=metadata_axis_name,
-        transform_metadata={nnx.PARTITION_NAME: metadata_axis_name},
+        transform_metadata={
+            nnx.PARTITION_NAME: metadata_axis_name,
+            "param_scan_axis": self.config.param_scan_axis,
+        },
     )(forked_rngs)
 
     return layers_vmapped
