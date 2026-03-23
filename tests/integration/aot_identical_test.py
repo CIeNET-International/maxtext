@@ -80,6 +80,7 @@ class AotBaseTest(unittest.TestCase):
     return h1.hexdigest() == h2.hexdigest()
 
 
+@pytest.mark.integration_test
 class AotHloIdenticalTest(AotBaseTest):
   """Tests for Ahead of Time Compilation HLO Graph Verification."""
 
@@ -158,6 +159,7 @@ class AotHloIdenticalTest(AotBaseTest):
     self.assert_compile_and_real_match_hlo("default_run")
 
 
+@pytest.mark.integration_test
 class AotJaxprIdenticalTest(AotBaseTest):
   """Tests for Ahead of Time Compilation Jaxpr Verification."""
 
