@@ -435,6 +435,9 @@ class ToLinen(linen.Module):
       _fix_for_qwix_quantization(module)
       method_fn = _get_module_method(module, nnx_method)
       out = method_fn(module, *args, **kwargs)
+      # Free the NNX module eagerly to avoid holding both NNX params and
+      # Linen variable copies in memory simultaneously during init tracing.
+      del module
       return out
 
     # create the nnx module
