@@ -20,6 +20,7 @@ from typing import Any, Optional
 from absl import flags
 import datetime
 from etils import epath
+from flax import nnx
 from flax.training import train_state
 import jax
 from maxtext.utils.globals import DEFAULT_OCDBT_TARGET_DATA_FILE_SIZE
@@ -712,14 +713,33 @@ def save_params_to_path(checkpoint_dir, params, use_ocdbt=True, use_zarr3=True):
 
 
 def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step=None):
-  """Save checkpoint if checkpointing is enabled."""
+  """Save checkpoint if checkpointing is enabled.
+
+  Args:
+    checkpoint_manager: The checkpoint manager.
+    state: The training state to save.
+    config: The config object.
+    data_iterator: The data iterator.
+    step: The step number. If None, extracts from state (for Linen TrainState).
+  """
   if checkpoint_manager is None:
     return
 
   # Determine the effective step for saving a checkpoint.
   # If 'step' is not provided, this call is for a potential final checkpoint
   # and use the last completed step from the state.
-  actual_step = (int(state.step) - 1) if step is None else int(step)
+  if step is not None:
+    actual_step = int(step)
+  else:
+    if config.enable_nnx:
+      actual_step = int(state.optimizer.step) - 1
+    else:
+      # Linen TrainState has .step attribute
+      actual_step = int(state.step) - 1
+
+  if config.enable_nnx:
+    # Convert nnx.State to dict.
+    state = state.to_pure_dict()
 
   # Determine if a checkpoint save should be forced, overriding the usual `config.checkpoint_period` logic.
   # This occurs if this function was called:

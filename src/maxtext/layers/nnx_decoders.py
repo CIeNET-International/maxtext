@@ -395,7 +395,9 @@ class NNXDecoder(nnx.Module):
       )
       return nnx_wrappers.ToNNX(layer_linen, rngs=rngs)
 
-  def _create_scanned_layers(self, decoder_layer_class, length: int, metadata_axis_name: str, rngs: nnx.Rngs, **layer_kwargs):
+  def _create_scanned_layers(
+      self, decoder_layer_class, length: int, metadata_axis_name: str, rngs: nnx.Rngs, **layer_kwargs
+  ):
     """Creates a scanned stack of layers using jax.lax.scan for memory-efficient initialization.
 
     Uses jax.lax.scan instead of nnx.vmap to reduce peak memory during initialization.
@@ -420,8 +422,7 @@ class NNXDecoder(nnx.Module):
     first_rng_state = jax.tree.map(lambda x: x[0], rngs_state)
     ref_rngs = nnx.merge(rngs_graphdef, first_rng_state)
     ref_layer = decoder_layer_class(
-        config=self.config, mesh=self.mesh, quant=self.quant,
-        model_mode=self.model_mode, rngs=ref_rngs, **layer_kwargs
+        config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=ref_rngs, **layer_kwargs
     )
     layer_graphdef, _, _ = nnx.split(ref_layer, nnx.Param, ...)
     del ref_layer
@@ -432,8 +433,12 @@ class NNXDecoder(nnx.Module):
     def scan_body(carry, rng_state_slice):
       layer_rngs = nnx.merge(rngs_graphdef, rng_state_slice)
       layer = decoder_layer_class(
-          config=self.config, mesh=self.mesh, quant=self.quant,
-          model_mode=self.model_mode, rngs=layer_rngs, **layer_kwargs
+          config=self.config,
+          mesh=self.mesh,
+          quant=self.quant,
+          model_mode=self.model_mode,
+          rngs=layer_rngs,
+          **layer_kwargs,
       )
       _, params, rest = nnx.split(layer, nnx.Param, ...)
       return carry, (params, rest)
@@ -455,6 +460,7 @@ class NNXDecoder(nnx.Module):
           metadata["param_scan_axis"] = axis
           return leaf.replace(**metadata)
         return leaf
+
       return jax.tree.map(_update_leaf, state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
 
     stacked_params = _add_scan_metadata(stacked_params, scan_axis)
