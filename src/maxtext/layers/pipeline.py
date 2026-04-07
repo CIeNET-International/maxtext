@@ -1363,7 +1363,20 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
       sharding = x.get_metadata().get("out_sharding")
       if sharding is not None and isinstance(sharding, (list, tuple)):
         filtered = tuple(s for s in sharding if s != "circular_repeats")
-        return P(*filtered) if filtered else P()
+        if filtered:
+          return P(*filtered)
+      # Fallback: Variables created without sharding metadata (e.g. via ToNNX wrapper or
+      # empty kernel_axes=()). flax's add_axis is a no-op when out_sharding is absent/empty,
+      # so the vmap partition names are never recorded. We know the vmap structure:
+      #   num_pipeline_repeats > 1 → shape (num_repeats, num_stages, ...)  — 2 leading stacked dims
+      #   num_pipeline_repeats == 1 → shape (num_stages, ...)              — 1 leading stacked dim
+      # Return P('layers', None, ...) so logical_to_mesh maps 'layers' → 'stage' (physical),
+      # giving shard_map correct out_specs that acknowledge per-stage variation.
+      num_stacked = 2 if self.config.num_pipeline_repeats > 1 else 1
+      val = x.value
+      if hasattr(val, 'ndim') and val.ndim >= num_stacked:
+        remaining = val.ndim - num_stacked
+        return P('layers', *([None] * remaining))
       return P()
 
     # Inspect the first variable's metadata to confirm out_sharding is present.
