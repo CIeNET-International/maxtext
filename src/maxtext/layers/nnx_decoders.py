@@ -475,15 +475,14 @@ class NNXDecoder(nnx.Module):
                 rngs=rngs,
                 num_of_layers=block_pattern_len,
             )
-          if remainder_layers > 0:
-            self.layers_remainder = gemma4.Gemma4ScannableBlock(
-                config=self.config,
-                mesh=mesh,
-                quant=self.quant,
-                model_mode=self.model_mode,
-                num_of_layers=remainder_layers,
-                rngs=rngs,
-            )
+          self.layers_remainder = gemma4.Gemma4ScannableBlock(
+              config=self.config,
+              mesh=mesh,
+              quant=self.quant,
+              model_mode=self.model_mode,
+              num_of_layers=remainder_layers,
+              rngs=rngs,
+          )
         else:
           layer_cls = decoder_block_classes[0]
           num_layers = int(config.num_decoder_layers / config.inhomogeneous_layer_cycle_interval)
