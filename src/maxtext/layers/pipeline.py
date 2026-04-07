@@ -1365,7 +1365,16 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
         return P(*filtered) if filtered else P()
       return P()
 
-    return jax.tree.map(get_spec, state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
+    result = jax.tree.map(get_spec, state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
+    # DIAGNOSTIC: verify sharding specs are not all P() — if everything is P() the BSW
+    # shard_map will fail with "out_specs require replication which can't be inferred".
+    all_specs = jax.tree_util.tree_leaves(result)
+    non_empty = [s for s in all_specs if s != P()]
+    max_logging.log(
+        f"[DIAG get_weight_sharding] total_leaves={len(all_specs)}, non_empty_specs={len(non_empty)},"
+        f" sample={all_specs[:3]}"
+    )
+    return result
 
   def get_main_vmap_func_for_iterations(self):
     def func_to_vmap(graph, state, stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode):
@@ -1726,6 +1735,11 @@ class NNXCircularPipeline(NNXPipelineBase):
   def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec):
     """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer."""
     bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
+
+    # DIAGNOSTIC: log first few bsw_pps leaves so we can verify the stage axis is present.
+    # If all specs are P() here, the shard_map below will fail with check_vma=True.
+    sample_pps = jax.tree_util.tree_leaves(bsw_pps)[:4]
+    max_logging.log(f"[DIAG get_current_weights_from_bsw] sample bsw_pps (first 4)={sample_pps}")
 
     # Convert NNX State objects to plain dicts for shard_map compatibility.
     bsw_dict_0 = nnx.to_pure_dict(bsw[0])
