@@ -1354,10 +1354,15 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
         return P()
       if isinstance(x.value, nn.spmd.LogicallyPartitioned):
         return x.value.partitions
-      metadata = x.get_metadata()
-      sharding = metadata.get("sharding")
-      if sharding and hasattr(sharding, "spec"):
-        return sharding.spec
+      # nnx.vmap add_axis stores sharding as a plain tuple (e.g. ("layers", "embed", "mlp")).
+      # hasattr(tuple, "spec") is always False, so the old "sharding.spec" path never fired.
+      # Read sharding as a tuple directly and strip "circular_repeats" — that axis is sliced
+      # by from_all_variables_to_repeat_weights before BSW use, so it must not appear in
+      # the shard_map out_specs.
+      sharding = x.get_metadata().get("sharding")
+      if sharding is not None and isinstance(sharding, (list, tuple)):
+        filtered = tuple(s for s in sharding if s != "circular_repeats")
+        return P(*filtered) if filtered else P()
       return P()
 
     return jax.tree.map(get_spec, state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
