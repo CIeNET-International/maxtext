@@ -1131,14 +1131,16 @@ class NNXDecoder(nnx.Module):
 
     layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
 
-    layer_kwargs = {}
+    layer_kwargs = {
+        "previous_chunk": previous_chunk,
+        "page_state": page_state,
+        "slot": slot,
+    }
     if cfg.decoder_block in (DecoderBlockType.GEMMA3, DecoderBlockType.GEMMA4):
       layer_kwargs["bidirectional_mask"] = bidirectional_mask
 
     if attention_metadata is not None:
       layer_kwargs["attention_metadata"] = attention_metadata
-    elif cfg.decoder_block == DecoderBlockType.DEEPSEEK and cfg.scan_layers:
-      layer_kwargs = {"previous_chunk": previous_chunk, "page_state": page_state, "slot": slot}
 
     # -------------------------------------------------------------------------
     # Execution Routing (Pipeline vs Direct)
@@ -1398,6 +1400,10 @@ class NNXDecoder(nnx.Module):
         if self.quant is not None and len(nnx.state(self.logits_dense, "aqt")) == 0:
           _ = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
       logits = None
+    # When in the Indexer Dense Warm-up stage, skip the expensive output head projection
+    # for efficiency, as the main model is frozen and the LM loss is not needed.
+    elif (cfg.use_indexer and not cfg.indexer_sparse_training) and self.model_mode == MODEL_MODE_TRAIN:
+      logits = None
     # When vocab tiling is enabled in training mode, full logits won't generate to reduce memory
     # Instead, we keep track on the hidden states, which has smaller size compared to full logits
     elif cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN:
@@ -1460,7 +1466,7 @@ class NNXDecoder(nnx.Module):
       checkpointed_gemma_fn = jax.checkpoint(pure_gemma_fn, policy=policy, prevent_cse=prevent_cse)
       graphdef, state = nnx.split(self.layers_remainder)
       y, new_state = checkpointed_gemma_fn(graphdef, state, y)
-      self.layers_remainder = nnx.merge(graphdef, new_state)
+      self._trace_safe_update(self.layers_remainder, new_state)
 
     return y
 
@@ -1485,7 +1491,12 @@ class NNXDecoder(nnx.Module):
     remainder_layers = cfg.num_decoder_layers % block_pattern_len
 
     layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
-    layer_kwargs = {"bidirectional_mask": bidirectional_mask}
+    layer_kwargs = {
+        "slot": slot,
+        "page_state": page_state,
+        "previous_chunk": previous_chunk,
+        "bidirectional_mask": bidirectional_mask,
+    }
 
     # Main scan over full blocks
     if num_full_blocks > 0:
@@ -1501,13 +1512,7 @@ class NNXDecoder(nnx.Module):
 
       def pure_gemma4_fn(graphdef, state_in, y_in):
         merged_layer = nnx.merge(graphdef, state_in)
-        out_y, _ = merged_layer(
-            y_in, *layer_args,
-            previous_chunk=previous_chunk,
-            page_state=page_state,
-            slot=slot,
-            **layer_kwargs,
-        )
+        out_y, _ = merged_layer(y_in, *layer_args, **layer_kwargs)
         return out_y, nnx.state(merged_layer)
 
       checkpointed_fn = jax.checkpoint(pure_gemma4_fn, policy=policy, prevent_cse=prevent_cse)

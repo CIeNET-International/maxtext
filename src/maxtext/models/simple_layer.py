@@ -58,7 +58,8 @@ class SimpleDecoderLayer(nnx.Module):
     )
 
   def __call__(
-      self, inputs: jnp.ndarray, positions, segmentation, deterministic, model_mode, previous_chunk=None, page_state=None
+      self, inputs: jnp.ndarray, positions, segmentation, deterministic, model_mode,
+      previous_chunk=None, page_state=None, slot=None, kv_cache=None, **kwargs
   ):
     # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
     if isinstance(inputs, tuple):
@@ -120,7 +121,9 @@ class SimpleMlpDecoderLayer(nnx.Module):
       model_mode,
       previous_chunk=None,
       page_state=None,
-      slot=0,
+      slot=None,
+      kv_cache=None,
+      **kwargs,
   ):
     # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
     if isinstance(inputs, tuple):
