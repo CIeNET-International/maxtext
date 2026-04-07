@@ -1366,6 +1366,15 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
         return P(*filtered) if filtered else P()
       return P()
 
+    # Inspect the first variable's metadata to confirm out_sharding is present.
+    _first_leaves = jax.tree_util.tree_leaves(state, is_leaf=lambda x: isinstance(x, nnx.Variable))
+    _first_var = _first_leaves[0] if _first_leaves else None
+    max_logging.log(
+        f"[DIAG GWS meta] first_leaf_type={type(_first_var).__name__},"
+        f" is_var={isinstance(_first_var, nnx.Variable)},"
+        f" metadata={_first_var.get_metadata() if isinstance(_first_var, nnx.Variable) else 'N/A'}"
+    )
+
     result = jax.tree.map(get_spec, state, is_leaf=lambda x: isinstance(x, nnx.Variable))
     all_specs = jax.tree_util.tree_leaves(result)
     non_empty = [s for s in all_specs if s != P()]
@@ -1750,6 +1759,14 @@ class NNXCircularPipeline(NNXPipelineBase):
     bsw_dict_0 = nnx.to_pure_dict(bsw[0])
     bsw_dict_1 = nnx.to_pure_dict(bsw[1])
     bsw_pps_dict = nnx.to_pure_dict(bsw_pps)
+
+    # Log the dict-form specs that will be passed to shard_map as out_specs.
+    _pps_dict_leaves = jax.tree_util.tree_leaves(bsw_pps_dict)
+    _pps_dict_non_empty = [s for s in _pps_dict_leaves if s and s != P()]
+    max_logging.log(
+        f"[DIAG pre_shard_map] bsw_pps_dict total={len(_pps_dict_leaves)},"
+        f" non_empty={len(_pps_dict_non_empty)}, sample={_pps_dict_leaves[:3]}"
+    )
 
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
