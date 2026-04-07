@@ -1350,24 +1350,23 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
     state = nnx.state(self.layers)
 
     def get_spec(x):
-      if not isinstance(x, nnx.VariableState):
+      if not isinstance(x, nnx.Variable):
         return P()
       if isinstance(x.value, nn.spmd.LogicallyPartitioned):
         return x.value.partitions
-      # nnx.vmap add_axis stores sharding as a plain tuple (e.g. ("layers", "embed", "mlp")).
-      # hasattr(tuple, "spec") is always False, so the old "sharding.spec" path never fired.
-      # Read sharding as a tuple directly and strip "circular_repeats" — that axis is sliced
-      # by from_all_variables_to_repeat_weights before BSW use, so it must not appear in
-      # the shard_map out_specs.
-      sharding = x.get_metadata().get("sharding")
+      # In flax 0.12+, 'sharding' is remapped to 'out_sharding' at construction time.
+      # nnx.vmap add_axis (triggered by transform_metadata={PARTITION_NAME: "layers"})
+      # prepends the axis name to the existing out_sharding tuple, e.g.
+      #   ("embed", "mlp") → ("layers", "embed", "mlp")
+      # Strip "circular_repeats" — that dim is sliced by from_all_variables_to_repeat_weights
+      # before BSW use and must not appear in the shard_map out_specs.
+      sharding = x.get_metadata().get("out_sharding")
       if sharding is not None and isinstance(sharding, (list, tuple)):
         filtered = tuple(s for s in sharding if s != "circular_repeats")
         return P(*filtered) if filtered else P()
       return P()
 
-    result = jax.tree.map(get_spec, state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
-    # DIAGNOSTIC: verify sharding specs are not all P() — if everything is P() the BSW
-    # shard_map will fail with "out_specs require replication which can't be inferred".
+    result = jax.tree.map(get_spec, state, is_leaf=lambda x: isinstance(x, nnx.Variable))
     all_specs = jax.tree_util.tree_leaves(result)
     non_empty = [s for s in all_specs if s != P()]
     max_logging.log(
@@ -1916,7 +1915,7 @@ class NNXCircularPipeline(NNXPipelineBase):
     _, layers_params, layers_metrics, layers_mutables = nnx.split(layers_state, is_static_param, nnx.Intermediate, ...)
 
     # Filter physical_partition_spec to only contain keys that exist in layers_params.
-    # physical_partition_spec has specs at the VariableState level (2 path steps: e.g. gate→bias),
+    # physical_partition_spec has specs at the Variable level (2 path steps: e.g. gate→bias),
     # while layers_params leaves are one level deeper (e.g. gate→bias→value via GetAttrKey).
     # We stop navigating when we reach a P(...) leaf, returning it for the raw value underneath.
     def filter_to_match(path, _):
