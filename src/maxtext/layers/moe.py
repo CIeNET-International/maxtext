@@ -278,6 +278,11 @@ class GateLogit(nnx.Module):
         kernel = self.kernel[...]
         kernel = jnp.asarray(kernel, self.dtype)
       else:
+        # DIAGNOSTIC: kernel.value is None — should not happen after BSW fix.
+        max_logging.log(
+            f"[DIAG kernel_none] MoE expert kernel is None in {self.__class__.__name__},"
+            f" inputs.shape={inputs.shape}. Returning zeros."
+        )
         kernel = None
 
     if kernel is not None:
@@ -2043,15 +2048,15 @@ class RoutedMoE(nnx.Module):
       w1_kernel = jnp.asarray(self.wi_1[...], self.dtype)
       wo_kernel = jnp.asarray(self.wo[...], self.dtype)
 
-    if self.per_expert_scale is not None:
-      wo_kernel = wo_kernel * jnp.asarray(self.per_expert_scale[...], self.dtype)[:, None, None]
+      if self.per_expert_scale is not None:
+        wo_kernel = wo_kernel * jnp.asarray(self.per_expert_scale[...], self.dtype)[:, None, None]
 
-    if cfg.mlp_bias:
-      w0_bias = jnp.asarray(self.wi_0_bias[...], self.dtype)
-      w1_bias = jnp.asarray(self.wi_1_bias[...], self.dtype)
-      wo_bias = jnp.asarray(self.wo_bias[...], self.dtype)
-    else:
-      w0_bias, w1_bias, wo_bias = None, None, None
+      if cfg.mlp_bias:
+        w0_bias = jnp.asarray(self.wi_0_bias[...], self.dtype)
+        w1_bias = jnp.asarray(self.wi_1_bias[...], self.dtype)
+        wo_bias = jnp.asarray(self.wo_bias[...], self.dtype)
+      else:
+        w0_bias, w1_bias, wo_bias = None, None, None
 
       if cfg.sparse_matmul:
         if quantizations.in_serve_mode(self.quant):
@@ -2074,7 +2079,11 @@ class RoutedMoE(nnx.Module):
             inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias
         )
     else:
-      # If kernels are missing (e.g. masked in pipeline), return zeros.
+      # DIAGNOSTIC: kernels are None — should not happen after BSW fix.
+      max_logging.log(
+          f"[DIAG kernel_none] RoutedMoE wi_0.value is None in {self.__class__.__name__},"
+          f" inputs.shape={inputs.shape}. Returning zeros."
+      )
       output = jnp.zeros_like(inputs)
       lb_loss = None
       bias_updates = None

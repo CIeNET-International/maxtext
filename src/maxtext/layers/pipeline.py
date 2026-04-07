@@ -1314,7 +1314,6 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
         num_splits = int(np.prod(shape))
         flat_keys = jax.random.split(key, num_splits)
         kwargs[stream_name] = flat_keys.reshape(shape + key.shape)
-      print(f"DEBUG: build_batched_rngs created kwargs keys: {kwargs.keys()}")
       return nnx.Rngs(**kwargs)
 
     def create_stage_fn(r):
@@ -1352,14 +1351,14 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
 
     def get_spec(x):
       if not isinstance(x, nnx.VariableState):
-        return None
+        return P()
       if isinstance(x.value, nn.spmd.LogicallyPartitioned):
         return x.value.partitions
       metadata = x.get_metadata()
       sharding = metadata.get("sharding")
       if sharding and hasattr(sharding, "spec"):
         return sharding.spec
-      return None
+      return P()
 
     return jax.tree.map(get_spec, state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
 
@@ -1531,7 +1530,6 @@ class NNXPipeline(NNXPipelineBase):
       return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
 
     _, layers_params, layers_metrics, layers_mutables = nnx.split(layers_state, is_static_param, nnx.Intermediate, ...)
-    print(f"DEBUG: layers_mutables keys before scan are {layers_mutables.keys()}")
 
     def scan_body(carry, _):
       current_loop_state, current_layer_mutables = carry
@@ -1636,8 +1634,17 @@ class NNXCircularPipeline(NNXPipelineBase):
         if w is None:
           return None
 
-        # Check if we are in an abstract context (compilation) where concrete slicing fails.
-        is_abstract = isinstance(w, (jax.ShapeDtypeStruct, jax.core.Tracer))
+        # Check if we are in an abstract context (jax.eval_shape) where concrete slicing fails.
+        # NOTE: Do NOT include jax.core.Tracer here. During jax.lax.scan tracing, all values
+        # are DynamicJaxprTracer — we must allow dynamic_slice_in_dim to trace through them.
+        is_abstract = isinstance(w, jax.ShapeDtypeStruct)
+
+        # DIAGNOSTIC: log the leaf type once during tracing to verify types at runtime.
+        # (Python code runs once per trace; this fires during jit/scan lowering, not per step.)
+        max_logging.log(
+            f"[DIAG slice_leaf] type(w)={type(w).__name__}, is_abstract={is_abstract},"
+            f" was_tracer={isinstance(w, jax.core.Tracer)}, shape={getattr(w, 'shape', '?')}"
+        )
 
         if is_abstract:
           # Manually calculate sliced and squeezed shape for abstract tracers
@@ -1713,66 +1720,31 @@ class NNXCircularPipeline(NNXPipelineBase):
 
   def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec):
     """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer."""
-
-    # Strip nnx.Variable wrappers from pps to match the structure of bsw (which is raw arrays)
-    def _is_var(x):
-      return isinstance(x, nnx.Variable)
-
-    physical_partition_spec = jax.tree.map(lambda x: x.value, physical_partition_spec, is_leaf=_is_var)
-
     bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
-    # Ensure bsw_pps matches the None-structure of bsw.
-    # A leaf should only be None in pps if it's None in BOTH buffers.
+
+    # Convert NNX State objects to plain dicts for shard_map compatibility.
     bsw_dict_0 = nnx.to_pure_dict(bsw[0])
     bsw_dict_1 = nnx.to_pure_dict(bsw[1])
-    pps_dict = nnx.to_pure_dict(bsw_pps)
-
-    def is_really_none(x):
-      return x is None
-
-    bsw_pps = jax.tree.map(
-        lambda b0, b1, p: p if (not is_really_none(b0) or not is_really_none(b1)) else None,
-        bsw_dict_0,
-        bsw_dict_1,
-        pps_dict,
-    )
+    bsw_pps_dict = nnx.to_pure_dict(bsw_pps)
 
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
 
-    if bsw_pps is not None:
+    @jax.shard_map(
+        mesh=self.mesh, in_specs=((bsw_pps_dict, bsw_pps_dict), P("stage")), out_specs=bsw_pps_dict, check_vma=True
+    )
+    def select_weights_from_bsw(bsw_inner, repeat_id):
+      return jax.tree.map(
+          lambda x, y: jax.lax.select(repeat_id[0] == stage0_repeat_id, y, x), bsw_inner[0], bsw_inner[1]
+      )
 
-      @jax.shard_map(mesh=self.mesh, in_specs=((bsw_pps, bsw_pps), P("stage")), out_specs=bsw_pps, check_vma=False)
-      def select_weights_from_bsw(bsw_inner, repeat_id):
-        def _select_leaf(x, y, p):
-          if p is None:
-            return None
-          return jax.lax.select(repeat_id[0] == stage0_repeat_id, y, x)
-
-        return jax.tree.map(_select_leaf, bsw_inner[0], bsw_inner[1], bsw_pps)
-
-      # Convert bsw data to dicts to match bsw_pps structure for shard_map.
-      bsw_data = (bsw_dict_0, bsw_dict_1)
-      weights = select_weights_from_bsw(bsw_data, repeat_ids)
-    else:
-
-      def select_weights_from_bsw(bsw_inner, repeat_id):
-        def _select_leaf(x, y):
-          if x is None:
-            return None
-          return jax.lax.select(repeat_id == stage0_repeat_id, y, x)
-
-        return jax.tree.map(_select_leaf, bsw_inner[0], bsw_inner[1])
-
-      weights = jax.vmap(select_weights_from_bsw, in_axes=((0, 0), 0), out_axes=0)(bsw, repeat_ids)
-    return weights
+    return select_weights_from_bsw((bsw_dict_0, bsw_dict_1), repeat_ids)
 
   def run_one_iteration(
       self,
       loop_state,
       bsw,
       pipeline_weights_graph,
-      layers_params,
       layers_metrics,
       current_layer_mutables,
       positions,
@@ -1851,7 +1823,7 @@ class NNXCircularPipeline(NNXPipelineBase):
             lambda x: self.shard_dim_by_stages(x, 1, physical_partition_spec=None, is_stage_weight=False), updated_fw_tree
         )
 
-      def is_static_param(path, v):
+      def is_static_param(_, v):
         return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
 
       # We only need to update the metrics and mutables in the carry, as parameters are handled by AD
@@ -1919,18 +1891,23 @@ class NNXCircularPipeline(NNXPipelineBase):
 
     layers_state = jax.tree.map(unbox_val, layers_state, is_leaf=is_lp)
 
-    def is_static_param(path, v):
+    def is_static_param(_, v):
       return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
 
     _, layers_params, layers_metrics, layers_mutables = nnx.split(layers_state, is_static_param, nnx.Intermediate, ...)
 
     # Filter physical_partition_spec to only contain keys that exist in layers_params.
-    # This prevents structural mismatches in shard_map when layers_state has more keys (like dropout).
+    # physical_partition_spec has specs at the VariableState level (2 path steps: e.g. gate→bias),
+    # while layers_params leaves are one level deeper (e.g. gate→bias→value via GetAttrKey).
+    # We stop navigating when we reach a P(...) leaf, returning it for the raw value underneath.
     def filter_to_match(path, _):
       try:
         spec = physical_partition_spec
         for p in path:
-          spec = spec[p.key if hasattr(p, "key") else p]
+          if isinstance(spec, P) or spec is None:
+            return spec
+          key = p.key if hasattr(p, "key") else p
+          spec = spec[key]
         return spec
       except (KeyError, TypeError, AttributeError):
         return None
@@ -1951,7 +1928,6 @@ class NNXCircularPipeline(NNXPipelineBase):
           current_loop_state,
           next_bsw,
           layers_graph,
-          layers_params,
           layers_metrics,
           current_layer_mutables,
           positions,

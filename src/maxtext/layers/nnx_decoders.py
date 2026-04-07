@@ -1112,7 +1112,9 @@ class NNXDecoder(nnx.Module):
     # Execution Routing (Pipeline vs Direct)
     # -------------------------------------------------------------------------
     if cfg.using_pipeline_parallelism:
-      logical_partition_spec = self.pipeline_module.get_weight_sharding() if cfg.pipeline_fsdp_ag_once else None
+      logical_partition_spec = (
+          self.pipeline_module.get_weight_sharding() if cfg.pipeline_fsdp_ag_once or cfg.pipeline_fsdp_ag_per_repeat else None
+      )
 
       if self.is_deepseek:
         logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)

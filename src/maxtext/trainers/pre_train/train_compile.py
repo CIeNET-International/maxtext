@@ -249,11 +249,13 @@ def main(argv: Sequence[str]) -> None:
   # prematurely initializing the backend.
   max_utils.print_system_information()
 
-  # Filter logical_axis_rules to remove axes not present in the topology mesh.
-  # This prevents ValueError in flax.linen.spmd.with_logical_constraint during compilation.
-  # Configuration is read-only, so we bypass __setattr__ by modifying the underlying dictionary.
-  filtered_rules = sharding.filter_rules_for_mesh(config.logical_axis_rules, topology_mesh)
-  object.__getattribute__(config, "_flat_config")["logical_axis_rules"] = filtered_rules
+  if config.enable_nnx:
+    # Filter logical_axis_rules to remove axes not present in the topology mesh.
+    # NNX path uses a topology mesh with fewer axes; this prevents ValueError in
+    # flax.linen.spmd.with_logical_constraint during compilation.
+    # Configuration is read-only, so we bypass __setattr__ by modifying the underlying dictionary.
+    filtered_rules = sharding.filter_rules_for_mesh(config.logical_axis_rules, topology_mesh)
+    object.__getattribute__(config, "_flat_config")["logical_axis_rules"] = filtered_rules
 
   # Shaped inputs
   (

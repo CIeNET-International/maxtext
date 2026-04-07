@@ -233,6 +233,11 @@ class DenseGeneral(nnx.Module):
             kernel = jax.device_put(kernel, max_utils.device_space())
           kernel = jnp.asarray(kernel, self.dtype)
       else:
+        # DIAGNOSTIC: kernel.value is None — should not happen after BSW fix.
+        max_logging.log(
+            f"[DIAG kernel_none] DenseGeneral kernel is None in {self.__class__.__name__},"
+            f" inputs.shape={inputs.shape}. Returning zeros."
+        )
         kernel = None
 
     # out_sharding should be None for auto mesh axis
