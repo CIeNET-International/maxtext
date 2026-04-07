@@ -1247,15 +1247,14 @@ def _extract_partition_specs(abstract_state, config):
   # Flax NNX get_partition_spec expects an nnx.State or nnx.Variable.
   # abstract_state is a TrainState, so we must map over it and extract specs manually.
   def get_nnx_spec(leaf):
-    if isinstance(leaf, nnx.VariableState):
-      # Extract using NNX's native metadata
-      return P(*leaf.sharding_names) if getattr(leaf, "sharding_names", None) else P()
-    elif hasattr(leaf, "sharding_names"):
-      return P(*leaf.sharding_names)
-    # Default to replicated for scalars, ints, or missing specs
+    if isinstance(leaf, nnx.Variable):
+      sharding = leaf.get_metadata().get("out_sharding")
+      if sharding is not None and isinstance(sharding, (list, tuple)):
+        return P(*sharding)
+      return P()
     return P()
 
-  return jax.tree_util.tree_map(get_nnx_spec, abstract_state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
+  return jax.tree_util.tree_map(get_nnx_spec, abstract_state, is_leaf=lambda x: isinstance(x, nnx.Variable))
 
 
 def get_logical_annotations(model, tx, config, rng, mesh, is_training=True):

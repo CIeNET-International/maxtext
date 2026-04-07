@@ -1692,6 +1692,12 @@ class NNXCircularPipeline(NNXPipelineBase):
       bsw_pps = pipeline_utils.derive_stage_weight_partition_specs(physical_partition_spec, axes_to_remove)
     else:
       bsw_pps = None
+    _cp4 = jax.tree_util.tree_leaves(bsw_pps) if bsw_pps is not None else []
+    _cp4_non_empty = [s for s in _cp4 if s and s != P()]
+    max_logging.log(
+        f"[DIAG CP4 from_repeat_weights_to_bsw] bsw_pps total={len(_cp4)},"
+        f" non_empty={len(_cp4_non_empty)}, sample={_cp4[:3]}"
+    )
 
     def _apply_sharding_hint(weight, pspec):
       if pspec is None or weight is None:
@@ -1894,6 +1900,12 @@ class NNXCircularPipeline(NNXPipelineBase):
     physical_partition_spec = logical_to_mesh(
         logical_partition_spec, mesh=self.mesh, rules=self.config.logical_axis_rules
     )
+    _cp2 = jax.tree_util.tree_leaves(physical_partition_spec)
+    _cp2_non_empty = [s for s in _cp2 if s and s != P()]
+    max_logging.log(
+        f"[DIAG CP2 logical_to_mesh] total={len(_cp2)},"
+        f" non_empty={len(_cp2_non_empty)}, sample={_cp2[:3]}"
+    )
 
     bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
     real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
@@ -1931,6 +1943,12 @@ class NNXCircularPipeline(NNXPipelineBase):
         return None
 
     params_physical_partition_spec = jax.tree_util.tree_map_with_path(filter_to_match, layers_params)
+    _cp3 = jax.tree_util.tree_leaves(params_physical_partition_spec)
+    _cp3_non_none = [s for s in _cp3 if s is not None and s != P()]
+    max_logging.log(
+        f"[DIAG CP3 filter_to_match] total={len(_cp3)},"
+        f" non_none_non_empty={len(_cp3_non_none)}, sample={_cp3[:3]}"
+    )
 
     def scan_body(carry, _):
       current_loop_state, current_layer_mutables = carry
