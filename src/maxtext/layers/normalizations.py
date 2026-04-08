@@ -83,7 +83,7 @@ class RMSNorm(nnx.Module):
 
     scale = self.scale.value
     # Move scale to device if parameter offloading is enabled
-    if scale is not None and self.parameter_memory_host_offload:
+    if self.parameter_memory_host_offload:
       max_logging.log("normalizations.py: Moving scale parameter to device")
       scale = jax.device_put(scale, max_utils.device_space())
 
