@@ -114,18 +114,23 @@ class PipelineParallelismTest(unittest.TestCase):
     )
     deterministic = True
     # We use a simpler single matmul decoder layer for fast compilation in these tests.
+    # Keep a Linen-wrapped stage for the sequential reference comparison below.
     rngs = nnx.Rngs(params=0)
     single_pipeline_stage = simple_layer.SimpleDecoderLayerToLinen(
         config=config, mesh=mesh, model_mode=model_mode, rngs=rngs
     )
+
+    def stage_factory(rngs):
+      return simple_layer.SimpleDecoderLayer(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
+
     my_pipeline = pipeline.create_pipeline(
-        config=config, layers=single_pipeline_stage, mesh=mesh
+        config=config, stage_factory=stage_factory, mesh=mesh
     )
     init_pipeline_params = my_pipeline.init(
         jax.random.PRNGKey(0), inputs, inputs_position, inputs_segmentation, deterministic, model_mode
     )
-    logical_partition_spec = my_pipeline.get_weight_sharding(
-        inputs, inputs_position, inputs_segmentation, deterministic, model_mode
+    logical_partition_spec = my_pipeline.apply(
+        init_pipeline_params, nnx_method='get_weight_sharding'
     )
 
     # Create a dummy scalar loss function so we may take the gradient wrt weights
