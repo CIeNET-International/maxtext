@@ -74,22 +74,24 @@ class PipelineParallelismTest(unittest.TestCase):
   base_output_directory = get_test_base_output_directory()
   dataset_path = get_test_dataset_path()
 
-  def assert_pipeline_same_output_and_grad(self, config, single_pipeline_stage_class=None):
+  def assert_pipeline_same_output_and_grad(self, config, single_pipeline_stage_class=None, nnx_stage_class=None):
     """check that the output and gradient are the same"""
     devices_array = maxtext_utils.create_device_mesh(config)
     mesh = Mesh(devices_array, config.mesh_axes)
     model_mode = MODEL_MODE_TRAIN
+    rngs = nnx.Rngs(params=0)
     if single_pipeline_stage_class is None:
-      rngs = nnx.Rngs(params=0)
       single_pipeline_stage = simple_layer.SimpleDecoderLayerToLinen(
           config=config, mesh=mesh, model_mode=model_mode, rngs=rngs
       )
     else:
       if issubclass(single_pipeline_stage_class, nnx_wrappers.ToLinen):
-        rngs = nnx.Rngs(params=0)
         single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
       else:
         single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode)
+
+    if nnx_stage_class is None:
+      nnx_stage_class = simple_layer.SimpleDecoderLayer
 
     def get_inputs(batch_size, sequence, features):
       """Get random inputs, and random dummy targets
@@ -113,15 +115,9 @@ class PipelineParallelismTest(unittest.TestCase):
         config.global_batch_size_to_train_on, config.max_target_length, config.emb_dim
     )
     deterministic = True
-    # We use a simpler single matmul decoder layer for fast compilation in these tests.
-    # Keep a Linen-wrapped stage for the sequential reference comparison below.
-    rngs = nnx.Rngs(params=0)
-    single_pipeline_stage = simple_layer.SimpleDecoderLayerToLinen(
-        config=config, mesh=mesh, model_mode=model_mode, rngs=rngs
-    )
 
     def stage_factory(rngs):
-      return simple_layer.SimpleDecoderLayer(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
+      return nnx_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
 
     my_pipeline = pipeline.create_pipeline(
         config=config, stage_factory=stage_factory, mesh=mesh
@@ -265,7 +261,11 @@ class PipelineParallelismTest(unittest.TestCase):
         capacity_factor=1,
         decoder_block="deepseek",
     )
-    self.assert_pipeline_same_output_and_grad(config, single_pipeline_stage_class=deepseek.DeepSeekMoELayerToLinen)
+    self.assert_pipeline_same_output_and_grad(
+        config,
+        single_pipeline_stage_class=deepseek.DeepSeekMoELayerToLinen,
+        nnx_stage_class=deepseek.DeepSeekMoELayer,
+    )
 
   @pytest.mark.tpu_only
   def test_circular_ag_once(self):

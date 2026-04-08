@@ -905,7 +905,7 @@ class NNXCircularPipeline(NNXPipelineBase):
 
   def from_repeat_weights_to_bsw(self, repeat_weights, physical_partition_spec):
     """Executes FSDP-like all-gathers to fully materialize a block of weights for BSW."""
-    axes_to_remove = ["fsdp", "fsdp_transpose"]
+    axes_to_remove = ["fsdp", "fsdp_transpose", "context"]
     if physical_partition_spec is not None:
       bsw_pps = pipeline_utils.derive_stage_weight_partition_specs(physical_partition_spec, axes_to_remove)
     else:
