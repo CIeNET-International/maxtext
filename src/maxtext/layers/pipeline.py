@@ -27,6 +27,7 @@ import jax.ad_checkpoint
 from flax.core import meta
 from flax import linen as nn
 from flax import nnx
+from maxtext.layers import initializers
 from maxtext.layers.nnx_wrappers import to_linen_class
 
 from maxtext.common.common_types import Config, MODEL_MODE_TRAIN, EP_AS_CONTEXT, ShardMode
@@ -1170,13 +1171,18 @@ def create_nnx_pipeline(
 # ---------------------------------------------------------------------------
 # Linen-compatible wrappers (must be defined after NNX classes above)
 # ---------------------------------------------------------------------------
-Pipeline = to_linen_class(NNXPipeline)
-CircularPipeline = to_linen_class(NNXCircularPipeline)
+Pipeline = to_linen_class(
+    NNXPipeline,
+    base_metadata_fn=initializers.variable_to_logically_partitioned,)
+CircularPipeline = to_linen_class(
+  NNXCircularPipeline,
+  base_metadata_fn=initializers.variable_to_logically_partitioned,
+)
 
 
 def create_pipeline(
     config: Config, stage_factory: Any, mesh: Mesh, remat_policy: Any = None
-) -> Pipeline | CircularPipeline:
+):
   """Factory function to instantiate the correct Linen Pipeline module based on config.
 
   Args:
