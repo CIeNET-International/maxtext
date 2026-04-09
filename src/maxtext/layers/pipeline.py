@@ -855,13 +855,22 @@ class NNXPipeline(NNXPipelineBase):
 
     layers_state = jax.tree.map(unbox_val, layers_state, is_leaf=is_lp)
 
-    if self.config.pipeline_fsdp_ag_once:
-      layers_state = self.all_gather_over_fsdp(layers_state, logical_partition_spec)
-
     def is_static_param(_, v):
       return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
 
+    # Split BEFORE all_gather_over_fsdp so the tree handed to it aligns with
+    # logical_partition_spec. logical_partition_spec comes from get_weight_sharding
+    # which filters to the same is_static_param predicate (nnx.Param +
+    # _overwrite_with_gradient), so layers_params and the spec tree are
+    # structurally identical by construction. Passing the unfiltered layers_state
+    # would include dropout/RNG state that the spec tree lacks, causing
+    # jax.tree.map to raise "Mismatch custom node data". Mirrors Linen
+    # old_pipeline.py:864-866 where all_gather_over_fsdp operates on
+    # self.layers.variables (the params collection only).
     _, layers_params, layers_metrics, layers_mutables = nnx.split(layers_state, is_static_param, nnx.Intermediate, ...)
+
+    if self.config.pipeline_fsdp_ag_once:
+      layers_params = self.all_gather_over_fsdp(layers_params, logical_partition_spec)
 
     def scan_body(carry, _):
       current_loop_state, current_layer_mutables = carry
