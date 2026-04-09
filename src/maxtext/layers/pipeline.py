@@ -24,6 +24,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import jax
 import jax.ad_checkpoint
 
+from aqt.jax.v2 import aqt_tensor
 from flax.core import meta
 from flax import linen as nn
 from flax import nnx
@@ -607,27 +608,89 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
     self.layers = nnx.merge(graphdef, params, rest)
 
   def get_weight_sharding(self, *init_args):
-    """Returns a pytree of PartitionSpecs mirroring the params state.
+    """Returns a pytree of logical-name PartitionSpecs mirroring the params state.
 
-    Params lacking explicit sharding metadata are mapped to P() (replicated),
-    matching Linen's "every param has a valid PartitionSpec" contract. Returning
-    P() instead of None ensures shard_map spec trees are always valid.
+    Reads the sharding tuple that ``nnx.Param(sharding=...)`` stores in the
+    variable's metadata and converts it to a ``jax.sharding.PartitionSpec``.
+    ``nnx.vmap(..., transform_metadata={PARTITION_NAME: "layers"})`` prepends
+    the vmap axis name to this tuple automatically, so a twice-vmapped
+    circular-pipeline param ends up with
+    ``out_sharding=('circular_repeats', 'layers', 'embed', 'mlp')`` and this
+    method returns ``P('circular_repeats', 'layers', 'embed', 'mlp')``.
+
+    The ``circular_repeats`` axis is stripped downstream by
+    ``pipeline_utils.strip_pipeline_repeat_logical_axis`` in
+    ``NNXCircularPipeline.__call__`` (the two-spec pattern); do NOT strip it
+    here.
+
+    The state filter matches ``is_static_param`` used by ``__call__`` (see
+    e.g. line 1196): both ``nnx.Param`` and ``_overwrite_with_gradient``
+    variables are included so the returned spec tree aligns leaf-for-leaf
+    with ``layers_params`` downstream. Without this, FP8 runs (which produce
+    ``_overwrite_with_gradient`` amax history and scale variables via
+    ``flax/linen/fp8_ops.py``) would fail with a pytree structure mismatch in
+    ``weight_prefetching``.
+
+    Metadata keys are tried in this order (matches the precedence used by
+    ``variable_to_logically_partitioned`` in
+    ``src/MaxText/layers/initializers.py``):
+
+      1. ``out_sharding`` — current Flax NNX (>=0.12.x). Written by both
+         ``nnx.Param(sharding=...)`` and ``nnx.Param(out_sharding=...)``.
+      2. ``sharding_names`` — legacy alias.
+      3. ``sharding`` — legacy alias used by an older Flax.
+
+    Quantized (``aqt_tensor.QTensor``) values and ``_overwrite_with_gradient``
+    variables are treated as replicated (``P()``), mirroring the skip-list in
+    ``variable_to_logically_partitioned`` (``initializers.py:81-85``). A single
+    PartitionSpec per VariableState keeps the spec tree shape aligned with
+    downstream consumers that do ``jax.tree.map`` with
+    ``is_leaf=isinstance(., nnx.VariableState)``.
+
+    Params lacking any of these keys are also mapped to ``P()`` (replicated),
+    matching Linen's "every param has a valid PartitionSpec" contract.
     """
-    state = nnx.state(self.layers, nnx.Param)
+    # Match __call__'s is_static_param: include both nnx.Param and
+    # _overwrite_with_gradient variables so the spec tree aligns with layers_params.
+    def _is_static_param(path, v):
+      return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
+
+    state = nnx.state(self.layers, _is_static_param)
 
     def get_spec(x):
       if not isinstance(x, nnx.VariableState):
         # Non-VariableState leaf (e.g., nnx.Empty): treat as replicated.
         return P()
+      # _overwrite_with_gradient variables (FP8 amax history / scales) carry no
+      # partition metadata; return replicated to keep the tree aligned.
+      if x.type.__name__ == "_overwrite_with_gradient":
+        return P()
+      # AQT QTensor values are a pytree wrapping quantized data; mirror the
+      # skip-list in variable_to_logically_partitioned (initializers.py:81-83).
+      if isinstance(x.value, aqt_tensor.QTensor):
+        return P()
       if isinstance(x.value, nn.spmd.LogicallyPartitioned):
+        # Dead in the NNX-first flow; retained as a forward-compat guard in
+        # case a Linen-wrapped param is ever merged into this module.
         return x.value.partitions
       metadata = x.get_metadata()
-      sharding = metadata.get("sharding")
-      if sharding and hasattr(sharding, "spec"):
+      # Try each known metadata key in order; first hit wins.
+      sharding = metadata.get("out_sharding")
+      if sharding is None:
+        sharding = metadata.get("sharding_names")
+      if sharding is None:
+        sharding = metadata.get("sharding")
+      # Already a PartitionSpec - pass through.
+      if isinstance(sharding, P):
+        return sharding
+      # Happy path: tuple/list of logical axis names from nnx.Param(sharding=...).
+      if isinstance(sharding, (tuple, list)):
+        return P(*sharding)
+      # Non-PartitionSpec wrapper with an explicit ``.spec`` attribute (kept
+      # for forward compatibility with future Flax wrapper types).
+      if sharding is not None and hasattr(sharding, "spec"):
         return sharding.spec
       # Fallback: replicated sharding (valid for shard_map, unlike None).
-      # Linen provides valid PartitionSpec for every param via nn.with_partitioning;
-      # NNX params without explicit sharding get replicated sharding here.
       return P()
 
     return jax.tree.map(get_spec, state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
@@ -795,7 +858,7 @@ class NNXPipeline(NNXPipelineBase):
     if self.config.pipeline_fsdp_ag_once:
       layers_state = self.all_gather_over_fsdp(layers_state, logical_partition_spec)
 
-    def is_static_param(path, v):
+    def is_static_param(_, v):
       return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
 
     _, layers_params, layers_metrics, layers_mutables = nnx.split(layers_state, is_static_param, nnx.Intermediate, ...)
@@ -961,28 +1024,102 @@ class NNXCircularPipeline(NNXPipelineBase):
   def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec):
     """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer.
 
-    NNX vmap-only path. The shard_map optimization from Linen cannot be used yet
-    because get_weight_sharding does not reliably extract nnx.vmap-added stage/repeat
-    sharding axes — the fallback produces P() specs that claim "not varying across
-    any mesh axis", but the BSW selection genuinely varies across the stage axis,
-    causing shard_map to reject the contradiction.
+    Mirrors Linen ``old_pipeline.py:1125`` shard_map approach. Preconditions
+    that make this work in NNX (all addressed by earlier commits in this
+    sequence):
 
-    TODO(shard-map-reenable): Fix get_weight_sharding to correctly extract the
-    sharding axes added by nnx.vmap (PARTITION_NAME metadata), then the shard_map
-    path can be restored. See docs/superpowers/plans/2026-04-09-pipeline-shard-map-reenable.md
-    for the treedef roundtrip + two-spec pattern that are ready to re-enable.
+    - Fix C (``get_weight_sharding``, commits 04a31e939 + 405e4bb0c):
+      returns real logical specs from the ``out_sharding`` metadata tuple,
+      including FP8 and AQT skip-list handling, so ``bsw_pps`` carries real
+      mesh axes like ``P('stage','fsdp','tensor')`` instead of ``P()``.
+    - Fix A (two-spec pattern in ``NNXCircularPipeline.__call__``,
+      commit 6e724b907): the ``physical_partition_spec`` reaching this
+      method has the ``circular_repeats`` axis stripped, so its dims match
+      the 3-dim BSW arrays (repeat already gathered away by
+      ``from_all_variables_to_repeat_weights``).
+    - Treedef roundtrip below: strips ``nnx.Variable`` wrappers from BSW
+      for shard_map pytree compatibility, then reconstructs them so
+      downstream ``nnx.State.merge`` works.
+
+    The ``else`` branch preserves a ``jax.vmap`` fallback for the
+    initialization path where ``physical_partition_spec`` is ``None``
+    (``jax.eval_shape`` during ``setup_initial_state``).
     """
+    bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
 
-    def select_weights_from_bsw(bsw_inner, repeat_id):
-      return jax.tree.map(
-          lambda x, y: jax.lax.select(repeat_id == stage0_repeat_id, y, x) if x is not None else None,
-          bsw_inner[0],
-          bsw_inner[1],
+    if bsw_pps is not None:
+      # Strip nnx.Variable containers from BSW for shard_map pytree compatibility.
+      # BSW has Param(array) nodes at leaves; shard_map specs are plain P() leaves.
+      # Treedef roundtrip:
+      #   1. Capture bsw_treedef (includes Param nodes) for reconstruction later
+      #   2. Flatten BSW leaves (raw arrays extracted from inside Param nodes)
+      #   3. Rebuild BSW with pps_treedef (no Param nodes) so it matches bsw_pps
+      #   4. Run shard_map on the raw-array BSW
+      #   5. Reconstruct nnx.Variable wrappers via bsw_treedef.unflatten
+      # Leaf counts match by construction: bsw and bsw_pps are co-derived from
+      # the same weight tree (via get_weight_sharding + from_repeat_weights_to_bsw).
+      bsw_treedef = jax.tree.structure(bsw[0])
+      # Both P and None count as leaves for spec-tree traversal. Fix C
+      # guarantees no None leaves in bsw_pps, but `or x is None` is kept as a
+      # defence-in-depth safety net against a future regression that re-
+      # introduces None specs.
+      is_spec_leaf = lambda x: isinstance(x, P) or x is None
+      pps_treedef = jax.tree.structure(bsw_pps, is_leaf=is_spec_leaf)
+      bsw0_leaves = jax.tree.leaves(bsw[0])
+      bsw1_leaves = jax.tree.leaves(bsw[1])
+      # Defensive: both BSW halves and the spec tree must agree on leaf count.
+      # Stricter: bsw[0] and bsw[1] must have the same *structure*, not just
+      # the same leaf count — they are co-produced by from_repeat_weights_to_bsw
+      # called on cur_repeat_weights / nxt_repeat_weights so in practice this
+      # always holds, but catching a divergence early beats a confusing
+      # shard_map error later.
+      assert bsw_treedef == jax.tree.structure(bsw[1]), (
+          f"BSW half-tree structure mismatch: bsw[0] and bsw[1] must be "
+          f"structurally identical but differ."
       )
+      assert pps_treedef.num_leaves == len(bsw0_leaves) == len(bsw1_leaves), (
+          f"BSW/spec leaf count mismatch: specs={pps_treedef.num_leaves}, "
+          f"bsw0={len(bsw0_leaves)}, bsw1={len(bsw1_leaves)}"
+      )
+      raw_bsw_0 = pps_treedef.unflatten(bsw0_leaves)
+      raw_bsw_1 = pps_treedef.unflatten(bsw1_leaves)
 
-    weights = jax.vmap(select_weights_from_bsw, in_axes=((0, 0), 0), out_axes=0)(bsw, repeat_ids)
+      @jax.shard_map(
+          mesh=self.mesh,
+          in_specs=((bsw_pps, bsw_pps), P("stage")),
+          out_specs=bsw_pps,
+          check_vma=True,
+      )
+      # [0]: shard_map passes repeat_id as a (1,)-shaped per-stage slice, not
+      # a scalar. raw_bsw leaves are all arrays (the treedef roundtrip above
+      # reconstructed pps_treedef with the raw array leaves from bsw), so no
+      # None-guard is needed here — matches Linen old_pipeline.py:1134.
+      def select_weights_from_bsw(bsw_inner, repeat_id):
+        return jax.tree.map(
+            lambda x, y: jax.lax.select(repeat_id[0] == stage0_repeat_id, y, x),
+            bsw_inner[0],
+            bsw_inner[1],
+        )
+
+      raw_weights = select_weights_from_bsw((raw_bsw_0, raw_bsw_1), repeat_ids)
+      # Reconstruct nnx.Variable wrappers so downstream nnx.State.merge works.
+      # raw_weights has pps_treedef structure; re-flatten and unflatten into bsw_treedef.
+      weights = bsw_treedef.unflatten(jax.tree.leaves(raw_weights))
+    else:
+      # Fallback: no partition spec provided (e.g. initialization path where
+      # logical_partition_spec is None); use vmap over the repeat dim. NNX
+      # Variable wrappers are handled natively by jax.vmap — no treedef
+      # roundtrip needed.
+      def select_weights_from_bsw(bsw_inner, repeat_id):
+        return jax.tree.map(
+            lambda x, y: jax.lax.select(repeat_id == stage0_repeat_id, y, x) if x is not None else None,
+            bsw_inner[0],
+            bsw_inner[1],
+        )
+
+      weights = jax.vmap(select_weights_from_bsw, in_axes=((0, 0), 0), out_axes=0)(bsw, repeat_ids)
 
     return weights
 
