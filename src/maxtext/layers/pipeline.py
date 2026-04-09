@@ -961,65 +961,28 @@ class NNXCircularPipeline(NNXPipelineBase):
   def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec):
     """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer.
 
-    Mirrors Linen old_pipeline.py:1125 shard_map approach. Preconditions that make
-    this work in NNX (all addressed by earlier fixes in this sequence):
-    - Fix C: get_weight_sharding returns P() (not None) for unsharded params
-    - Fix A: __call__ passes repeat-stripped logical spec to run_one_iteration, so
-      physical_partition_spec here has no circular_repeats axis and its dims match
-      the 3-dim BSW arrays (repeat gathered away by from_all_variables_to_repeat_weights).
-    - This method: treedef roundtrip strips nnx.Variable wrappers from BSW for
-      shard_map pytree compatibility, then reconstructs them for nnx.State.merge.
+    NNX vmap-only path. The shard_map optimization from Linen cannot be used yet
+    because get_weight_sharding does not reliably extract nnx.vmap-added stage/repeat
+    sharding axes — the fallback produces P() specs that claim "not varying across
+    any mesh axis", but the BSW selection genuinely varies across the stage axis,
+    causing shard_map to reject the contradiction.
+
+    TODO(shard-map-reenable): Fix get_weight_sharding to correctly extract the
+    sharding axes added by nnx.vmap (PARTITION_NAME metadata), then the shard_map
+    path can be restored. See docs/superpowers/plans/2026-04-09-pipeline-shard-map-reenable.md
+    for the treedef roundtrip + two-spec pattern that are ready to re-enable.
     """
-    bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
 
-    if bsw_pps is not None:
-      # Strip nnx.Variable containers from BSW for shard_map pytree compatibility.
-      # BSW has Param(array) nodes at leaves; shard_map specs are plain P() leaves.
-      # Treedef roundtrip:
-      #   1. Capture bsw_treedef (includes Param nodes) for reconstruction later
-      #   2. Flatten BSW leaves (raw arrays extracted from inside Param nodes)
-      #   3. Rebuild BSW with pps_treedef (no Param nodes) so it matches bsw_pps
-      #   4. Run shard_map on raw-array BSW
-      #   5. Reconstruct nnx.Variable wrappers via bsw_treedef.unflatten
-      # Leaf counts match by construction: bsw and bsw_pps co-derived from same weight tree.
-      bsw_treedef = jax.tree.structure(bsw[0])
-      is_spec_leaf = lambda x: isinstance(x, P) or x is None
-      pps_treedef = jax.tree.structure(bsw_pps, is_leaf=is_spec_leaf)
-      bsw0_leaves = jax.tree.leaves(bsw[0])
-      bsw1_leaves = jax.tree.leaves(bsw[1])
-      assert pps_treedef.num_leaves == len(bsw0_leaves) == len(bsw1_leaves), (
-          f"BSW/spec leaf count mismatch: specs={pps_treedef.num_leaves}, "
-          f"bsw0={len(bsw0_leaves)}, bsw1={len(bsw1_leaves)}"
+    def select_weights_from_bsw(bsw_inner, repeat_id):
+      return jax.tree.map(
+          lambda x, y: jax.lax.select(repeat_id == stage0_repeat_id, y, x) if x is not None else None,
+          bsw_inner[0],
+          bsw_inner[1],
       )
-      raw_bsw_0 = pps_treedef.unflatten(bsw0_leaves)
-      raw_bsw_1 = pps_treedef.unflatten(bsw1_leaves)
 
-      @jax.shard_map(mesh=self.mesh, in_specs=((bsw_pps, bsw_pps), P("stage")), out_specs=bsw_pps, check_vma=True)
-      def select_weights_from_bsw(bsw_inner, repeat_id):
-        return jax.tree.map(
-            lambda x, y: jax.lax.select(repeat_id[0] == stage0_repeat_id, y, x) if x is not None else None,
-            bsw_inner[0],
-            bsw_inner[1],
-        )
-
-      raw_weights = select_weights_from_bsw((raw_bsw_0, raw_bsw_1), repeat_ids)
-      # Reconstruct nnx.Variable wrappers for nnx.State.merge compatibility downstream.
-      # raw_weights has pps_treedef structure; re-flatten and unflatten into bsw_treedef.
-      weights = bsw_treedef.unflatten(jax.tree.leaves(raw_weights))
-    else:
-      # Fallback: no partition spec provided (e.g. initialization path where
-      # logical_partition_spec is None); use vmap over the repeat dim. NNX Variable
-      # wrappers are handled natively by jax.vmap — no treedef roundtrip needed.
-      def select_weights_from_bsw(bsw_inner, repeat_id):
-        return jax.tree.map(
-            lambda x, y: jax.lax.select(repeat_id == stage0_repeat_id, y, x) if x is not None else None,
-            bsw_inner[0],
-            bsw_inner[1],
-        )
-
-      weights = jax.vmap(select_weights_from_bsw, in_axes=((0, 0), 0), out_axes=0)(bsw, repeat_ids)
+    weights = jax.vmap(select_weights_from_bsw, in_axes=((0, 0), 0), out_axes=0)(bsw, repeat_ids)
 
     return weights
 
@@ -1199,6 +1162,13 @@ class NNXCircularPipeline(NNXPipelineBase):
 
     _, layers_params, layers_metrics, layers_mutables = nnx.split(layers_state, is_static_param, nnx.Intermediate, ...)
 
+    # TODO(rng-split): NNX scan_body does NOT advance RNG keys per iteration.
+    # Linen old_pipeline.py uses nn.scan(split_rngs={"random": True}) which
+    # auto-splits dropout keys per iteration. jax.lax.scan has no equivalent,
+    # so every microbatch in the pipeline sees the SAME dropout mask. This is
+    # a correctness bug for training with dropout (deterministic=False,
+    # dropout_rate>0). Fix by folding loop_iteration into RNG state or carrying
+    # RngState in the scan tuple. Out of scope for the shard_map fix sequence.
     def scan_body(carry, _):
       current_loop_state, _, current_layer_mutables = carry
 
