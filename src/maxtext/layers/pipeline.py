@@ -733,16 +733,54 @@ class NNXPipeline(NNXPipelineBase):
     if physical_partition_spec is None:
       return jax.tree.map(gather_weights_for_stages_in, weights)
 
-    # Flatten specs to a list aligned with weights' leaf traversal order.
-    # Single-tree map on weights lets jax.tree.map naturally recurse into
-    # nnx.Variable nodes and create NEW Variables from results (no mutation),
-    # avoiding TraceContextError inside jax.lax.scan.
+    # `weights` is the merged state (layers_params + layers_metrics + layers_mutables)
+    # and may contain variables that `physical_partition_spec` does not cover
+    # (e.g., dropout RngState that nnx.vmap propagates without a sharding spec).
+    # The old flat spec_iter pattern walked `weights` in leaf order and pulled
+    # one spec per leaf; with a merged state it misaligned (e.g., dropout
+    # RngState of rank 2 getting a rank-4 mlp kernel spec) and raised
+    # "value of rank 2 but spec of rank 4" from with_sharding_constraint.
+    #
+    # Fix: split `weights` by the same is_static_param predicate that
+    # `get_weight_sharding` uses, so the static-params sub-tree has the same
+    # leaf count as the spec tree (empirically verified against flax 0.12.6 /
+    # jax 0.9.2 — see git reflog note about invariant (8) during the Fix C
+    # landing). Then apply the spec_iter pattern on the aligned sub-tree so
+    # specs and values pair up 1:1, and gather the non-params separately with
+    # spec=None (shard_dim_by_stages handles None by building a placeholder
+    # of the correct rank per value). Merge back afterwards so downstream
+    # consumers see the full state.
+    #
+    # Note on 2-tree jax.tree.map: we cannot use the Linen-style
+    # `jax.tree.map(f, weights, spec)` pattern (old_pipeline.py:669) here
+    # because `weights_params` has `nnx.Param` leaves that are pytree nodes
+    # (descending to `.value`), while `physical_partition_spec` has plain `P`
+    # leaves. The structures diverge at the Param/P level and jax.tree.map
+    # raises "Custom node type mismatch". The spec_iter pattern sidesteps
+    # this by only walking the weights tree and using a flat spec list.
+    def is_static_param(_, v):
+      return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
+
+    _, weights_params, weights_rest = nnx.split(weights, is_static_param, ...)
+
+    # Spec-iter pattern on the aligned static-params sub-tree. weights_params
+    # and physical_partition_spec now have the same leaf count because both
+    # were produced from the same is_static_param predicate applied to the
+    # same layer structure.
     def is_spec_leaf(x):
       return isinstance(x, P) or x is None
 
     spec_leaves = jax.tree_util.tree_leaves(physical_partition_spec, is_leaf=is_spec_leaf)
     spec_iter = iter(spec_leaves)
-    return jax.tree.map(lambda w: gather_weights_for_stages_in(w, next(spec_iter)), weights)
+    gathered_params = jax.tree.map(
+        lambda w: gather_weights_for_stages_in(w, next(spec_iter)),
+        weights_params,
+    )
+
+    # Non-params gathered without sharding hints.
+    gathered_rest = jax.tree.map(gather_weights_for_stages_in, weights_rest)
+
+    return nnx.State.merge(gathered_params, gathered_rest)
 
   def run_one_iteration(
       self,
