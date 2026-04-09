@@ -24,6 +24,7 @@ as you would on the target hardware.
 import functools
 import os
 import pickle
+import re
 from typing import Sequence
 
 from absl import app
@@ -144,6 +145,43 @@ def jit_and_compile(
     )
     maxtext_utils.maybe_dump_jaxpr(config, jitted, func_input_args)
     lowered = jitted.lower(*func_input_args, **func_input_kwargs)
+  # Dump lowered HLO before compilation (works even when compile fails)
+  hlo_dump_path = f"/tmp/hlo_dump_{config.compile_topology}.txt"
+  print(f"[train_compile] Dumping lowered HLO to {hlo_dump_path}...", flush=True)
+  hlo_text = lowered.as_text()
+  with open(hlo_dump_path, "w") as f:
+    f.write(hlo_text)
+  print(f"[train_compile] HLO dumped ({os.path.getsize(hlo_dump_path)} bytes)", flush=True)
+
+  # HLO diagnostic: find largest tensors to verify SparseCore compatibility
+  # Match both XLA HLO format (bf16[M,N]) and StableHLO format (tensor<MxNxbf16>)
+  tensor_pattern = re.compile(r'(bf16|f32|f16|s8|u8|s32)\[([0-9,]+)\]|tensor<([0-9x]+)x(bf16|f32|f16|i8|i32)>')
+  tensor_sizes = []
+  for m in tensor_pattern.finditer(hlo_text):
+    if m.group(1):  # XLA format: bf16[M,N]
+      dtype, dims = m.group(1), m.group(2)
+      shape = tuple(int(d) for d in dims.split(','))
+    else:  # StableHLO format: tensor<MxNxbf16>
+      dims_str, dtype = m.group(3), m.group(4)
+      shape = tuple(int(d) for d in dims_str.split('x'))
+      dtype = {'i8': 's8', 'i32': 's32'}.get(dtype, dtype)
+    bytes_per_elem = 2 if dtype in ('bf16', 'f16') else 4 if dtype in ('f32', 's32') else 1
+    size_bytes = 1
+    for d in shape:
+      size_bytes *= d
+    size_bytes *= bytes_per_elem
+    tensor_sizes.append((size_bytes, dtype, shape))
+  tensor_sizes.sort(reverse=True)
+  print("[HLO DIAG] Top 10 largest tensors in lowered HLO:", flush=True)
+  for size_bytes, dtype, shape in tensor_sizes[:10]:
+    size_gib = size_bytes / (1024**3)
+    print(f"  {size_gib:.2f} GiB  {dtype}{list(shape)}", flush=True)
+  # Check for SparseCore violations (>16 GiB)
+  violations = [(s, dt, sh) for s, dt, sh in tensor_sizes if s > 16 * (1024**3)]
+  if violations:
+    print(f"[HLO DIAG] WARNING: {len(violations)} tensors exceed SparseCore 16 GiB limit!", flush=True)
+  else:
+    print("[HLO DIAG] All tensors within SparseCore 16 GiB limit.", flush=True)
   # Import libtpu flags as compiler options. Defaults to empty dict if string is empty.
   compiler_options = max_utils.parse_libtpu_flags_to_dict(config.compile_xla_flags)
   compiled = lowered.compile(compiler_options=compiler_options)

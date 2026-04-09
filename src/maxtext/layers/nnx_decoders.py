@@ -383,6 +383,7 @@ class NNXDecoder(nnx.Module):
     self.scanned_layers = None
     self.is_deepseek = self.config.decoder_block == DecoderBlockType.DEEPSEEK
     self.is_gemma3 = self.config.decoder_block == DecoderBlockType.GEMMA3
+    self.is_gemma4 = self.config.decoder_block == DecoderBlockType.GEMMA4
 
     if config.using_pipeline_parallelism:
 
@@ -461,6 +462,21 @@ class NNXDecoder(nnx.Module):
           self.layers_remainder = RemattedGemma3Block(
               config=self.config, mesh=mesh, quant=self.quant, model_mode=self.model_mode, **rem_layer_kwargs, rngs=rngs
           )
+        elif config.decoder_block == DecoderBlockType.GEMMA4:
+          block_pattern_len = len(gemma4.GEMMA4_ATTENTION_PATTERN)
+          num_full_blocks = config.num_decoder_layers // block_pattern_len
+          remainder_layers = config.num_decoder_layers % block_pattern_len
+          layer_kwargs = {"num_of_layers": block_pattern_len}
+          Gemma4Block = gemma4.Gemma4ScannableBlock
+          if num_full_blocks > 0:
+            self.layers = self._create_scanned_layers(
+                Gemma4Block, length=num_full_blocks, metadata_axis_name="layers", rngs=rngs, **layer_kwargs
+            )
+          if remainder_layers > 0:
+            rem_layer_kwargs = {"num_of_layers": remainder_layers}
+            self.layers_remainder = Gemma4Block(
+                config=self.config, mesh=mesh, quant=self.quant, model_mode=self.model_mode, **rem_layer_kwargs, rngs=rngs
+            )
         else:
           layer_cls = decoder_block_classes[0]
           num_layers = int(config.num_decoder_layers / config.inhomogeneous_layer_cycle_interval)
@@ -489,6 +505,8 @@ class NNXDecoder(nnx.Module):
             layer_kwargs = {}
             if config.decoder_block == DecoderBlockType.GEMMA3:
               layer_kwargs = {"attention_type": gemma3.get_attention_type(layer_id=lyr)}
+            elif config.decoder_block == DecoderBlockType.GEMMA4:
+              layer_kwargs = {"attention_type": gemma4.get_attention_type(layer_id=lyr)}
             elif config.decoder_block == DecoderBlockType.LLAMA4:
               layer_kwargs = {
                   "is_nope_layer": llama4.determine_is_nope_layer(lyr, self.config.nope_layer_interval),
@@ -918,6 +936,8 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.GEMMA,
         DecoderBlockType.GEMMA2,
         DecoderBlockType.GEMMA3,
+        DecoderBlockType.GEMMA4,
+        DecoderBlockType.QWEN2,
         DecoderBlockType.QWEN3,
         DecoderBlockType.QWEN3_MOE,
         DecoderBlockType.GPT_OSS,
@@ -960,6 +980,8 @@ class NNXDecoder(nnx.Module):
           "gemma3-4b",
           "gemma3-12b",
           "gemma3-27b",
+          "gemma4-26b",
+          "gemma4-31b",
           "llama4-17b-16e",
           "llama4-17b-128e",
           "qwen3-omni-30b-a3b",
@@ -1093,7 +1115,7 @@ class NNXDecoder(nnx.Module):
     layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
 
     layer_kwargs = {}
-    if cfg.decoder_block == DecoderBlockType.GEMMA3:
+    if cfg.decoder_block in (DecoderBlockType.GEMMA3, DecoderBlockType.GEMMA4):
       layer_kwargs["bidirectional_mask"] = bidirectional_mask
 
     if attention_metadata is not None:
@@ -1105,7 +1127,11 @@ class NNXDecoder(nnx.Module):
     # Execution Routing (Pipeline vs Direct)
     # -------------------------------------------------------------------------
     if cfg.using_pipeline_parallelism:
-      logical_partition_spec = self.pipeline_module.get_weight_sharding() if cfg.pipeline_fsdp_ag_once else None
+      logical_partition_spec = (
+          self.pipeline_module.get_weight_sharding()
+          if (cfg.pipeline_fsdp_ag_once or cfg.pipeline_fsdp_ag_per_repeat)
+          else None
+      )
 
       if self.is_deepseek:
         logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
@@ -1280,6 +1306,18 @@ class NNXDecoder(nnx.Module):
               page_state,
               slot,
           )
+        elif self.is_gemma4:
+          y = self._apply_gemma4_scanned_blocks(
+              y,
+              decoder_segment_ids,
+              decoder_positions,
+              deterministic,
+              model_mode,
+              bidirectional_mask,
+              previous_chunk,
+              page_state,
+              slot,
+          )
         else:
           y, self.layers = self._apply_layers_sequentially(
               self.layers, y, *layer_args, length=cfg.num_decoder_layers, **layer_kwargs
@@ -1392,6 +1430,55 @@ class NNXDecoder(nnx.Module):
       checkpointed_gemma_fn = jax.checkpoint(pure_gemma_fn, policy=policy, prevent_cse=prevent_cse)
       graphdef, state = nnx.split(self.layers_remainder)
       y, new_state = checkpointed_gemma_fn(graphdef, state, y)
+      self.layers_remainder = nnx.merge(graphdef, new_state)
+
+    return y
+
+  def _apply_gemma4_scanned_blocks(
+      self,
+      y,
+      decoder_segment_ids,
+      decoder_positions,
+      deterministic,
+      model_mode,
+      bidirectional_mask,
+      previous_chunk,
+      page_state,
+      slot,
+  ):
+    """Applies Gemma4 scanned decoder blocks, handling main scan and remainders."""
+
+    cfg = self.config
+
+    # Define the repeating pattern length and calculate how many full blocks to scan
+    block_pattern_len = len(gemma4.GEMMA4_ATTENTION_PATTERN)
+    num_full_blocks = cfg.num_decoder_layers // block_pattern_len
+    remainder_layers = cfg.num_decoder_layers % block_pattern_len
+
+    layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
+    layer_kwargs = {"bidirectional_mask": bidirectional_mask}
+
+    # Apply the main scan over the full blocks
+    if num_full_blocks > 0:
+      y, self.layers = self._apply_layers_sequentially(
+          self.layers, y, *layer_args, length=num_full_blocks, **layer_kwargs
+      )
+
+    # Apply any remaining layers that did not fit into a full scanned block
+    if remainder_layers > 0 and hasattr(self, "layers_remainder"):
+      policy = self.get_remat_policy()
+      prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
+
+      def pure_gemma4_fn(graphdef, state_in, y_in):
+        merged_layer = nnx.merge(graphdef, state_in)
+        out_y, _ = merged_layer(
+            y_in, *layer_args, previous_chunk=previous_chunk, page_state=page_state, slot=slot, **layer_kwargs
+        )
+        return out_y, nnx.state(merged_layer)
+
+      checkpointed_gemma4_fn = jax.checkpoint(pure_gemma4_fn, policy=policy, prevent_cse=prevent_cse)
+      graphdef, state = nnx.split(self.layers_remainder)
+      y, new_state = checkpointed_gemma4_fn(graphdef, state, y)
       self.layers_remainder = nnx.merge(graphdef, new_state)
 
     return y
