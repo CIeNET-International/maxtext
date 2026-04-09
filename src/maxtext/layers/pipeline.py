@@ -951,7 +951,15 @@ class NNXCircularPipeline(NNXPipelineBase):
 
   def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec):
     """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer."""
-    bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
+    # Use derive_stage_weight_partition_specs (same as from_repeat_weights_to_bsw) to match
+    # BSW's actual dimensions: FSDP/context axes removed, repeat dim dropped.
+    # _remove_fsdp_from_physical_partition_spec would keep the repeat dim, mismatching BSW
+    # arrays whose repeat dim was already removed by from_all_variables_to_repeat_weights.
+    axes_to_remove = ["fsdp", "fsdp_transpose", "context"]
+    if physical_partition_spec is not None:
+      bsw_pps = pipeline_utils.derive_stage_weight_partition_specs(physical_partition_spec, axes_to_remove)
+    else:
+      bsw_pps = None
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
 
