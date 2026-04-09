@@ -956,6 +956,21 @@ class NNXCircularPipeline(NNXPipelineBase):
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
 
     if bsw_pps is not None:
+      # Strip nnx.Variable containers from BSW for shard_map pytree compatibility.
+      # BSW has Param(array) nodes; shard_map specs are plain P()/None leaves.
+      # Use treedef roundtrip: flatten BSW leaves, rebuild with spec structure, run shard_map,
+      # then reconstruct Variable wrappers from original treedef.
+      # Leaf counts match by construction: bsw and bsw_pps are co-derived from the same weight tree.
+      bsw_treedef = jax.tree.structure(bsw[0])
+      is_spec_leaf = lambda x: isinstance(x, P) or x is None
+      pps_treedef = jax.tree.structure(bsw_pps, is_leaf=is_spec_leaf)
+      bsw0_leaves = jax.tree.leaves(bsw[0])
+      bsw1_leaves = jax.tree.leaves(bsw[1])
+      assert pps_treedef.num_leaves == len(bsw0_leaves), (
+          f"BSW/spec leaf count mismatch: specs={pps_treedef.num_leaves}, bsw={len(bsw0_leaves)}"
+      )
+      raw_bsw_0 = pps_treedef.unflatten(bsw0_leaves)
+      raw_bsw_1 = pps_treedef.unflatten(bsw1_leaves)
 
       @jax.shard_map(mesh=self.mesh, in_specs=((bsw_pps, bsw_pps), P("stage")), out_specs=bsw_pps, check_vma=True)
       def select_weights_from_bsw(bsw_inner, repeat_id):
@@ -965,7 +980,9 @@ class NNXCircularPipeline(NNXPipelineBase):
             bsw_inner[1],
         )
 
-      weights = select_weights_from_bsw(bsw, repeat_ids)
+      raw_weights = select_weights_from_bsw((raw_bsw_0, raw_bsw_1), repeat_ids)
+      # Reconstruct nnx.Variable wrappers for nnx.State.merge compatibility downstream.
+      weights = bsw_treedef.unflatten(jax.tree.leaves(raw_weights))
     else:
 
       def select_weights_from_bsw(bsw_inner, repeat_id):
