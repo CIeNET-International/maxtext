@@ -587,7 +587,7 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
         create_stage_fn,
         in_axes=0,
         out_axes=(None, 0, 0),
-        axis_name=self.spmd_axis_name,
+        spmd_axis_name=self.spmd_axis_name,
         transform_metadata={nnx.PARTITION_NAME: "layers"},
     )
 
@@ -705,7 +705,7 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
         func_to_vmap,
         in_axes=(None, 0, 0, 0, 0, None, None),
         out_axes=(0, 0),
-        axis_name=self.spmd_axis_name,
+        spmd_axis_name=self.spmd_axis_name,
     )
 
 
