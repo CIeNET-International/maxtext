@@ -608,7 +608,7 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
 
   def get_weight_sharding(self, *init_args):
     """get weight sharding function for this pipeline."""
-    state = nnx.state(self.layers)
+    state = nnx.state(self.layers, nnx.Param)
 
     def get_spec(x):
       if not isinstance(x, nnx.VariableState):
@@ -850,7 +850,7 @@ class NNXCircularPipeline(NNXPipelineBase):
     """Initializes pipeline execution state and Empty BSW buffers."""
     loop_state = super().init_states(inputs)
 
-    weights = nnx.state(self.layers)
+    weights = nnx.state(self.layers, nnx.Param)
 
     def get_single_repeat_shape(x):
       if x is None:
@@ -984,14 +984,20 @@ class NNXCircularPipeline(NNXPipelineBase):
       loop_state,
       bsw,
       pipeline_weights_graph,
-      pipeline_weights_state,
+      layers_metrics,
+      current_layer_mutables,
       positions,
       segment_ids,
       deterministic,
       model_mode,
       logical_partition_spec,
   ):
-    """Executes the forward/backward logic for a single microbatch inside the circular pipeline."""
+    """Executes the forward/backward logic for a single microbatch inside the circular pipeline.
+
+    Fetches params from BSW (params-only), gathers metrics/mutables directly for the current
+    repeat, merges into full state for the forward pass, then scatter-updates only non-params
+    back (params are static in scan and handled by AD/gradient).
+    """
     state_io = loop_state["state_io"]
     shift = loop_state["shift"]
     circ_storage = loop_state["circ_storage"]
@@ -1009,11 +1015,29 @@ class NNXCircularPipeline(NNXPipelineBase):
     )
 
     vmap_func = self.get_main_vmap_func_for_iterations()
-    stage_weights_state = self.fetch_active_stage_weights(
+
+    # 1. Fetch params from BSW (params-only, tree matches physical_partition_spec)
+    stage_params = self.fetch_active_stage_weights(
         bsw,
         loop_iteration,
         physical_partition_spec=physical_partition_spec,
     )
+
+    # 2. Gather non-params (metrics, mutables) for current repeat directly
+    _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
+    if self.config.num_pipeline_repeats > 1:
+      stage_metrics = self.gather_weights_across_stages_vmap(
+          layers_metrics, repeat_ids=repeat_ids, repeat_dim_in_weights=0, stages_dim_in_weights=1
+      )
+      stage_mutables = self.gather_weights_across_stages_vmap(
+          current_layer_mutables, repeat_ids=repeat_ids, repeat_dim_in_weights=0, stages_dim_in_weights=1
+      )
+    else:
+      stage_metrics = layers_metrics
+      stage_mutables = current_layer_mutables
+
+    # 3. Merge into full state for forward pass
+    stage_weights_state = nnx.State.merge(stage_params, stage_metrics, stage_mutables)
 
     stages_output, updated_stage_weights_state = vmap_func(
         pipeline_weights_graph,
@@ -1028,10 +1052,10 @@ class NNXCircularPipeline(NNXPipelineBase):
     if self.config.scan_layers:
       stages_output = stages_output[0]
 
+    # Scatter-back: only update non-params (params are handled by AD/gradient, not carried in scan)
     if self.config.num_pipeline_repeats > 1:
-      _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
 
-      def _scatter_update(fw, uw, spec=None):
+      def _scatter_update(fw, uw):
         if fw is None or uw is None:
           return fw
 
@@ -1040,14 +1064,30 @@ class NNXCircularPipeline(NNXPipelineBase):
 
         r_ids = self.shard_dim_by_stages(repeat_ids, 0, physical_partition_spec=None)
         updated_fw = jax.vmap(_update_one_stage, in_axes=(1, 0, 0), out_axes=1)(fw, uw, r_ids)
-        return self.shard_dim_by_stages(updated_fw, 1, physical_partition_spec=spec, is_stage_weight=False)
+        return self.shard_dim_by_stages(updated_fw, 1, physical_partition_spec=None, is_stage_weight=False)
 
-      pipeline_weights_state = jax.tree.map(_scatter_update, pipeline_weights_state, updated_stage_weights_state)
+      # Extract non-params from updated stage state
+      def is_static_param(path, v):
+        return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
+
+      _, _, updated_stage_metrics, updated_stage_mutables = nnx.split(
+          updated_stage_weights_state, is_static_param, nnx.Intermediate, ...
+      )
+      updated_stage_non_params = nnx.State.merge(updated_stage_metrics, updated_stage_mutables)
+      current_non_params = nnx.State.merge(layers_metrics, current_layer_mutables)
+      new_layer_state = jax.tree.map(_scatter_update, current_non_params, updated_stage_non_params)
     else:
-      pipeline_weights_state = updated_stage_weights_state
+      # Filter to non-params for consistency with num_pipeline_repeats > 1 path
+      def is_static_param(path, v):
+        return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
+
+      _, _, else_metrics, else_mutables = nnx.split(
+          updated_stage_weights_state, is_static_param, nnx.Intermediate, ...
+      )
+      new_layer_state = nnx.State.merge(else_metrics, else_mutables)
 
     new_state = self.advance_circular_buffers(stages_output, loop_state)
-    return new_state, pipeline_weights_state
+    return new_state, new_layer_state
 
   def __call__(
       self,
@@ -1105,11 +1145,10 @@ class NNXCircularPipeline(NNXPipelineBase):
 
     def scan_body(carry, _):
       current_loop_state, _, current_layer_mutables = carry
-      current_layer_state = nnx.State.merge(layers_params, layers_metrics, current_layer_mutables)
 
-      # 1. Async FSDP Prefetch into Buffer Sliding Window
+      # 1. Async FSDP Prefetch into Buffer Sliding Window (params only)
       next_bsw = self.weight_prefetching(
-          current_layer_state, physical_partition_spec, current_loop_state["loop_iteration"]
+          layers_params, physical_partition_spec, current_loop_state["loop_iteration"]
       )
 
       # 2. Run Forward & State Shift
@@ -1117,7 +1156,8 @@ class NNXCircularPipeline(NNXPipelineBase):
           current_loop_state,
           next_bsw,
           layers_graph,
-          current_layer_state,
+          layers_metrics,
+          current_layer_mutables,
           positions,
           segment_ids,
           deterministic,
