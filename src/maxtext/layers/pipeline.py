@@ -607,19 +607,28 @@ class NNXPipelineBase(nnx.Module, PipelineSharedMixin):
     self.layers = nnx.merge(graphdef, params, rest)
 
   def get_weight_sharding(self, *init_args):
-    """get weight sharding function for this pipeline."""
+    """Returns a pytree of PartitionSpecs mirroring the params state.
+
+    Params lacking explicit sharding metadata are mapped to P() (replicated),
+    matching Linen's "every param has a valid PartitionSpec" contract. Returning
+    P() instead of None ensures shard_map spec trees are always valid.
+    """
     state = nnx.state(self.layers, nnx.Param)
 
     def get_spec(x):
       if not isinstance(x, nnx.VariableState):
-        return None
+        # Non-VariableState leaf (e.g., nnx.Empty): treat as replicated.
+        return P()
       if isinstance(x.value, nn.spmd.LogicallyPartitioned):
         return x.value.partitions
       metadata = x.get_metadata()
       sharding = metadata.get("sharding")
       if sharding and hasattr(sharding, "spec"):
         return sharding.spec
-      return None
+      # Fallback: replicated sharding (valid for shard_map, unlike None).
+      # Linen provides valid PartitionSpec for every param via nn.with_partitioning;
+      # NNX params without explicit sharding get replicated sharding here.
+      return P()
 
     return jax.tree.map(get_spec, state, is_leaf=lambda x: isinstance(x, nnx.VariableState))
 
@@ -950,24 +959,67 @@ class NNXCircularPipeline(NNXPipelineBase):
     return self.get_current_weights_from_bsw(bsw, loop_iteration, physical_partition_spec)
 
   def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec):
-    """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer."""
-    # NNX bypass: skip shard_map path, always use vmap.
-    # The shard_map path requires partition specs that exactly match the BSW pytree structure,
-    # but NNX get_weight_sharding produces None specs for some params (missing LP annotations)
-    # and BSW contains nnx.Variable wrappers. Both break shard_map's strict pytree matching.
-    # The vmap path is functionally equivalent and handles NNX Variable types natively.
-    # TODO: re-enable shard_map once get_weight_sharding reliably produces valid PartitionSpecs.
+    """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer.
+
+    Mirrors Linen old_pipeline.py:1125 shard_map approach. Preconditions that make
+    this work in NNX (all addressed by earlier fixes in this sequence):
+    - Fix C: get_weight_sharding returns P() (not None) for unsharded params
+    - Fix A: __call__ passes repeat-stripped logical spec to run_one_iteration, so
+      physical_partition_spec here has no circular_repeats axis and its dims match
+      the 3-dim BSW arrays (repeat gathered away by from_all_variables_to_repeat_weights).
+    - This method: treedef roundtrip strips nnx.Variable wrappers from BSW for
+      shard_map pytree compatibility, then reconstructs them for nnx.State.merge.
+    """
+    bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
 
-    def select_weights_from_bsw(bsw_inner, repeat_id):
-      return jax.tree.map(
-          lambda x, y: jax.lax.select(repeat_id == stage0_repeat_id, y, x) if x is not None else None,
-          bsw_inner[0],
-          bsw_inner[1],
+    if bsw_pps is not None:
+      # Strip nnx.Variable containers from BSW for shard_map pytree compatibility.
+      # BSW has Param(array) nodes at leaves; shard_map specs are plain P() leaves.
+      # Treedef roundtrip:
+      #   1. Capture bsw_treedef (includes Param nodes) for reconstruction later
+      #   2. Flatten BSW leaves (raw arrays extracted from inside Param nodes)
+      #   3. Rebuild BSW with pps_treedef (no Param nodes) so it matches bsw_pps
+      #   4. Run shard_map on raw-array BSW
+      #   5. Reconstruct nnx.Variable wrappers via bsw_treedef.unflatten
+      # Leaf counts match by construction: bsw and bsw_pps co-derived from same weight tree.
+      bsw_treedef = jax.tree.structure(bsw[0])
+      is_spec_leaf = lambda x: isinstance(x, P) or x is None
+      pps_treedef = jax.tree.structure(bsw_pps, is_leaf=is_spec_leaf)
+      bsw0_leaves = jax.tree.leaves(bsw[0])
+      bsw1_leaves = jax.tree.leaves(bsw[1])
+      assert pps_treedef.num_leaves == len(bsw0_leaves) == len(bsw1_leaves), (
+          f"BSW/spec leaf count mismatch: specs={pps_treedef.num_leaves}, "
+          f"bsw0={len(bsw0_leaves)}, bsw1={len(bsw1_leaves)}"
       )
+      raw_bsw_0 = pps_treedef.unflatten(bsw0_leaves)
+      raw_bsw_1 = pps_treedef.unflatten(bsw1_leaves)
 
-    weights = jax.vmap(select_weights_from_bsw, in_axes=((0, 0), 0), out_axes=0)(bsw, repeat_ids)
+      @jax.shard_map(mesh=self.mesh, in_specs=((bsw_pps, bsw_pps), P("stage")), out_specs=bsw_pps, check_vma=True)
+      def select_weights_from_bsw(bsw_inner, repeat_id):
+        return jax.tree.map(
+            lambda x, y: jax.lax.select(repeat_id[0] == stage0_repeat_id, y, x) if x is not None else None,
+            bsw_inner[0],
+            bsw_inner[1],
+        )
+
+      raw_weights = select_weights_from_bsw((raw_bsw_0, raw_bsw_1), repeat_ids)
+      # Reconstruct nnx.Variable wrappers for nnx.State.merge compatibility downstream.
+      # raw_weights has pps_treedef structure; re-flatten and unflatten into bsw_treedef.
+      weights = bsw_treedef.unflatten(jax.tree.leaves(raw_weights))
+    else:
+      # Fallback: no partition spec provided (e.g. initialization path where
+      # logical_partition_spec is None); use vmap over the repeat dim. NNX Variable
+      # wrappers are handled natively by jax.vmap — no treedef roundtrip needed.
+      def select_weights_from_bsw(bsw_inner, repeat_id):
+        return jax.tree.map(
+            lambda x, y: jax.lax.select(repeat_id == stage0_repeat_id, y, x) if x is not None else None,
+            bsw_inner[0],
+            bsw_inner[1],
+        )
+
+      weights = jax.vmap(select_weights_from_bsw, in_axes=((0, 0), 0), out_axes=0)(bsw, repeat_ids)
 
     return weights
 
@@ -1112,8 +1164,20 @@ class NNXCircularPipeline(NNXPipelineBase):
 
     loop_state, bsw = self.init_states(inputs)
 
-    physical_partition_spec = logical_to_mesh(
+    # Two-spec pattern (mirrors Linen old_pipeline.py:1342/1353):
+    # - Full spec (with circular_repeats axis) -> BSW creation via weight_prefetching.
+    #   from_repeat_weights_to_bsw's derive_stage_weight_partition_specs drops the
+    #   first dim (repeat), so the input must still have it.
+    # - Stripped logical spec (circular_repeats removed) -> BSW consumption via
+    #   run_one_iteration. get_current_weights_from_bsw uses _remove_fsdp_from_
+    #   physical_partition_spec, which only removes fsdp; the repeat axis must
+    #   already be gone to match the 3-dim BSW arrays (repeat gathered away by
+    #   from_all_variables_to_repeat_weights).
+    physical_partition_spec_full = logical_to_mesh(
         logical_partition_spec, mesh=self.mesh, rules=self.config.logical_axis_rules
+    )
+    logical_partition_spec_stripped = pipeline_utils.strip_pipeline_repeat_logical_axis(
+        logical_partition_spec
     )
 
     bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
@@ -1139,11 +1203,15 @@ class NNXCircularPipeline(NNXPipelineBase):
       current_loop_state, _, current_layer_mutables = carry
 
       # 1. Async FSDP Prefetch into Buffer Sliding Window (params only)
+      # Use FULL spec - weight_prefetching drops the repeat axis internally via
+      # derive_stage_weight_partition_specs.
       next_bsw = self.weight_prefetching(
-          layers_params, physical_partition_spec, current_loop_state["loop_iteration"]
+          layers_params, physical_partition_spec_full, current_loop_state["loop_iteration"]
       )
 
       # 2. Run Forward & State Shift
+      # Use STRIPPED logical spec - run_one_iteration re-derives physical from it,
+      # and get_current_weights_from_bsw expects specs without the repeat axis.
       new_loop_state, new_layer_state = self.run_one_iteration(
           current_loop_state,
           next_bsw,
@@ -1154,7 +1222,7 @@ class NNXCircularPipeline(NNXPipelineBase):
           segment_ids,
           deterministic,
           model_mode,
-          logical_partition_spec,
+          logical_partition_spec_stripped,
       )
 
       _, _, new_layer_metrics, new_layer_mutables = nnx.split(new_layer_state, is_static_param, nnx.Intermediate, ...)
