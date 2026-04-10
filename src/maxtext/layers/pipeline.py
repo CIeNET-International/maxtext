@@ -1022,37 +1022,118 @@ class NNXCircularPipeline(NNXPipelineBase):
         weights_state, repeat_ids=repeat_ids, repeat_dim_in_weights=0, stages_dim_in_weights=1
     )
 
-  def from_repeat_weights_to_bsw(self, repeat_weights, physical_partition_spec):
-    """Executes FSDP-like all-gathers to fully materialize a block of weights for BSW."""
+  def from_repeat_weights_to_bsw(
+      self,
+      repeat_weights,
+      physical_partition_spec,
+      axes_to_gather=("fsdp", "fsdp_transpose", "context", "expert"),
+      # TODO (chengnuojin) set use_shardmap=true after JAX >= 0.10.0 and use all_gather(..., to='invarying')
+      use_shardmap=False,  # using shardmap produces additional reduce-scatter in backward pass
+  ):
+    """Executes FSDP-like all-gathers to fully materialize a block of weights for BSW.
+    """
     axes_to_remove = ["fsdp", "fsdp_transpose", "context"]
     if physical_partition_spec is not None:
       bsw_pps = pipeline_utils.derive_stage_weight_partition_specs(physical_partition_spec, axes_to_remove)
     else:
       bsw_pps = None
 
-    def _apply_sharding_hint(weight, pspec):
-      if pspec is None or weight is None:
-        return weight
-      sharding_name = NamedSharding(self.mesh, pspec)
-      return maybe_shard_with_name(
-          weight,
-          sharding_name,
-          shard_mode=self.config.shard_mode,
-          debug_sharding=self.config.debug_sharding,
-          extra_stack_level=0,
+    def _from_repeat_weights_to_bsw_shardmap(
+        repeat_weights,
+        physical_partition_spec,
+        axes_to_gather,
+    ):
+      # Drop the first axis (repeat/stage dim) from every spec leaf.
+      is_spec_leaf = lambda x: isinstance(x, P) or x is None
+      repeat_weights_pps = jax.tree.map(
+          lambda p: P(*p[1:]) if isinstance(p, P) else p,
+          physical_partition_spec,
+          is_leaf=is_spec_leaf,
       )
+
+      # Dynamically gather the index pytrees for all specified axes
+      axis_indices_dict = {
+          axis: pipeline_utils.get_mesh_axis_dim_indices(physical_partition_spec, axis) for axis in axes_to_gather
+      }
+
+      axis_names = list(axis_indices_dict.keys())
+      axis_pytrees = list(axis_indices_dict.values())
+
+      def should_skip_gather(axis_name, path_keys):
+        """Defines specific rule-based exceptions for gathering certain axes."""
+        if axis_name == "expert" and "MoeBlock_0" in path_keys:
+          return True
+        # Add more exclusion rules for other axes here if needed in the future
+        return False
+
+      # Strip nnx.Variable wrappers via treedef roundtrip (same pattern as
+      # get_current_weights_from_bsw). weights_treedef captures Variable nodes;
+      # pps_treedef stops at plain P leaves and has the same leaf count by
+      # invariant (8) -- both filtered by the same is_static_param predicate
+      # upstream. Flatten repeat_weights to raw arrays, rebuild with
+      # pps_treedef so the shard_map input tree matches the spec tree, then
+      # re-wrap into Variables via weights_treedef on the way out.
+      weights_treedef = jax.tree.structure(repeat_weights)
+      pps_treedef = jax.tree.structure(repeat_weights_pps, is_leaf=is_spec_leaf)
+      weights_leaves = jax.tree.leaves(repeat_weights)
+      assert pps_treedef.num_leaves == len(weights_leaves), (
+          f"repeat_weights/spec leaf count mismatch: specs={pps_treedef.num_leaves}, "
+          f"weights={len(weights_leaves)}"
+      )
+      raw_weights = pps_treedef.unflatten(weights_leaves)
+
+      @jax.shard_map(
+          mesh=self.mesh,
+          in_specs=(repeat_weights_pps, None),  # 'None' covers the entire axis_pytrees list
+          out_specs=bsw_pps,
+          check_vma=False,
+      )
+      def _shard_map_gather_weights(sharded_weights, indices_pytrees_list):
+
+        def _gather_tensor_along_axes(path, x, *indices):
+          path_keys = [getattr(p, "key", str(p)) for p in path]
+
+          # Iterate through the provided axes and their corresponding indices
+          for axis_name, axis_idx in zip(axis_names, indices):
+            if axis_idx >= 0 and not should_skip_gather(axis_name, path_keys):
+              x = jax.lax.all_gather(x, axis_name=axis_name, axis=axis_idx - 1, tiled=True)
+          return x
+
+        return jax.tree_util.tree_map_with_path(_gather_tensor_along_axes, sharded_weights, *indices_pytrees_list)
+
+      raw_bsw = _shard_map_gather_weights(raw_weights, axis_pytrees)
+      return weights_treedef.unflatten(jax.tree.leaves(raw_bsw))
+
+    def _from_repeat_weights_to_bsw_hint(repeat_weights):
+      def _apply_sharding_hint(weight, pspec):
+        if pspec is None or weight is None:
+          return weight
+        sharding_name = NamedSharding(self.mesh, pspec)
+        return maybe_shard_with_name(
+            weight,
+            sharding_name,
+            shard_mode=self.config.shard_mode,
+            debug_sharding=self.config.debug_sharding,
+            extra_stack_level=0,
+        )
+
+      # Flatten specs to a list aligned with repeat_weights' leaf traversal order.
+      # Single-tree map avoids nnx.Variable mutation (TraceContextError inside scan).
+      def is_spec_leaf(x):
+        return isinstance(x, P) or x is None
+
+      spec_leaves = jax.tree_util.tree_leaves(bsw_pps, is_leaf=is_spec_leaf)
+      spec_iter = iter(spec_leaves)
+      return jax.tree.map(lambda w: _apply_sharding_hint(w, next(spec_iter)), repeat_weights)
 
     if bsw_pps is None:
       return repeat_weights
 
-    # Flatten specs to a list aligned with repeat_weights' leaf traversal order.
-    # Single-tree map avoids nnx.Variable mutation (TraceContextError inside scan).
-    def is_spec_leaf(x):
-      return isinstance(x, P) or x is None
-
-    spec_leaves = jax.tree_util.tree_leaves(bsw_pps, is_leaf=is_spec_leaf)
-    spec_iter = iter(spec_leaves)
-    return jax.tree.map(lambda w: _apply_sharding_hint(w, next(spec_iter)), repeat_weights)
+    if use_shardmap:
+      return _from_repeat_weights_to_bsw_shardmap(
+          repeat_weights, physical_partition_spec, axes_to_gather=axes_to_gather
+      )
+    return _from_repeat_weights_to_bsw_hint(repeat_weights)
 
   def weight_prefetching(self, weights_state, physical_partition_spec, loop_iteration):
     """Triggers asynchronous FSDP-like all-gathers for current and next pipeline steps."""
