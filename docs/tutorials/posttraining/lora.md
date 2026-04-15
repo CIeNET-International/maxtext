@@ -159,7 +159,7 @@ python3 -m maxtext.trainers.post_train.sft.train_sft \
     base_output_directory="${BASE_OUTPUT_DIRECTORY?}" \
     model_name="${PRE_TRAINED_MODEL?}" \
     load_parameters_path="${PRE_TRAINED_MODEL_CKPT_PATH?}" \
-    lora_restore_path="${LORA_RESTORE_PATH}" \
+    lora_restore_path="${LORA_RESTORE_PATH?}" \
     hf_access_token="${HF_TOKEN?}" \
     hf_path="${DATASET_NAME?}" \
     train_split="${TRAIN_SPLIT?}" \
