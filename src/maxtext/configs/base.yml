@@ -1163,6 +1163,8 @@ subslice_shape: ""
 enable_nnx: False
 pure_nnx_decoder: False
 pure_nnx: False
+use_nnx_pipeline: False  # Set to False to use native Linen pipeline (with custom VJP)
+
 
 ################################## Qwen3-Next Specific Configs ##################################
 # Kernel size for the 1D convolution in the Gated Delta Net
