@@ -919,6 +919,12 @@ class PipelineParallelism(BaseModel):
   scan_layers_per_stage: bool = Field(False, description="Use jax.lax.scan over layers within a stage.")
   set_remat_policy_on_pipeline_iterations: bool = Field(True, description="Set remat policy on the pipeline scan.")
   set_remat_policy_on_layers_per_stage: bool = Field(False, description="Set remat policy on the inner layer scan.")
+  use_nnx_pipeline: bool = Field(
+      False,
+      description="When True, create_pipeline returns NNX pipeline wrapped in ToLinen. "
+      "When False, create_pipeline returns native Linen pipeline (PipelineLinen/CircularPipelineLinen). "
+      "Pure NNX decoders use create_nnx_pipeline directly.",
+  )
 
 
 class RematAndOffload(BaseModel):
