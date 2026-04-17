@@ -2292,6 +2292,172 @@ class NNXCircularPipeline(NNXPipelineBase):
     new_state = self.get_new_loop_state(stages_output, loop_state)
     return new_state, new_layer_state
 
+  def _init_empty_bsw(self, layers_params):
+    """Create zero-initialized BSW from the first repeat's gathered weights."""
+    dummy_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, 0)
+    return jax.tree.map(jnp.zeros_like, dummy_repeat_weights)
+
+  def _create_microbatch_scan(self, layers_graph, layers_metrics, positions, segment_ids,
+                               deterministic, model_mode, logical_partition_spec_stripped):
+    """Creates memory-efficient scan over microbatches with two-level custom VJP.
+
+    Matches Linen's create_gradient_accumulation_scan: separates lightweight
+    state from heavy BSW, uses per-step remat, accumulates d+g on BSW gradients.
+
+    Level 1 (run_single_microbatch): per-microbatch jax.remat + VJP separating
+    lightweight state (loop_state + mutables) from heavy BSW weights.
+
+    Level 2 (run_pipeline_microbatches): scan over microbatches with manual d+g
+    accumulation on BSW gradients in the backward pass.
+
+    Returns:
+      A jax.custom_vjp function: (lightweight_state, bsw) -> (final_lightweight, bsw)
+      where lightweight_state = (loop_state, layers_mutables) and bsw = (w_curr, w_next).
+    """
+
+    def _run_one_step(lightweight_state, bsw_arg):
+      """Single microbatch forward: lightweight_state carried, BSW as separate arg."""
+      current_loop_state, current_layer_mutables = lightweight_state
+      iteration = current_loop_state["loop_iteration"]
+      advanced_mutables = _advance_rng_state(current_layer_mutables, iteration)
+      new_loop_state, new_layer_state = self.run_one_iteration(
+          current_loop_state, bsw_arg, layers_graph, layers_metrics,
+          advanced_mutables, positions, segment_ids, deterministic, model_mode,
+          logical_partition_spec_stripped,
+      )
+      _, _, new_layer_metrics, new_layer_mutables = nnx.split(
+          new_layer_state, _is_static_param, nnx.Intermediate, ...
+      )
+      return (new_loop_state, new_layer_mutables), new_layer_metrics
+
+    _run_one_step_remat = jax.remat(_run_one_step, policy=self.get_pipeline_remat_policy())
+
+    # --- Level 1: per-microbatch custom VJP ---
+    @jax.custom_vjp
+    def run_single_microbatch(lightweight_state, bsw_arg):
+      return run_single_microbatch_fwd(lightweight_state, bsw_arg)[0]
+
+    def run_single_microbatch_fwd(lightweight_state, bsw_arg):
+      out, vjp_fun = jax.vjp(_run_one_step_remat, lightweight_state, bsw_arg)
+      return out, vjp_fun
+
+    def run_single_microbatch_bwd(vjp_fun, g_out):
+      d_lightweight, d_bsw = vjp_fun(g_out)
+      return d_lightweight, d_bsw
+
+    run_single_microbatch.defvjp(run_single_microbatch_fwd, run_single_microbatch_bwd)
+
+    # --- Level 2: scan over microbatches with d+g accumulation on BSW ---
+    @jax.custom_vjp
+    def run_pipeline_microbatches(lightweight_state, bsw_arg):
+      return run_pipeline_microbatches_fwd(lightweight_state, bsw_arg)[0]
+
+    def run_pipeline_microbatches_fwd(lightweight_state, bsw_arg):
+      # Run scan collecting both carry and metrics outputs.
+      # VJP only needs the carry path; metrics are non-differentiable.
+      def _scan_with_metrics(l, b):
+        return jax.lax.scan(
+            lambda carry, _: run_single_microbatch(carry, b),
+            l, None, length=self.config.num_pipeline_microbatches,
+        )
+
+      (final_lightweight, scan_metrics), scan_vjp_fun = jax.vjp(
+          _scan_with_metrics, lightweight_state, bsw_arg, has_aux=False,
+      )
+
+      return (final_lightweight, bsw_arg, scan_metrics), scan_vjp_fun
+
+    def run_pipeline_microbatches_bwd(scan_vjp_fun, g_final_state):
+      g_lightweight, g_bsw, g_metrics = g_final_state
+      # scan_vjp_fun cotangent matches _scan_with_metrics output: (carry, metrics)
+      d_init_lightweight, d_init_bsw = scan_vjp_fun((g_lightweight, g_metrics))
+      # d + g: accumulate incoming BSW gradient with scan-computed gradient
+      d_init_bsw = jax.tree.map(
+          lambda d, g: d + g if hasattr(d, "shape") else d,
+          d_init_bsw, g_bsw,
+      )
+      return d_init_lightweight, d_init_bsw
+
+    run_pipeline_microbatches.defvjp(run_pipeline_microbatches_fwd, run_pipeline_microbatches_bwd)
+    return run_pipeline_microbatches
+
+  def _execute_one_repeat(self, loop_state, current_gathered_weights, layers_mutables, layers_params,
+                           layers_graph, layers_metrics, positions, segment_ids, deterministic, model_mode,
+                           logical_partition_spec_stripped, physical_partition_spec_full):
+    """Execute one pipeline repeat with linear_transpose for reduce-scatter in backward.
+
+    Matches Linen's execute_pipeline_stage_pure: uses jax.linear_transpose of
+    weight_prefetching to derive the reduce-scatter dual in the backward pass,
+    avoiding redundant forward passes of the all-gather.
+
+    Args:
+      loop_state: Current pipeline loop state dict.
+      current_gathered_weights: BSW weights gathered for the current repeat.
+      layers_mutables: Current mutable state (RNG keys/counts).
+      layers_params: Full FSDP-sharded pipeline parameters (all repeats).
+      layers_graph, layers_metrics: Graph def and metrics state for nnx.merge.
+      positions, segment_ids: Sequence metadata.
+      deterministic, model_mode: Forward pass configuration.
+      logical_partition_spec_stripped: Logical specs without repeat axis.
+      physical_partition_spec_full: Full physical specs for weight prefetching.
+
+    Returns:
+      Tuple of (new_loop_state, next_gathered_weights, new_mutables, stacked_metrics).
+    """
+
+    scan_microbatches_fn = self._create_microbatch_scan(
+        layers_graph, layers_metrics, positions, segment_ids,
+        deterministic, model_mode, logical_partition_spec_stripped,
+    )
+
+    @jax.custom_vjp
+    def _repeat_pure(loop_state, current_gathered_weights, layers_mutables, layers_params):
+      return _repeat_fwd(loop_state, current_gathered_weights, layers_mutables, layers_params)[0]
+
+    def _repeat_fwd(loop_state, current_gathered_weights, layers_mutables, layers_params):
+      iteration = loop_state["loop_iteration"]
+      next_gathered_weights = self.weight_prefetching(layers_params, physical_partition_spec_full, iteration)
+      bsw = (current_gathered_weights, next_gathered_weights)
+
+      partial_wp = functools.partial(
+          self.weight_prefetching,
+          physical_partition_spec=physical_partition_spec_full,
+          loop_iteration=iteration,
+      )
+      weight_prefetching_transpose = jax.linear_transpose(partial_wp, layers_params)
+
+      lightweight_state = (loop_state, layers_mutables)
+      (final_lightweight, _, scan_metrics), scan_microbatches_vjp = jax.vjp(
+          scan_microbatches_fn, lightweight_state, bsw,
+      )
+      new_loop_state, new_mutables = final_lightweight
+
+      return (
+          (new_loop_state, next_gathered_weights, new_mutables, scan_metrics),
+          (scan_microbatches_vjp, weight_prefetching_transpose),
+      )
+
+    def _repeat_bwd(residuals, g_out):
+      scan_microbatches_vjp, weight_prefetching_transpose = residuals
+      grad_loop_state, grad_next_weights, grad_mutables, grad_metrics = g_out
+
+      grad_current_weights_zero = jax.tree.map(jnp.zeros_like, grad_next_weights)
+      grad_bsw = (grad_current_weights_zero, grad_next_weights)
+
+      # scan_microbatches_vjp cotangent matches forward output: (lightweight, bsw, metrics)
+      grad_lightweight, grad_bsw = scan_microbatches_vjp(
+          ((grad_loop_state, grad_mutables), grad_bsw, grad_metrics)
+      )
+      grad_loop_state, grad_mutables = grad_lightweight
+      grad_current_weights, grad_next_weights = grad_bsw
+
+      (grad_layers_params,) = weight_prefetching_transpose(grad_next_weights)
+
+      return grad_loop_state, grad_current_weights, grad_mutables, grad_layers_params
+
+    _repeat_pure.defvjp(_repeat_fwd, _repeat_bwd)
+    return _repeat_pure(loop_state, current_gathered_weights, layers_mutables, layers_params)
+
   def __call__(
       self,
       inputs: jnp.ndarray,
@@ -2351,8 +2517,6 @@ class NNXCircularPipeline(NNXPipelineBase):
     logical_partition_spec_stripped = pipeline_utils.strip_pipeline_repeat_logical_axis(logical_partition_spec)
 
     bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
-    real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
-    total_iterations = real_iterations + bubble_iterations
 
     layers_graph, layers_state = nnx.split(self.layers)
 
@@ -2380,65 +2544,65 @@ class NNXCircularPipeline(NNXPipelineBase):
         "Only RngState variables (RngKey/RngCount) should be present."
     )
 
-    def scan_body(carry, _):
-      current_loop_state, current_layer_mutables = carry
-      # Fold loop_iteration into RNG keys so each scan step gets a unique
-      # dropout mask — mirrors Linen's nn.scan(split_rngs={"random": True}).
-      iteration = current_loop_state["loop_iteration"]
-      advanced_mutables = _advance_rng_state(current_layer_mutables, iteration)
+    # --- 3-level custom VJP execution (matching Linen memory profile) ---
+    # Level 1: per-microbatch remat + VJP (inside _create_microbatch_scan)
+    # Level 2: scan over microbatches with d+g accumulation (inside _create_microbatch_scan)
+    # Level 3: per-repeat with linear_transpose for reduce-scatter (inside _execute_one_repeat)
+    #
+    # Outer loop over repeats is a Python for-loop (not scanned) because each repeat
+    # needs its own linear_transpose closure bound to the current loop_iteration.
+    # This matches the Linen pipeline's nn.scan over repeats which uses a custom VJP
+    # per repeat via create_pipeline_stage / execute_pipeline_stage_pure.
 
-      # Gather weights for the current iteration only.
-      # Unlike the Linen circular pipeline which carries a sliding-window BSW
-      # (w_curr, w_next) through scan and uses a custom_vjp to manage the
-      # gradient flow, the NNX port recomputes weights each iteration.
-      # Since from_all_variables_to_repeat_weights already gathers the correct
-      # per-stage repeat via get_microbatch_and_repeat_ids, the dual-buffer
-      # select is unnecessary — cur_bsw alone has the right weights for every
-      # stage. Passing (cur_bsw, cur_bsw) makes the select in
-      # get_current_weights_from_bsw a no-op, eliminating the boundary bug
-      # where nxt_bsw (gathered for iteration+1) provided wrong-repeat weights
-      # to stages still processing the current repeat.
-      cur_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, iteration)
-      cur_bsw = self.from_repeat_weights_to_bsw(cur_repeat_weights, physical_partition_spec_full)
-      bsw = (cur_bsw, cur_bsw)
+    current_gathered_weights = self._init_empty_bsw(layers_params)
+    all_metrics = []
+    current_loop_state = loop_state
+    current_mutables = layers_mutables
 
-      # Run Forward & State Shift
-      # Use STRIPPED logical spec - run_one_iteration re-derives physical from it,
-      # and get_current_weights_from_bsw expects specs without the repeat axis.
-      new_loop_state, new_layer_state = self.run_one_iteration(
-          current_loop_state,
-          bsw,
-          layers_graph,
-          layers_metrics,
-          advanced_mutables,
-          positions,
-          segment_ids,
-          deterministic,
-          model_mode,
-          logical_partition_spec_stripped,
+    for _ in range(self.config.num_pipeline_repeats):
+      (current_loop_state, current_gathered_weights, current_mutables, repeat_metrics) = (
+          self._execute_one_repeat(
+              current_loop_state, current_gathered_weights, current_mutables, layers_params,
+              layers_graph, layers_metrics, positions, segment_ids, deterministic, model_mode,
+              logical_partition_spec_stripped, physical_partition_spec_full,
+          )
       )
+      all_metrics.append(repeat_metrics)
 
-      _, _, new_layer_metrics, new_layer_mutables = nnx.split(new_layer_state, _is_static_param, nnx.Intermediate, ...)
-      return (new_loop_state, new_layer_mutables), new_layer_metrics
+    # Bubble: simple scan without Level 2 VJP (no weight prefetching needed).
+    if bubble_iterations > 0:
+      bsw_bubble = (current_gathered_weights, current_gathered_weights)
 
-    if self.config.set_remat_policy_on_pipeline_iterations:
-      scan_body = jax.checkpoint(
-          scan_body, policy=self.get_pipeline_remat_policy(), prevent_cse=not self.config.scan_pipeline_iterations
+      def bubble_body(carry, _):
+        current_ls, current_mut = carry
+        iteration = current_ls["loop_iteration"]
+        advanced_mut = _advance_rng_state(current_mut, iteration)
+        new_ls, new_layer_state = self.run_one_iteration(
+            current_ls, bsw_bubble, layers_graph, layers_metrics,
+            advanced_mut, positions, segment_ids, deterministic, model_mode,
+            logical_partition_spec_stripped,
+        )
+        _, _, new_metrics, new_mut = nnx.split(
+            new_layer_state, _is_static_param, nnx.Intermediate, ...
+        )
+        return (new_ls, new_mut), new_metrics
+
+      if self.config.set_remat_policy_on_pipeline_iterations:
+        bubble_body = jax.checkpoint(bubble_body, policy=self.get_pipeline_remat_policy())
+
+      (current_loop_state, current_mutables), bubble_metrics = jax.lax.scan(
+          bubble_body, (current_loop_state, current_mutables), None, length=bubble_iterations,
       )
+      all_metrics.append(bubble_metrics)
 
-    # Memory Efficient Execution via pure JAX scan
-    if self.config.scan_pipeline_iterations:
-      (loop_state, final_layer_mutables), stacked_metrics = jax.lax.scan(
-          scan_body, (loop_state, layers_mutables), None, length=total_iterations
-      )
-    else:
-      current_carry = (loop_state, layers_mutables)
-      metrics_history = []
-      for _ in range(total_iterations):
-        current_carry, step_metrics = scan_body(current_carry, None)
-        metrics_history.append(step_metrics)
-      loop_state, final_layer_mutables = current_carry
-      stacked_metrics = jax.tree.map(lambda *xs: jnp.stack(xs), *metrics_history) if metrics_history else layers_metrics
+    # Collect metrics from all repeats + bubble
+    def _concat_metrics(*xs):
+      return jnp.concatenate(xs, axis=0)
+
+    stacked_metrics = jax.tree.map(_concat_metrics, *all_metrics)
+
+    loop_state = current_loop_state
+    final_layer_mutables = current_mutables
 
     final_layer_state = nnx.State.merge(layers_params, stacked_metrics, final_layer_mutables)
     nnx.update(self.layers, final_layer_state)
