@@ -277,11 +277,11 @@ class NNXScannedPipelineStage(nnx.Module):
     def create_layer_fn(rng):
       return layer_cls(config=config, mesh=mesh, quant=quant, model_mode=model_mode, rngs=rng)
 
-    # Workaround for Deepseek MTP test failure.
-    # TODO: Handle this properly.
+    # Workaround for Deepseek MTP test failure where rngs.fork() may fail
+    # when rngs doesn't support splitting (e.g., single-key Rngs objects).
     try:
       forked_rngs = rngs.fork(split=num_layers)
-    except:  # pylint: disable=bare-except
+    except (TypeError, AttributeError, ValueError):
       forked_rngs = rngs
 
     out_axes = nnx.StateAxes({nnx.Param: config.param_scan_axis, ...: 0})
@@ -623,11 +623,13 @@ class NNXDecoder(nnx.Module):
     final_carry, scanned_state = jax.lax.scan(layer_fn, x_in, (params, state))
 
     if scan_axis != 0:
-      # Only move the axis back on the params, NOT the mutables!
-      params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), params)
+      # Split params from the POST-SCAN output, move those back to scan_axis.
+      # Must operate on scanned_state (not original params) to get post-scan values.
+      scanned_params, scanned_other = scanned_state.split(nnx.Param, ...)
+      scanned_params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), scanned_params)
+      scanned_state = nnx.State.merge(scanned_params, scanned_other)
 
-    final_state = nnx.State.merge(params, scanned_state)
-    nnx.update(layers, final_state)
+    nnx.update(layers, scanned_state)
     return final_carry, layers
 
   def _apply_interleaved_scanned_layers(
