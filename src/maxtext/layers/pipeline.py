@@ -40,7 +40,27 @@ from maxtext.utils.sharding import (
     logical_to_mesh_axes,
     logical_to_mesh,
 )
-from maxtext.utils import pipeline_utils
+from maxtext.utils import max_logging, pipeline_utils
+
+
+def _pytree_bytes(tree):
+  """Return (num_leaves, total_bytes) for a pytree of arrays."""
+  leaves = jax.tree.leaves(tree)
+  num = len(leaves)
+  total = sum(l.size * l.dtype.itemsize for l in leaves if hasattr(l, 'size'))
+  return num, total
+
+
+def _log_pytree_info(label, tree):
+  """Log leaf count and total size of a pytree (only during tracing)."""
+  leaves = jax.tree.leaves(tree)
+  num = len(leaves)
+  total = sum(l.size * l.dtype.itemsize for l in leaves if hasattr(l, 'size'))
+  max_logging.log(
+      f"[pipeline-mem] {label}: {num} leaves, "
+      f"{total / 1e9:.3f} GB, "
+      f"treedef depth={jax.tree.structure(tree).num_leaves}"
+  )
 
 
 def _is_static_param(path, v):
@@ -2107,49 +2127,48 @@ class NNXCircularPipeline(NNXPipelineBase):
     nxt_repeat_weights = self.from_all_variables_to_repeat_weights(weights_state, loop_iteration + 1)
     return self.from_repeat_weights_to_bsw(nxt_repeat_weights, physical_partition_spec)
 
-  def fetch_active_stage_weights(self, bsw, loop_iteration, physical_partition_spec=None):
+  def fetch_active_stage_weights(self, bsw, loop_iteration, physical_partition_spec=None,
+                                   bsw_variable_treedef=None):
     """The module fetches the actively prefetched weights
     from the Buffer Sliding Window to avoid mid-iteration FSDP all-gathers.
     """
-    return self.get_current_weights_from_bsw(bsw, loop_iteration, physical_partition_spec)
+    return self.get_current_weights_from_bsw(bsw, loop_iteration, physical_partition_spec,
+                                              bsw_variable_treedef=bsw_variable_treedef)
 
-  def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec):
-    """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer."""
+  def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec,
+                                    bsw_variable_treedef=None):
+    """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer.
+
+    When bsw_variable_treedef is provided, BSW is assumed to be pre-stripped
+    (raw arrays, no nnx.Variable wrappers) and the per-iteration treedef
+    roundtrip is skipped.
+    """
     bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
 
     if bsw_pps is not None:
-      # Strip nnx.Variable containers from BSW for shard_map pytree compatibility.
-      # BSW has Param(array) nodes at leaves; shard_map specs are plain P() leaves.
-      # Treedef roundtrip:
-      #   1. Capture bsw_treedef (includes Param nodes) for reconstruction later
-      #   2. Flatten BSW leaves (raw arrays extracted from inside Param nodes)
-      #   3. Rebuild BSW with pps_treedef (no Param nodes) so it matches bsw_pps
-      #   4. Run shard_map on the raw-array BSW
-      #   5. Reconstruct nnx.Variable wrappers via bsw_treedef.unflatten
-      # Leaf counts match by construction: bsw and bsw_pps are co-derived from
-      # the same weight tree (via get_weight_sharding + from_repeat_weights_to_bsw).
-      bsw_treedef = jax.tree.structure(bsw[0])
-
-      pps_treedef = jax.tree.structure(bsw_pps, is_leaf=is_spec_leaf)
-      bsw0_leaves = jax.tree.leaves(bsw[0])
-      bsw1_leaves = jax.tree.leaves(bsw[1])
-      # Defensive: both BSW halves and the spec tree must agree on leaf count.
-      # Stricter: bsw[0] and bsw[1] must have the same *structure*, not just
-      # the same leaf count — they are co-produced by from_repeat_weights_to_bsw
-      # called on cur_repeat_weights / nxt_repeat_weights so in practice this
-      # always holds, but catching a divergence early beats a confusing
-      # shard_map error later.
-      assert bsw_treedef == jax.tree.structure(
-          bsw[1]
-      ), "BSW half-tree structure mismatch: bsw[0] and bsw[1] must be structurally identical but differ."
-      assert pps_treedef.num_leaves == len(bsw0_leaves) == len(bsw1_leaves), (
-          f"BSW/spec leaf count mismatch: specs={pps_treedef.num_leaves}, "
-          f"bsw0={len(bsw0_leaves)}, bsw1={len(bsw1_leaves)}"
-      )
-      raw_bsw_0 = pps_treedef.unflatten(bsw0_leaves)
-      raw_bsw_1 = pps_treedef.unflatten(bsw1_leaves)
+      if bsw_variable_treedef is not None:
+        # Fast path: BSW was pre-stripped before the scan — no per-iteration
+        # treedef roundtrip needed. bsw[0]/bsw[1] already match pps structure.
+        raw_bsw_0 = bsw[0]
+        raw_bsw_1 = bsw[1]
+        bsw_treedef = bsw_variable_treedef
+      else:
+        # Legacy path: BSW has nnx.Variable wrappers — strip them now.
+        bsw_treedef = jax.tree.structure(bsw[0])
+        pps_treedef = jax.tree.structure(bsw_pps, is_leaf=is_spec_leaf)
+        bsw0_leaves = jax.tree.leaves(bsw[0])
+        bsw1_leaves = jax.tree.leaves(bsw[1])
+        assert bsw_treedef == jax.tree.structure(
+            bsw[1]
+        ), "BSW half-tree structure mismatch: bsw[0] and bsw[1] must be structurally identical but differ."
+        assert pps_treedef.num_leaves == len(bsw0_leaves) == len(bsw1_leaves), (
+            f"BSW/spec leaf count mismatch: specs={pps_treedef.num_leaves}, "
+            f"bsw0={len(bsw0_leaves)}, bsw1={len(bsw1_leaves)}"
+        )
+        raw_bsw_0 = pps_treedef.unflatten(bsw0_leaves)
+        raw_bsw_1 = pps_treedef.unflatten(bsw1_leaves)
 
       @jax.shard_map(
           mesh=self.mesh,
@@ -2200,6 +2219,7 @@ class NNXCircularPipeline(NNXPipelineBase):
       deterministic,
       model_mode,
       logical_partition_spec,
+      bsw_variable_treedef=None,
   ):
     """Executes the forward/backward logic for a single microbatch inside the circular pipeline.
 
@@ -2230,6 +2250,7 @@ class NNXCircularPipeline(NNXPipelineBase):
         bsw,
         loop_iteration,
         physical_partition_spec=physical_partition_spec,
+        bsw_variable_treedef=bsw_variable_treedef,
     )
 
     # 2. Gather non-params (metrics, mutables) for current repeat directly
@@ -2292,6 +2313,183 @@ class NNXCircularPipeline(NNXPipelineBase):
     new_state = self.get_new_loop_state(stages_output, loop_state)
     return new_state, new_layer_state
 
+  def _make_inner_scan_body(self, bsw, layers_graph, layers_metrics, positions, segment_ids,
+                            deterministic, model_mode, logical_partition_spec_stripped):
+    """Creates scan body closing over BSW. Returns (carry, _) -> (carry, metrics).
+
+    Pre-strips nnx.Variable wrappers from BSW once before the scan to eliminate
+    per-iteration treedef roundtrips in get_current_weights_from_bsw. Also applies
+    stop_gradient to layers_metrics (constant within a repeat) to reduce VJP
+    residual overhead, matching Linen's variable_broadcast behavior.
+    """
+    # RC2: Stop gradient on constant closure variable — layers_metrics doesn't
+    # change per microbatch, updated metrics come from forward output.
+    const_metrics = jax.lax.stop_gradient(layers_metrics)
+
+    # RC3: Pre-strip BSW Variable wrappers ONCE (outside scan) to avoid
+    # per-iteration treedef roundtrip in get_current_weights_from_bsw.
+    physical_partition_spec = logical_to_mesh(
+        logical_partition_spec_stripped, self.mesh, rules=self.config.logical_axis_rules
+    )
+    bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
+
+    if bsw_pps is not None:
+      bsw_variable_treedef = jax.tree.structure(bsw[0])
+      pps_treedef = jax.tree.structure(bsw_pps, is_leaf=is_spec_leaf)
+      bsw0_leaves = jax.tree.leaves(bsw[0])
+      bsw1_leaves = jax.tree.leaves(bsw[1])
+      assert bsw_variable_treedef == jax.tree.structure(
+          bsw[1]
+      ), "BSW half-tree structure mismatch: bsw[0] and bsw[1] must be structurally identical but differ."
+      assert pps_treedef.num_leaves == len(bsw0_leaves) == len(bsw1_leaves), (
+          f"BSW/spec leaf count mismatch: specs={pps_treedef.num_leaves}, "
+          f"bsw0={len(bsw0_leaves)}, bsw1={len(bsw1_leaves)}"
+      )
+      raw_bsw = (
+          pps_treedef.unflatten(bsw0_leaves),
+          pps_treedef.unflatten(bsw1_leaves),
+      )
+      max_logging.log(
+          f"[pipeline-mem] BSW pre-strip: "
+          f"original treedef nodes={bsw_variable_treedef.num_leaves}, "
+          f"stripped treedef nodes={pps_treedef.num_leaves}, "
+          f"leaves={len(bsw0_leaves)}"
+      )
+    else:
+      bsw_variable_treedef = None
+      raw_bsw = bsw
+
+    def inner_body(carry, _):
+      current_loop_state, current_layer_mutables = carry
+      iteration = current_loop_state["loop_iteration"]
+      advanced_mutables = _advance_rng_state(current_layer_mutables, iteration)
+      new_loop_state, new_layer_state = self.run_one_iteration(
+          current_loop_state, raw_bsw, layers_graph, const_metrics,
+          advanced_mutables, positions, segment_ids, deterministic, model_mode,
+          logical_partition_spec_stripped,
+          bsw_variable_treedef=bsw_variable_treedef,
+      )
+      _, _, new_layer_metrics, new_layer_mutables = nnx.split(
+          new_layer_state, _is_static_param, nnx.Intermediate, ...
+      )
+      return (new_loop_state, new_layer_mutables), new_layer_metrics
+
+    if self.config.set_remat_policy_on_pipeline_iterations:
+      inner_body = jax.checkpoint(
+          inner_body, policy=lambda *_, **__: False,
+          prevent_cse=not self.config.scan_pipeline_iterations,
+      )
+    return inner_body
+
+  def _init_empty_bsw(self, layers_params):
+    """Creates zero-filled BSW buffer matching one repeat's gathered weights shape."""
+    dummy_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, 0)
+    return jax.tree.map(jnp.zeros_like, dummy_repeat_weights)
+
+  def _execute_one_repeat(self, loop_state, current_gathered_weights, layers_mutables,
+                           layers_params, layers_graph, layers_metrics, positions, segment_ids,
+                           deterministic, model_mode, logical_partition_spec_stripped,
+                           physical_partition_spec_full):
+    """Execute one repeat: 1 all-gather + inner scan + custom VJP.
+
+    BSW is an explicit jax.vjp argument for correct gradient flow.
+    nnx.State objects are flattened to raw array lists at the custom_vjp
+    boundary to reduce pytree complexity and VJP residual overhead (RC1).
+    layers_metrics is wrapped in stop_gradient since it's constant within
+    a repeat (RC2).
+    """
+
+    # RC2: stop_gradient on layers_metrics — constant within _repeat_fwd,
+    # Intermediate variables are not optimized by the optimizer.
+    const_layers_metrics = jax.lax.stop_gradient(layers_metrics)
+
+    # RC1: Flatten nnx.State -> raw array leaves at the VJP boundary
+    mutables_flat, mutables_treedef = jax.tree_util.tree_flatten(layers_mutables)
+    params_flat, params_treedef = jax.tree_util.tree_flatten(layers_params)
+
+    _log_pytree_info("VJP boundary — layers_mutables (original)", layers_mutables)
+    _log_pytree_info("VJP boundary — layers_params (original)", layers_params)
+    max_logging.log(
+        f"[pipeline-mem] VJP boundary — mutables_flat: {len(mutables_flat)} leaves, "
+        f"params_flat: {len(params_flat)} leaves"
+    )
+
+    @jax.custom_vjp
+    def _repeat_pure(loop_state, current_gathered_weights, mutables_flat, params_flat):
+      return _repeat_fwd(loop_state, current_gathered_weights, mutables_flat, params_flat)[0]
+
+    def _repeat_fwd(loop_state, current_gathered_weights, mutables_flat, params_flat):
+      # Reconstruct nnx.State for internal use
+      layers_mutables_inner = mutables_treedef.unflatten(mutables_flat)
+      layers_params_inner = params_treedef.unflatten(params_flat)
+
+      iteration = loop_state["loop_iteration"]
+      next_gathered_weights = self.weight_prefetching(
+          layers_params_inner, physical_partition_spec_full, iteration)
+      bsw = (current_gathered_weights, next_gathered_weights)
+
+      partial_weight_prefetching = functools.partial(
+          self.weight_prefetching,
+          physical_partition_spec=physical_partition_spec_full,
+          loop_iteration=iteration,
+      )
+      weight_prefetching_transpose = jax.linear_transpose(
+          partial_weight_prefetching, layers_params_inner)
+
+      def run_inner(loop_state, bsw_arg, layers_mutables):
+        inner_body = self._make_inner_scan_body(
+            bsw_arg, layers_graph, const_layers_metrics, positions, segment_ids,
+            deterministic, model_mode, logical_partition_spec_stripped,
+        )
+        return jax.lax.scan(
+            inner_body, (loop_state, layers_mutables), None,
+            length=self.config.num_pipeline_microbatches)
+
+      primals_out, scan_vjp_fn = jax.vjp(
+          run_inner, loop_state, bsw, layers_mutables_inner)
+      (new_loop_state, new_mutables), inner_metrics = primals_out
+
+      _log_pytree_info("_repeat_fwd — BSW (current + next)", bsw)
+      _log_pytree_info("_repeat_fwd — scan_vjp_fn residuals", scan_vjp_fn)
+      _log_pytree_info("_repeat_fwd — inner_metrics (scan output)", inner_metrics)
+
+      # Flatten new_mutables back to raw leaves for the VJP output
+      new_mutables_flat = jax.tree_util.tree_leaves(new_mutables)
+
+      return (
+          (new_loop_state, next_gathered_weights, new_mutables_flat, inner_metrics),
+          (scan_vjp_fn, weight_prefetching_transpose),
+      )
+
+    def _repeat_bwd(residuals, g_out):
+      scan_vjp_fn, weight_prefetching_transpose = residuals
+      grad_loop_state, grad_next_weights, grad_mutables_flat, grad_metrics = g_out
+
+      # Unflatten mutables gradient for scan_vjp_fn which expects nnx.State
+      grad_mutables = mutables_treedef.unflatten(grad_mutables_flat)
+
+      grad_loop_state, grad_bsw, grad_mutables = scan_vjp_fn(
+          ((grad_loop_state, grad_mutables), grad_metrics))
+      grad_bsw_curr, grad_bsw_next = grad_bsw
+      grad_bsw_next = jax.tree.map(
+          lambda d, g: d + g if hasattr(d, "shape") else d,
+          grad_bsw_next, grad_next_weights)
+      (grad_layers_params,) = weight_prefetching_transpose(grad_bsw_next)
+
+      # Flatten output gradients to match the flat input signature
+      grad_mutables_flat = jax.tree_util.tree_leaves(grad_mutables)
+      grad_params_flat = jax.tree_util.tree_leaves(grad_layers_params)
+      return grad_loop_state, grad_bsw_curr, grad_mutables_flat, grad_params_flat
+
+    _repeat_pure.defvjp(_repeat_fwd, _repeat_bwd)
+
+    result = _repeat_pure(loop_state, current_gathered_weights, mutables_flat, params_flat)
+    new_loop_state, next_gathered_weights, new_mutables_flat, inner_metrics = result
+
+    # Unflatten back to nnx.State for the caller
+    new_mutables = mutables_treedef.unflatten(new_mutables_flat)
+    return new_loop_state, next_gathered_weights, new_mutables, inner_metrics
+
   def __call__(
       self,
       inputs: jnp.ndarray,
@@ -2350,10 +2548,6 @@ class NNXCircularPipeline(NNXPipelineBase):
     )
     logical_partition_spec_stripped = pipeline_utils.strip_pipeline_repeat_logical_axis(logical_partition_spec)
 
-    bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
-    real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
-    total_iterations = real_iterations + bubble_iterations
-
     layers_graph, layers_state = nnx.split(self.layers)
 
     def is_lp(x):
@@ -2380,65 +2574,51 @@ class NNXCircularPipeline(NNXPipelineBase):
         "Only RngState variables (RngKey/RngCount) should be present."
     )
 
-    def scan_body(carry, _):
-      current_loop_state, current_layer_mutables = carry
-      # Fold loop_iteration into RNG keys so each scan step gets a unique
-      # dropout mask — mirrors Linen's nn.scan(split_rngs={"random": True}).
-      iteration = current_loop_state["loop_iteration"]
-      advanced_mutables = _advance_rng_state(current_layer_mutables, iteration)
+    current_gathered_weights = self._init_empty_bsw(layers_params)
 
-      # Gather weights for the current iteration only.
-      # Unlike the Linen circular pipeline which carries a sliding-window BSW
-      # (w_curr, w_next) through scan and uses a custom_vjp to manage the
-      # gradient flow, the NNX port recomputes weights each iteration.
-      # Since from_all_variables_to_repeat_weights already gathers the correct
-      # per-stage repeat via get_microbatch_and_repeat_ids, the dual-buffer
-      # select is unnecessary — cur_bsw alone has the right weights for every
-      # stage. Passing (cur_bsw, cur_bsw) makes the select in
-      # get_current_weights_from_bsw a no-op, eliminating the boundary bug
-      # where nxt_bsw (gathered for iteration+1) provided wrong-repeat weights
-      # to stages still processing the current repeat.
-      cur_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, iteration)
-      cur_bsw = self.from_repeat_weights_to_bsw(cur_repeat_weights, physical_partition_spec_full)
-      bsw = (cur_bsw, cur_bsw)
+    # Log pipeline state sizes for HBM debugging
+    _log_pytree_info("__call__ — layers_params", layers_params)
+    _log_pytree_info("__call__ — layers_metrics", layers_metrics)
+    _log_pytree_info("__call__ — layers_mutables", layers_mutables)
+    _log_pytree_info("__call__ — initial BSW (one half)", current_gathered_weights)
 
-      # Run Forward & State Shift
-      # Use STRIPPED logical spec - run_one_iteration re-derives physical from it,
-      # and get_current_weights_from_bsw expects specs without the repeat axis.
-      new_loop_state, new_layer_state = self.run_one_iteration(
-          current_loop_state,
-          bsw,
-          layers_graph,
-          layers_metrics,
-          advanced_mutables,
-          positions,
-          segment_ids,
-          deterministic,
-          model_mode,
-          logical_partition_spec_stripped,
+    # RC2: layers_metrics is constant across all repeats — stop gradient
+    # to reduce VJP residual overhead (matches Linen variable_broadcast).
+    layers_metrics = jax.lax.stop_gradient(layers_metrics)
+
+    all_metrics = []
+    current_loop_state = loop_state
+    current_mutables = layers_mutables
+
+    for _ in range(self.config.num_pipeline_repeats):
+      (current_loop_state, current_gathered_weights, current_mutables, repeat_metrics) = (
+          self._execute_one_repeat(
+              current_loop_state, current_gathered_weights, current_mutables, layers_params,
+              layers_graph, layers_metrics, positions, segment_ids, deterministic, model_mode,
+              logical_partition_spec_stripped, physical_partition_spec_full,
+          )
       )
+      all_metrics.append(repeat_metrics)
 
-      _, _, new_layer_metrics, new_layer_mutables = nnx.split(new_layer_state, _is_static_param, nnx.Intermediate, ...)
-      return (new_loop_state, new_layer_mutables), new_layer_metrics
-
-    if self.config.set_remat_policy_on_pipeline_iterations:
-      scan_body = jax.checkpoint(
-          scan_body, policy=self.get_pipeline_remat_policy(), prevent_cse=not self.config.scan_pipeline_iterations
+    bubble_iterations = self.forwarding_delay * (self.num_stages - 1)
+    if bubble_iterations > 0:
+      bsw_bubble = (current_gathered_weights, current_gathered_weights)
+      bubble_body = self._make_inner_scan_body(
+          bsw_bubble, layers_graph, layers_metrics, positions, segment_ids,
+          deterministic, model_mode, logical_partition_spec_stripped,
       )
-
-    # Memory Efficient Execution via pure JAX scan
-    if self.config.scan_pipeline_iterations:
-      (loop_state, final_layer_mutables), stacked_metrics = jax.lax.scan(
-          scan_body, (loop_state, layers_mutables), None, length=total_iterations
+      (current_loop_state, current_mutables), bubble_metrics = jax.lax.scan(
+          bubble_body, (current_loop_state, current_mutables), None,
+          length=bubble_iterations,
       )
-    else:
-      current_carry = (loop_state, layers_mutables)
-      metrics_history = []
-      for _ in range(total_iterations):
-        current_carry, step_metrics = scan_body(current_carry, None)
-        metrics_history.append(step_metrics)
-      loop_state, final_layer_mutables = current_carry
-      stacked_metrics = jax.tree.map(lambda *xs: jnp.stack(xs), *metrics_history) if metrics_history else layers_metrics
+      all_metrics.append(bubble_metrics)
+
+    def _concat_metrics(*xs):
+      return jnp.concatenate(xs, axis=0)
+
+    stacked_metrics = jax.tree.map(_concat_metrics, *all_metrics)
+    loop_state = current_loop_state
+    final_layer_mutables = current_mutables
 
     final_layer_state = nnx.State.merge(layers_params, stacked_metrics, final_layer_mutables)
     nnx.update(self.layers, final_layer_state)
