@@ -2549,36 +2549,25 @@ class NNXCircularPipeline(NNXPipelineBase):
     # Level 2: scan over microbatches with d+g accumulation (inside _create_microbatch_scan)
     # Level 3: per-repeat with linear_transpose for reduce-scatter (inside _execute_one_repeat)
     #
-    # Outer loop uses jax.lax.scan (not a Python for-loop) so that only ONE repeat's
-    # VJP closures are alive at a time.  Combined with jax.checkpoint on repeat_body
-    # this matches Linen's memory profile and avoids ~20 GB temp from unrolled closures.
+    # Outer loop over repeats is a Python for-loop (not scanned) because each repeat
+    # needs its own linear_transpose closure bound to the current loop_iteration.
+    # This matches the Linen pipeline's nn.scan over repeats which uses a custom VJP
+    # per repeat via create_pipeline_stage / execute_pipeline_stage_pure.
 
     current_gathered_weights = self._init_empty_bsw(layers_params)
+    all_metrics = []
+    current_loop_state = loop_state
+    current_mutables = layers_mutables
 
-    def repeat_body(carry, _):
-      carry_loop_state, carry_gathered_weights, carry_mutables = carry
-      (new_loop_state, new_gathered_weights, new_mutables, step_metrics) = (
+    for _ in range(self.config.num_pipeline_repeats):
+      (current_loop_state, current_gathered_weights, current_mutables, repeat_metrics) = (
           self._execute_one_repeat(
-              carry_loop_state, carry_gathered_weights, carry_mutables, layers_params,
+              current_loop_state, current_gathered_weights, current_mutables, layers_params,
               layers_graph, layers_metrics, positions, segment_ids, deterministic, model_mode,
               logical_partition_spec_stripped, physical_partition_spec_full,
           )
       )
-      return (new_loop_state, new_gathered_weights, new_mutables), step_metrics
-
-    if self.config.set_remat_policy_on_pipeline_iterations:
-      repeat_body = jax.checkpoint(
-          repeat_body, policy=self.get_pipeline_remat_policy(),
-          prevent_cse=not self.config.scan_pipeline_iterations,
-      )
-
-    (current_loop_state, current_gathered_weights, current_mutables), repeat_metrics = jax.lax.scan(
-        repeat_body,
-        (loop_state, current_gathered_weights, layers_mutables),
-        None,
-        length=self.config.num_pipeline_repeats,
-    )
-    all_metrics = [repeat_metrics]
+      all_metrics.append(repeat_metrics)
 
     # Bubble: simple scan without Level 2 VJP (no weight prefetching needed).
     if bubble_iterations > 0:
