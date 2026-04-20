@@ -2403,28 +2403,33 @@ class NNXCircularPipeline(NNXPipelineBase):
 
     # ---- Outer body: per-repeat, DO weight_prefetching ----
     #
-    # Uses a TRUE sliding window BSW (w_curr, w_next) to handle repeat
-    # boundaries correctly. Later stages with forwarding_delay > 0 may
-    # transition to the next repeat mid-inner-scan and need next-repeat
-    # weights from bsw[1]. This matches Linen's create_pipeline_stage.
+    # BSW is NOT in the outer carry to avoid storing N copies of gathered
+    # weights (~1.6 GB each × 16 repeats = 25.6 GB). Instead, BSW is
+    # recomputed inside each outer_body call. With jax.checkpoint on
+    # outer_body, BSW creation is recomputed during backward too.
+    #
+    # Uses (w_curr, w_next) sliding window for correct repeat boundaries.
 
     def outer_body(carry, _):
-      """Process one full repeat: prefetch next BSW, form sliding window, scan microbatches."""
-      current_loop_state, current_layer_mutables, w_curr = carry
+      """Process one full repeat: create BSW, scan microbatches."""
+      current_loop_state, current_layer_mutables = carry
 
-      # 1. Prefetch NEXT repeat's weights (overlap communication with compute).
-      #    weight_prefetching gathers for loop_iteration + 1, but we pass
-      #    the current iteration so it prefetches the next repeat's weights.
+      # 1. Create BSW sliding window from layers_params (closure).
+      #    Recomputed per repeat (not stored in carry to save memory).
       iteration = current_loop_state["loop_iteration"]
+      cur_repeat_weights = self.from_all_variables_to_repeat_weights(
+          layers_params, iteration
+      )
+      w_curr = self.from_repeat_weights_to_bsw(
+          cur_repeat_weights, physical_partition_spec_full
+      )
+      # Prefetch next repeat's weights for sliding window
       w_next = self.weight_prefetching(
           layers_params, physical_partition_spec_full, iteration
       )
-
-      # 2. Form sliding window BSW: stages in current repeat use bsw[0],
-      #    stages transitioning to next repeat use bsw[1].
       bsw = (w_curr, w_next)
 
-      # 3. Inner scan: process num_microbatches iterations with fixed BSW
+      # 2. Inner scan: process num_microbatches iterations with fixed BSW
       inner_init = (current_loop_state, current_layer_mutables, bsw)
       if self.config.scan_pipeline_iterations:
         (new_loop_state, new_layer_mutables, _), inner_metrics = jax.lax.scan(
@@ -2441,12 +2446,12 @@ class NNXCircularPipeline(NNXPipelineBase):
             lambda *xs: jnp.stack(xs), *inner_metrics_history
         ) if inner_metrics_history else layers_metrics
 
-      # 4. Return: w_next becomes w_curr for the next repeat (sliding window advance)
-      return (new_loop_state, new_layer_mutables, w_next), inner_metrics
+      # 3. Return: carry is SMALL (no w_curr/w_next stored)
+      return (new_loop_state, new_layer_mutables), inner_metrics
 
     # ---- Apply remat to outer body ----
     # Safe because there's NO @jax.custom_vjp inside — no tracer leak risk.
-    # Reduces memory by recomputing BSW creation during backward.
+    # Recomputes BSW creation during backward (not stored in carry).
     if self.config.set_remat_policy_on_pipeline_iterations:
       outer_body = jax.checkpoint(
           outer_body,
@@ -2454,18 +2459,26 @@ class NNXCircularPipeline(NNXPipelineBase):
           prevent_cse=not self.config.scan_pipeline_iterations,
       )
 
-    # ---- Initialize BSW for first repeat ----
-    # Create initial w_curr (gathered weights for repeat 0)
-    init_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, 0)
-    init_w_curr = self.from_repeat_weights_to_bsw(
-        init_repeat_weights, physical_partition_spec_full
+    # ---- Logging: carry sizes for memory debugging ----
+    carry_leaves = jax.tree.leaves(loop_state)
+    carry_bytes = sum(l.size * l.dtype.itemsize for l in carry_leaves if hasattr(l, 'size'))
+    mut_leaves = jax.tree.leaves(layers_mutables)
+    mut_bytes = sum(l.size * l.dtype.itemsize for l in mut_leaves if hasattr(l, 'size'))
+    print(
+        f"[NNX Pipeline] Outer carry: loop_state={len(carry_leaves)} leaves "
+        f"({carry_bytes / 1e9:.3f} GB), mutables={len(mut_leaves)} leaves "
+        f"({mut_bytes / 1e9:.3f} GB). "
+        f"BSW NOT in carry (recomputed per repeat). "
+        f"num_repeats={num_repeats}, num_microbatches={num_microbatches}, "
+        f"bubble_iterations={bubble_iterations}",
+        flush=True,
     )
 
     # ---- Execute outer scan over repeats ----
-    outer_init = (loop_state, layers_mutables, init_w_curr)
+    outer_init = (loop_state, layers_mutables)
 
     if self.config.scan_pipeline_iterations:
-      (loop_state, final_layer_mutables, final_w_curr), repeat_metrics = jax.lax.scan(
+      (loop_state, final_layer_mutables), repeat_metrics = jax.lax.scan(
           outer_body, outer_init, None, length=num_repeats
       )
     else:
@@ -2474,16 +2487,23 @@ class NNXCircularPipeline(NNXPipelineBase):
       for _ in range(num_repeats):
         current_outer_carry, repeat_step_metrics = outer_body(current_outer_carry, None)
         repeat_metrics_history.append(repeat_step_metrics)
-      loop_state, final_layer_mutables, final_w_curr = current_outer_carry
+      loop_state, final_layer_mutables = current_outer_carry
       repeat_metrics = jax.tree.map(
           lambda *xs: jnp.stack(xs), *repeat_metrics_history
       ) if repeat_metrics_history else layers_metrics
 
     # ---- Bubble iterations ----
     if bubble_iterations > 0:
-      # Use final_w_curr from the last repeat as both BSW slots.
-      # During bubble phase, no new repeats start — stages are draining.
-      bubble_bsw = (final_w_curr, final_w_curr)
+      # Create BSW for bubble phase from layers_params.
+      # During bubble, no new repeats start — stages are draining.
+      bubble_iteration = loop_state["loop_iteration"]
+      bubble_repeat_weights = self.from_all_variables_to_repeat_weights(
+          layers_params, bubble_iteration
+      )
+      bubble_bsw_single = self.from_repeat_weights_to_bsw(
+          bubble_repeat_weights, physical_partition_spec_full
+      )
+      bubble_bsw = (bubble_bsw_single, bubble_bsw_single)
 
       bubble_init = (loop_state, final_layer_mutables, bubble_bsw)
       if self.config.scan_pipeline_iterations:
