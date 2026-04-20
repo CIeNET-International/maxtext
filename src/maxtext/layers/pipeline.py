@@ -2465,11 +2465,18 @@ class NNXCircularPipeline(NNXPipelineBase):
 
     def _repeat_bwd(residuals, g_out):
       scan_vjp_fn, weight_prefetching_transpose = residuals
-      grad_loop_state, grad_next_weights, _, grad_metrics = g_out
+      grad_loop_state, grad_next_weights, grad_mutables_flat_out, grad_metrics = g_out
 
-      # Pass zero gradients for mutables (closed over via stopped_mutables)
+      # Unflatten mutables gradient from output back to nnx.State structure
+      # for scan_vjp_fn (matches run_inner's output shape).
+      # Uses mutables_treedef (static Python, no tracer leak) instead of
+      # stopped_mutables (which would leak a tracer from checkpoint scope).
+      # Since stopped_mutables used stop_gradient, the scan backward produces
+      # zeros for this component anyway.
+      grad_mutables_state = mutables_treedef.unflatten(grad_mutables_flat_out)
+
       grad_loop_state, grad_bsw = scan_vjp_fn(
-          ((grad_loop_state, jax.tree.map(jnp.zeros_like, stopped_mutables)), grad_metrics))
+          ((grad_loop_state, grad_mutables_state), grad_metrics))
       grad_bsw_curr, grad_bsw_next = grad_bsw
       grad_bsw_next = jax.tree.map(
           lambda d, g: d + g if hasattr(d, "shape") else d,
