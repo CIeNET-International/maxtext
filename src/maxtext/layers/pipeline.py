@@ -2404,26 +2404,35 @@ class NNXCircularPipeline(NNXPipelineBase):
     const_layers_metrics = jax.lax.stop_gradient(layers_metrics)
 
     # RC1: Flatten nnx.State -> raw array leaves at the VJP boundary
-    # RC3: stop_gradient on mutables — RNG state doesn't need gradients,
-    # closing over it avoids per-iteration VJP residuals.
+    # RC3: stop_gradient on mutables — RNG state doesn't need gradients.
+    # IMPORTANT: stopped_mutables MUST be passed as an explicit argument to
+    # _repeat_pure (not captured as a closure) because this function runs
+    # inside jax.checkpoint.  Closing over a checkpoint-scoped tracer in a
+    # custom_vjp's _fwd/_bwd causes an UnexpectedTracerError: the checkpoint
+    # re-traces during backward, but custom_vjp's stored closures still
+    # reference the now-dead forward-trace scope.
     stopped_mutables = jax.lax.stop_gradient(layers_mutables)
     mutables_treedef = jax.tree_util.tree_structure(layers_mutables)
+    stopped_muts_flat, stopped_muts_treedef = jax.tree_util.tree_flatten(stopped_mutables)
     params_flat, params_treedef = jax.tree_util.tree_flatten(layers_params)
 
     _log_pytree_info("VJP boundary — layers_mutables (original)", layers_mutables)
     _log_pytree_info("VJP boundary — layers_params (original)", layers_params)
     max_logging.log(
         f"[pipeline-mem] VJP boundary — mutables leaves: {mutables_treedef.num_leaves}, "
-        f"params_flat: {len(params_flat)} leaves"
+        f"params_flat: {len(params_flat)} leaves, "
+        f"stopped_muts_flat: {len(stopped_muts_flat)} leaves"
     )
 
     @jax.custom_vjp
-    def _repeat_pure(loop_state, current_gathered_weights, params_flat):
-      return _repeat_fwd(loop_state, current_gathered_weights, params_flat)[0]
+    def _repeat_pure(loop_state, current_gathered_weights, params_flat, stopped_muts_flat):
+      return _repeat_fwd(loop_state, current_gathered_weights, params_flat, stopped_muts_flat)[0]
 
-    def _repeat_fwd(loop_state, current_gathered_weights, params_flat):
-      # Reconstruct nnx.State for internal use (mutables closed over via stopped_mutables)
+    def _repeat_fwd(loop_state, current_gathered_weights, params_flat, stopped_muts_flat):
+      # Reconstruct nnx.State from flat leaves — all are explicit arguments,
+      # nothing is closed over from the checkpoint scope.
       layers_params_inner = params_treedef.unflatten(params_flat)
+      stopped_mutables_inner = stopped_muts_treedef.unflatten(stopped_muts_flat)
 
       iteration = loop_state["loop_iteration"]
       next_gathered_weights = self.weight_prefetching(
@@ -2438,10 +2447,8 @@ class NNXCircularPipeline(NNXPipelineBase):
       weight_prefetching_transpose = jax.linear_transpose(
           partial_weight_prefetching, layers_params_inner)
 
-      # stopped_mutables MUST be an explicit argument to run_inner (not a
-      # closure variable) so that jax.vjp traces it as a proper input. If
-      # captured via closure, the tracer leaks from jax.checkpoint scope
-      # into scan_vjp_fn residuals, causing UnexpectedTracerError.
+      # stopped_mutables is now an explicit argument — pass it to run_inner
+      # so jax.vjp traces it as a proper input.
       def run_inner(loop_state, bsw_arg, mutables_arg):
         inner_body = self._make_inner_scan_body(
             bsw_arg, layers_graph, const_layers_metrics, positions, segment_ids,
@@ -2452,7 +2459,7 @@ class NNXCircularPipeline(NNXPipelineBase):
             length=self.config.num_pipeline_microbatches)
 
       primals_out, scan_vjp_fn = jax.vjp(
-          run_inner, loop_state, bsw, stopped_mutables)
+          run_inner, loop_state, bsw, stopped_mutables_inner)
       (new_loop_state, new_mutables), inner_metrics = primals_out
 
       _log_pytree_info("_repeat_fwd — BSW (current + next)", bsw)
@@ -2464,11 +2471,11 @@ class NNXCircularPipeline(NNXPipelineBase):
 
       return (
           (new_loop_state, next_gathered_weights, new_mutables_flat, inner_metrics),
-          (scan_vjp_fn, weight_prefetching_transpose),
+          (scan_vjp_fn, weight_prefetching_transpose, stopped_muts_flat),
       )
 
     def _repeat_bwd(residuals, g_out):
-      scan_vjp_fn, weight_prefetching_transpose = residuals
+      scan_vjp_fn, weight_prefetching_transpose, stopped_muts_res = residuals
       grad_loop_state, grad_next_weights, grad_mutables_flat_out, grad_metrics = g_out
 
       # Unflatten mutables gradient from output back to nnx.State structure
@@ -2487,11 +2494,15 @@ class NNXCircularPipeline(NNXPipelineBase):
 
       # Flatten output gradients to match the flat input signature
       grad_params_flat = jax.tree_util.tree_leaves(grad_layers_params)
-      return grad_loop_state, grad_bsw_curr, grad_params_flat
+      # Zero gradients for stopped_mutables — stop_gradient ensures no
+      # gradient flows, so return structural zeros.  Use shape/dtype from
+      # the residuals (not a closure) to avoid tracer scope issues.
+      grad_stopped_muts_flat = [jnp.zeros_like(s) for s in stopped_muts_res]
+      return grad_loop_state, grad_bsw_curr, grad_params_flat, grad_stopped_muts_flat
 
     _repeat_pure.defvjp(_repeat_fwd, _repeat_bwd)
 
-    result = _repeat_pure(loop_state, current_gathered_weights, params_flat)
+    result = _repeat_pure(loop_state, current_gathered_weights, params_flat, stopped_muts_flat)
     new_loop_state, next_gathered_weights, new_mutables_flat, inner_metrics = result
 
     # Unflatten back to nnx.State for the caller
@@ -2593,6 +2604,45 @@ class NNXCircularPipeline(NNXPipelineBase):
     # RC2: layers_metrics is constant across all repeats — stop gradient
     # to reduce VJP residual overhead (matches Linen variable_broadcast).
     layers_metrics = jax.lax.stop_gradient(layers_metrics)
+
+    # --- Diagnostic: log types of all closure variables for tracer leak debugging ---
+    def _describe_val(name, v):
+      """Log whether a value is a tracer, concrete array, or static Python object."""
+      if hasattr(v, 'shape') and hasattr(v, 'dtype'):
+        is_tracer = hasattr(v, '_trace')  # DynamicJaxprTracer has _trace
+        kind = "TRACER" if is_tracer else "concrete"
+        return f"  {name}: {kind} {v.dtype}[{','.join(str(s) for s in v.shape)}]"
+      elif isinstance(v, dict):
+        return f"  {name}: dict with {len(v)} keys"
+      elif isinstance(v, (list, tuple)):
+        return f"  {name}: {type(v).__name__} len={len(v)}"
+      else:
+        return f"  {name}: {type(v).__name__}"
+
+    # Log each closure variable of outer_repeat_body
+    closure_report = ["[TRACER-DIAG] outer_repeat_body closure variables:"]
+    for cname, cval in [
+        ("layers_params", layers_params),
+        ("layers_metrics", layers_metrics),
+        ("layers_graph", layers_graph),
+    ]:
+      closure_report.append(_describe_val(cname, cval))
+    # Log leaf-level for pytree closures
+    for cname, cval in [("layers_params", layers_params), ("layers_metrics", layers_metrics)]:
+      for i, leaf in enumerate(jax.tree.leaves(cval)):
+        closure_report.append(_describe_val(f"  {cname}.leaf[{i}]", leaf))
+    if positions is not None:
+      closure_report.append(_describe_val("positions", positions))
+    if segment_ids is not None:
+      closure_report.append(_describe_val("segment_ids", segment_ids))
+    closure_report.append(_describe_val("layers_mutables (in carry)", layers_mutables))
+    for i, leaf in enumerate(jax.tree.leaves(layers_mutables)):
+      closure_report.append(_describe_val(f"  mutables.leaf[{i}]", leaf))
+    closure_report.append(f"  deterministic: {type(deterministic).__name__} = {deterministic}")
+    closure_report.append(f"  model_mode: {type(model_mode).__name__} = {model_mode}")
+    closure_report.append(f"  logical_partition_spec_stripped: {type(logical_partition_spec_stripped).__name__}")
+    closure_report.append(f"  physical_partition_spec_full: {type(physical_partition_spec_full).__name__}")
+    max_logging.log("\n".join(closure_report))
 
     # --- Outer repeat scan: matches Linen's nn.scan(nn.remat(f)) ---
     def outer_repeat_body(carry, _):
