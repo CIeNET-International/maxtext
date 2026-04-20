@@ -2438,17 +2438,21 @@ class NNXCircularPipeline(NNXPipelineBase):
       weight_prefetching_transpose = jax.linear_transpose(
           partial_weight_prefetching, layers_params_inner)
 
-      def run_inner(loop_state, bsw_arg):
+      # stopped_mutables MUST be an explicit argument to run_inner (not a
+      # closure variable) so that jax.vjp traces it as a proper input. If
+      # captured via closure, the tracer leaks from jax.checkpoint scope
+      # into scan_vjp_fn residuals, causing UnexpectedTracerError.
+      def run_inner(loop_state, bsw_arg, mutables_arg):
         inner_body = self._make_inner_scan_body(
             bsw_arg, layers_graph, const_layers_metrics, positions, segment_ids,
             deterministic, model_mode, logical_partition_spec_stripped,
         )
         return jax.lax.scan(
-            inner_body, (loop_state, stopped_mutables), None,
+            inner_body, (loop_state, mutables_arg), None,
             length=self.config.num_pipeline_microbatches)
 
       primals_out, scan_vjp_fn = jax.vjp(
-          run_inner, loop_state, bsw)
+          run_inner, loop_state, bsw, stopped_mutables)
       (new_loop_state, new_mutables), inner_metrics = primals_out
 
       _log_pytree_info("_repeat_fwd — BSW (current + next)", bsw)
@@ -2469,13 +2473,11 @@ class NNXCircularPipeline(NNXPipelineBase):
 
       # Unflatten mutables gradient from output back to nnx.State structure
       # for scan_vjp_fn (matches run_inner's output shape).
-      # Uses mutables_treedef (static Python, no tracer leak) instead of
-      # stopped_mutables (which would leak a tracer from checkpoint scope).
-      # Since stopped_mutables used stop_gradient, the scan backward produces
-      # zeros for this component anyway.
       grad_mutables_state = mutables_treedef.unflatten(grad_mutables_flat_out)
 
-      grad_loop_state, grad_bsw = scan_vjp_fn(
+      # scan_vjp_fn returns gradients for 3 primals: (loop_state, bsw, mutables).
+      # Discard mutables gradient — stop_gradient ensures it's zeros.
+      grad_loop_state, grad_bsw, _ = scan_vjp_fn(
           ((grad_loop_state, grad_mutables_state), grad_metrics))
       grad_bsw_curr, grad_bsw_next = grad_bsw
       grad_bsw_next = jax.tree.map(
