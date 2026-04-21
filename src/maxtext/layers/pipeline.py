@@ -244,7 +244,7 @@ class PipelineSharedMixin:
     """Returns the pipeline remat policy for this pipeline."""
     if self.config.remat_policy == "custom":
       return self.remat_policy
-    save_input_policy = jax.checkpoint_policies.save_only_these_names("iteration_input", "decoder_layer_input")
+    save_input_policy = jax.checkpoint_policies.save_only_these_names("iteration_input", "decoder_layer_input", "bsw_weights")
     if self.remat_policy is not None:
       return jax.checkpoint_policies.save_from_both_policies(self.remat_policy, save_input_policy)
     return save_input_policy
@@ -2115,6 +2115,12 @@ class NNXCircularPipeline(NNXPipelineBase):
 
   def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec):
     """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer."""
+    # Fast path: when both BSW slots are identical (bsw[0] is bsw[1]),
+    # the shard_map select is a no-op. Skip it entirely.
+    # This is the case for NNXCircularPipeline which uses bsw=(cur_bsw, cur_bsw).
+    if bsw[0] is bsw[1]:
+      return bsw[0]
+
     bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
@@ -2426,6 +2432,9 @@ class NNXCircularPipeline(NNXPipelineBase):
       iteration = current_loop_state["loop_iteration"]
       cur_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, iteration)
       cur_bsw = self.from_repeat_weights_to_bsw(cur_repeat_weights, physical_partition_spec_full)
+      # Tag BSW so inner jax.checkpoint saves it instead of recomputing the
+      # all-gather during backward. Without this, backward re-gathers weights.
+      cur_bsw = jax.ad_checkpoint.checkpoint_name(cur_bsw, "bsw_weights")
       bsw_ref[0] = (cur_bsw, cur_bsw)
 
       # Inner scan over microbatches with fixed BSW
