@@ -2119,7 +2119,21 @@ class NNXCircularPipeline(NNXPipelineBase):
     # the shard_map select is a no-op. Skip it entirely.
     # This is the case for NNXCircularPipeline which uses bsw=(cur_bsw, cur_bsw).
     if bsw[0] is bsw[1]:
-      return bsw[0]
+      # Re-wrap nnx.Variable leaves so their _trace_state matches the
+      # *current* JAX trace level.  bsw[0] was created in the outer scan
+      # body (outer_body); by the time we reach here we are inside the
+      # inner scan body -> run_one_iteration -> nnx.vmap, which is a
+      # deeper trace.  Returning stale Variables causes
+      #   "Cannot extract graph node from different trace level"
+      # in check_consistent_aliasing (flax/nnx/extract.py).
+      # The shard_map path (below) avoids this by stripping / re-wrapping
+      # Variables through a treedef roundtrip.  We replicate that here:
+      # flatten to raw arrays, then unflatten back through the original
+      # treedef — unflatten calls Variable constructors which capture
+      # the current trace state.
+      treedef = jax.tree.structure(bsw[0])
+      leaves = jax.tree.leaves(bsw[0])
+      return treedef.unflatten(leaves)
 
     bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
