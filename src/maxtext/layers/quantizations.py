@@ -847,7 +847,11 @@ def maybe_quantize_model(model, config):
   if config.use_qwix_quantization and not config.use_batch_split_schedule:
     quantization_provider = get_qt_provider(config)
     if quantization_provider:
-      model = qwix.quantize_model(model, quantization_provider)
+      from flax import nnx
+      if isinstance(model, nnx.Module):
+        pass # Handle nnx model quantization with inputs in tests or caller directly.
+      else:
+        model = qwix.quantize_model(model, quantization_provider)
   return model
 
 
