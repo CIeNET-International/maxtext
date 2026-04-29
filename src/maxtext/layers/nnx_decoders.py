@@ -435,6 +435,49 @@ class NNXDecoder(nnx.Module):
 
           self._create_and_register_layer(layer_cls, rngs, "layers", lyr, **layer_kwargs)
 
+    self._dbg_dump_init_graphdefs()
+
+  def _dbg_dump_init_graphdefs(self):
+    """DEBUG: dump graphdef hash for every chunk-style attribute attached during __init__."""
+    self._dbg_dump_chunk_graphdefs(stage="__init__/end")
+
+  def _dbg_dump_call_graphdefs(self):
+    """DEBUG: dump graphdef hash for every chunk-style attribute on every (re)trace of __call__."""
+    self._dbg_dump_chunk_graphdefs(stage="__call__/enter")
+
+  def _dbg_dump_chunk_graphdefs(self, stage: str):
+    """DEBUG: print graphdef hash + type for chunk-style submodules. Stage tag distinguishes init vs call."""
+    candidate_prefixes = (
+        "layers",
+        "layers_remainder",
+        "dense_layers",
+        "moe_layers",
+        "layers_engram",
+    )
+    seen = set()
+    for attr in dir(self):
+      if attr.startswith("_") or attr in seen:
+        continue
+      if not any(attr == p or attr.startswith(p) for p in candidate_prefixes):
+        continue
+      seen.add(attr)
+      try:
+        v = getattr(self, attr)
+      except Exception:  # pylint: disable=broad-except
+        continue
+      if v is None or not isinstance(v, nnx.Module):
+        continue
+      try:
+        gd, *_ = nnx.split(v, nnx.Param, ...)
+        if False: max_logging.log(
+            f"[NNXDBG][{stage}] decoder_id={id(self)} attr={attr!r} "
+            f"graphdef_hash={hash(gd)} type={type(v).__name__}"
+        )
+      except Exception as e:  # pylint: disable=broad-except
+        if False: max_logging.log(
+            f"[NNXDBG][{stage}] decoder_id={id(self)} attr={attr!r} split_failed: {e!r}"
+        )
+
   def _create_and_register_layer(self, layer_cls, rngs, base_name, i, **layer_kwargs):
     attr_name = f"{base_name}_{i}"
     layer = self._create_single_layer(layer_cls, rngs, **layer_kwargs)
@@ -457,6 +500,10 @@ class NNXDecoder(nnx.Module):
       self, decoder_layer_class, length: int, metadata_axis_name: str, rngs: nnx.Rngs, **layer_kwargs
   ):
     """Creates a scanned stack of layers using jax.lax.scan for memory-efficient initialization."""
+    if False: max_logging.log(
+        f"[NNXDBG][_create_scanned_layers/enter] axis_name={metadata_axis_name!r} length={length} "
+        f"cls={getattr(decoder_layer_class, '__name__', decoder_layer_class)!r}"
+        )
     if length == 0:
       return None
     scan_axis = self.config.param_scan_axis
@@ -475,7 +522,15 @@ class NNXDecoder(nnx.Module):
         config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=ref_rngs, **layer_kwargs
     )
     layer_graphdef, _, _ = nnx.split(ref_layer, nnx.Param, ...)
+    if False: max_logging.log(
+        f"[NNXDBG][_create_scanned_layers/ref_split] axis_name={metadata_axis_name!r} "
+        f"layer_graphdef_hash={hash(layer_graphdef)}"
+        )
     del ref_layer
+    if False: max_logging.log(
+        f"[NNXDBG][_create_scanned_layers/del_ref] axis_name={metadata_axis_name!r} "
+        f"layer_graphdef_hash={hash(layer_graphdef)} (graphdef captured pre-del)"
+        )
 
     def scan_body(carry, rng_state_slice):
       layer_rngs = nnx.merge(rngs_graphdef, rng_state_slice)
@@ -491,6 +546,11 @@ class NNXDecoder(nnx.Module):
       return carry, (params, rest)
 
     _, (stacked_params, stacked_rest) = jax.lax.scan(scan_body, None, rngs_state)
+    if False: max_logging.log(
+        f"[NNXDBG][_create_scanned_layers/scan_done] axis_name={metadata_axis_name!r} "
+        f"params_leaves={len(jax.tree.leaves(stacked_params))} "
+        f"rest_leaves={len(jax.tree.leaves(stacked_rest))}"
+        )
 
     if scan_axis != 0:
       stacked_params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), stacked_params)
@@ -530,7 +590,20 @@ class NNXDecoder(nnx.Module):
     stacked_params = _add_scan_metadata(stacked_params, scan_axis)
     stacked_rest = _add_scan_metadata(stacked_rest, 0)
 
-    return nnx.merge(layer_graphdef, stacked_params, stacked_rest)
+    out = nnx.merge(layer_graphdef, stacked_params, stacked_rest)
+    try:
+      out_graphdef, *_ = nnx.split(out, nnx.Param, ...)
+      if False: max_logging.log(
+          f"[NNXDBG][_create_scanned_layers/merged] axis_name={metadata_axis_name!r} "
+          f"out_graphdef_hash={hash(out_graphdef)} "
+          f"matches_ref={out_graphdef == layer_graphdef}"
+        )
+    except Exception as e:  # pylint: disable=broad-except
+      if False: max_logging.log(
+          f"[NNXDBG][_create_scanned_layers/merged] axis_name={metadata_axis_name!r} "
+          f"post-merge split failed: {e!r}"
+        )
+    return out
 
   def _apply_layer_with_remat(self, layer: nnx.Module, y: jax.Array, policy: Any, prevent_cse: bool, **kwargs):
     """Helper to cleanly apply jax.checkpoint to a single unscanned layer or block."""
@@ -565,9 +638,19 @@ class NNXDecoder(nnx.Module):
       (final_carry, updated_layers) when kv_caches_stacked is None.
       (final_carry, updated_layers, returned_kv_stacked) otherwise.
     """
+    if length == 0:
+      return x_in, layers, kv_caches_stacked if kv_caches_stacked is not None else None
     policy = self.get_remat_policy()
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
+    if False: max_logging.log(
+        f"[NNXDBG][_apply_layers_sequentially/enter] layers_id={id(layers)} layers_type={type(layers).__name__} length={length}"
+        )
     graphdef, params, state = nnx.split(layers, nnx.Param, ...)
+    if False: max_logging.log(
+        f"[NNXDBG][_apply_layers_sequentially/post_split] layers_id={id(layers)} "
+        f"graphdef_hash={hash(graphdef)} params_leaves={len(jax.tree.leaves(params))} "
+        f"state_leaves={len(jax.tree.leaves(state))}"
+        )
 
     scan_axis = self.config.param_scan_axis
     if scan_axis != 0:
@@ -654,7 +737,13 @@ class NNXDecoder(nnx.Module):
     if scan_axis != 0:
       params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), params)
 
-    return final_carry, nnx.merge(graphdef, scanned_state), returned_kv_stacked if use_kv else None
+    if scan_axis != 0:
+      new_params, new_rest = scanned_state.split(nnx.Param, ...)
+      new_params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), new_params)
+      scanned_state = nnx.merge_state(new_params, new_rest)
+
+    nnx.update(layers, scanned_state)
+    return final_carry, layers, returned_kv_stacked if use_kv else None
 
   def get_decoder_layers(self):
     """Retrieves decoder layer classes based on config using a dictionary lookup."""
@@ -718,7 +807,7 @@ class NNXDecoder(nnx.Module):
     if cfg.remat_policy != "none":
       if cfg.remat_policy in ("minimal_with_context", "minimal_flash"):
         if cfg.remat_policy == "minimal_flash":
-          max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
+          if False: max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
         policy = self.minimal_policy(with_context=True)
       elif cfg.remat_policy == "minimal":
         policy = self.minimal_policy()
@@ -957,7 +1046,19 @@ class NNXDecoder(nnx.Module):
     Bridges NNX to Linen by creating a dictionary that mimics the exact variable
     structure expected by `deepseek_batchsplit.fetch_weights`.
     """
+    if False: max_logging.log(
+        f"[NNXDBG][_build_linen_params/enter] moe_stack_id={id(moe_stack)} type={type(moe_stack).__name__}"
+        )
     state_dict = nnx.state(moe_stack, nnx.Param)
+    try:
+      keys = list(state_dict.keys()) if hasattr(state_dict, "keys") else "<no keys>"
+      if False: max_logging.log(
+          f"[NNXDBG][_build_linen_params/state] moe_stack_id={id(moe_stack)} state_keys={keys}"
+        )
+    except Exception as e:  # pylint: disable=broad-except
+      if False: max_logging.log(
+          f"[NNXDBG][_build_linen_params/state] keys-read failed: {e!r}"
+        )
 
     return {
         "pre_self_attention_layer_norm": state_dict["pre_self_attention_layer_norm"],
@@ -1059,6 +1160,7 @@ class NNXDecoder(nnx.Module):
       attention_metadata=None,
       deepstack_visual_embeds: None | list[jnp.ndarray] = None,
   ):
+    self._dbg_dump_call_graphdefs()
     cfg = self.config
     assert decoder_input_tokens.ndim == 2  # [batch, len]
 
@@ -1152,8 +1254,8 @@ class NNXDecoder(nnx.Module):
                   num_layers=num_moe,
               )
           else:
-            y, self.moe_layer, _ = self._apply_layers_sequentially(
-                self.moe_layer, y, *layer_args, length=num_moe, **layer_kwargs
+            y, self.moe_layers, _ = self._apply_layers_sequentially(
+                self.moe_layers, y, *layer_args, length=num_moe, **layer_kwargs
             )
       elif self.is_gemma3:
         y = self._apply_gemma3_scanned_blocks(
