@@ -28,7 +28,8 @@ from flax import nnx
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from maxtext.configs import pyconfig
 from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN
 from maxtext.layers import quantizations
@@ -507,12 +508,37 @@ def get_transformer_model(config, mesh, quant, model_mode: str = MODEL_MODE_TRAI
     return models.transformer_as_linen(config, mesh, quant=quant, model_mode=model_mode)
 
 
+def _build_qwix_sample_inputs(config, mesh):
+  """Build dummy inputs for qwix shape propagation on NNX models.
+
+  Shapes match Transformer.__call__ signature; values are zero — qwix uses
+  shape and dtype only. Inputs are replicated across the mesh so qwix's init
+  forward pass does not OOM on multi-device runs.
+  """
+  batch = config.global_batch_size_to_load
+  seq = config.max_target_length
+  replicated = NamedSharding(mesh, PartitionSpec())
+  ids = jax.device_put(jnp.zeros((batch, seq), dtype=jnp.int32), replicated)
+  positions = jax.device_put(
+      jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32), (batch, seq)),
+      replicated,
+  )
+  segment_ids = jax.device_put(jnp.ones((batch, seq), dtype=jnp.int32), replicated)
+  return (ids, positions, segment_ids), {"enable_dropout": False}
+
+
 def create_model(config, mesh, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rngs | None = None):
   """Instantiates and returns the model object, sharded across the mesh."""
-  # Model definition
   quant = quantizations.configure_quantization(config)
   model = get_transformer_model(config, mesh, quant, model_mode=model_mode, rngs=rngs)
-  model = quantizations.maybe_quantize_model(model, config)
+  if (rngs is not None
+      and isinstance(model, nnx.Module)
+      and config.use_qwix_quantization
+      and not config.use_batch_split_schedule):
+    args, kwargs = _build_qwix_sample_inputs(config, mesh)
+    model = quantizations.maybe_quantize_model(model, config, *args, **kwargs)
+  else:
+    model = quantizations.maybe_quantize_model(model, config)
   return model
 
 

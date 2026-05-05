@@ -353,6 +353,8 @@ class QuantTest(unittest.TestCase):
             "base_num_kv_heads": 8,
             "base_mlp_dim": 4096,
             "base_num_decoder_layers": 12,
+            "enable_nnx": False,
+            "pure_nnx_decoder": False,
         }
         | kwargs
         | extra_args
@@ -513,6 +515,194 @@ class QuantTest(unittest.TestCase):
   @pytest.mark.gpu_only
   def test_fp8_te_nvfp4_quantization(self):
     self.quantization_config("te_nvfp4", grad_tolerance=1.0)
+
+
+class NNXQuantTest(unittest.TestCase):
+  """Tests for NNX-path quantized model correctness (fp8_gpu, fp8_nanoo)."""
+
+  def setUp(self):
+    self.cfg = self.init_pyconfig()
+    devices_array = maxtext_utils.create_device_mesh(self.cfg)
+    self.mesh = Mesh(devices_array, self.cfg.mesh_axes)
+    self.rng = jax.random.PRNGKey(0)
+
+  def init_pyconfig(self, **kwargs):
+    """Initialize MaxText pyconfig with NNX flags forced on."""
+    extra_args = get_decoupled_parallelism_overrides()
+    init_kwargs = (
+        {
+            "run_name": "test",
+            "dataset_type": "synthetic",
+            "enable_checkpointing": False,
+            "enable_goodput_recording": False,
+            "steps": 1,
+            "per_device_batch_size": 1,
+            "use_qwix_quantization": True,
+            "skip_jax_distributed_system": True,
+            "base_emb_dim": 1024,
+            "base_num_query_heads": 8,
+            "base_num_kv_heads": 8,
+            "base_mlp_dim": 4096,
+            "base_num_decoder_layers": 12,
+            "enable_nnx": True,
+            "pure_nnx_decoder": True,
+        }
+        | kwargs
+        | extra_args
+    )
+    config = pyconfig.initialize(
+        [sys.argv[0], get_test_config_path()],
+        **init_kwargs,
+    )
+    return config
+
+  def get_data(self):
+    """Same shape contract as QuantTest.get_data."""
+    s = (self.cfg.global_batch_size_to_train_on, self.cfg.max_target_length)
+    ids = jax.random.randint(self.rng, s, 0, self.cfg.vocab_size)
+    decoder_segment_ids = jnp.zeros(s) + DECODING_ACTIVE_SEQUENCE_INDICATOR
+    decoder_positions = jnp.stack(
+        [jnp.arange(self.cfg.max_target_length, dtype=jnp.int32) for _ in range(self.cfg.global_batch_size_to_train_on)]
+    )
+    return ids, decoder_segment_ids, decoder_positions
+
+  def pytree_allclose(self, a, b, *, tolerance=0.01):
+    """Return True if every pair of leaves is all-close."""
+    leaves_a, leaves_b = jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b)
+    return all(jnp.abs(y - x).mean() / (jnp.abs(x).mean() + 1e-8) < tolerance for x, y in zip(leaves_a, leaves_b))
+
+  def quantization_config_nnx(self, quant, *, scan_layers=False, logits_tolerance=2e-1, grad_tolerance=5e-1):
+    """Forward + backward parity check for NNX quantized model.
+
+    Quantization happens inside create_model via maybe_quantize_model, which
+    in turn calls qwix.quantize_model with auto-built dummy inputs. No manual
+    qwix call here.
+    """
+    base_cfg = self.init_pyconfig(scan_layers=scan_layers)
+    quant_cfg = self.init_pyconfig(quantization=quant, scan_layers=scan_layers)
+
+    rngs_base = nnx.Rngs(params=self.rng, aqt=self.rng, dropout=self.rng)
+    rngs_qt = nnx.Rngs(params=self.rng, aqt=self.rng, dropout=self.rng)
+    base_model = model_creation_utils.create_model(base_cfg, self.mesh, rngs=rngs_base)
+    qt_model = model_creation_utils.create_model(quant_cfg, self.mesh, rngs=rngs_qt)
+
+    ids, decoder_segment_ids, decoder_positions = self.get_data()
+
+    def loss_fn(model):
+      logits = model(
+          ids, decoder_positions, decoder_segment_ids, enable_dropout=False
+      )
+      return jnp.mean(logits ** 2), logits
+
+    (_, base_logits), grads_base = nnx.value_and_grad(loss_fn, has_aux=True)(base_model)
+    (_, qt_logits), grads_qt = nnx.value_and_grad(loss_fn, has_aux=True)(qt_model)
+
+    rel_logits_err = jnp.abs(qt_logits - base_logits).mean() / (jnp.abs(base_logits).mean() + 1e-8)
+    print(f"relative error in logits: {rel_logits_err}")
+    assert rel_logits_err < logits_tolerance
+
+    self.assertTrue(self.pytree_allclose(grads_base, grads_qt, tolerance=grad_tolerance))
+
+  @pytest.mark.gpu_only
+  @pytest.mark.external_serving
+  def test_fp8_gpu_quantization_nnx(self):
+    """fp8_gpu via qwix interception, scan_layers=False."""
+    self.quantization_config_nnx("fp8_gpu", grad_tolerance=1.0)
+
+  @pytest.mark.gpu_only
+  @pytest.mark.external_serving
+  def test_fp8_nanoo_quantization_nnx(self):
+    """fp8_nanoo via qwix interception, scan_layers=False."""
+    self.quantization_config_nnx("fp8_nanoo", grad_tolerance=1.0)
+
+  @pytest.mark.gpu_only
+  @pytest.mark.external_serving
+  def test_fp8_gpu_quantization_nnx_with_scan(self):
+    self.quantization_config_nnx("fp8_gpu", scan_layers=True, grad_tolerance=1.0)
+
+  @pytest.mark.gpu_only
+  @pytest.mark.external_serving
+  def test_fp8_nanoo_quantization_nnx_with_scan(self):
+    self.quantization_config_nnx("fp8_nanoo", scan_layers=True, grad_tolerance=1.0)
+
+  def test_qwix_path_propagated_under_scan(self):
+    """Regression probe: verify qwix_path survives nnx.split -> jax.lax.scan -> nnx.merge.
+
+    The Phase 2 design suspected that per-iteration `nnx.merge(graphdef, params, state)`
+    inside `_apply_layers_sequentially` strips the `qwix_path` attribute that qwix sets
+    on every module via `quantize_nnx_model`. If qwix_path is lost inside the scan body,
+    `qwix._src.flax_util.get_current_module_path` returns nothing, the rule regex fails
+    to match, and fp8 interception silently no-ops.
+
+    This probe replicates the exact split/merge pattern in
+    `nnx_decoders._apply_layers_sequentially`. It tags every submodule with a
+    qwix_path tuple, runs `jax.lax.scan` over a stacked NNX module, and asserts that
+    the per-iteration merged module sees every original qwix_path. NNX stores plain
+    Python attributes in `graphdef` (static metadata), so they survive the round-trip;
+    if a future flax change moves them into the dynamic state pytree, this test fires.
+    """
+
+    class _Inner(nnx.Module):
+
+      def __init__(self, rngs: nnx.Rngs):
+        self.w = nnx.Param(jax.random.normal(rngs.params(), (4, 4)))
+
+      def __call__(self, x):
+        return x @ self.w[...]
+
+    class _Block(nnx.Module):
+
+      def __init__(self, rngs: nnx.Rngs):
+        self.inner = _Inner(rngs)
+
+      def __call__(self, x):
+        return self.inner(x)
+
+    @nnx.split_rngs(splits=3)
+    @nnx.vmap(in_axes=(0,), out_axes=0)
+    def _make_stacked(rngs):
+      return _Block(rngs)
+
+    stacked = _make_stacked(nnx.Rngs(0))
+
+    expected = {}
+    for path, mod in nnx.iter_modules(stacked):
+      tagged = ("decoder", "layers") + path
+      mod.qwix_path = tagged
+      expected[path] = tagged
+
+    graphdef, params, state = nnx.split(stacked, nnx.Param, ...)
+
+    captured = []
+
+    def layer_fn(carry, scanned_vars):
+      cur_params, cur_state = scanned_vars
+      layer = nnx.merge(graphdef, cur_params, cur_state)
+      for path, mod in nnx.iter_modules(layer):
+        captured.append((path, getattr(mod, "qwix_path", None)))
+      return layer(carry), nnx.state(layer)
+
+    x = jnp.ones((2, 4))
+    _ = jax.lax.scan(layer_fn, x, (params, state))
+
+    self.assertTrue(captured, msg="scan body did not run; cannot probe qwix_path.")
+    for path, qwix_path in captured:
+      self.assertIsNotNone(
+          qwix_path,
+          msg=(
+              f"Per-iteration merged module at relative path {path!r} lost qwix_path. "
+              "If this fires, _apply_layers_sequentially must re-attach qwix_path "
+              "after nnx.merge."
+          ),
+      )
+      self.assertEqual(
+          qwix_path,
+          expected[path],
+          msg=(
+              f"qwix_path tuple changed across split/merge for {path!r}: "
+              f"got {qwix_path!r}, want {expected[path]!r}."
+          ),
+      )
 
 
 @pytest.mark.parametrize(

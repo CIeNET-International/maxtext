@@ -94,7 +94,7 @@ def _compute_dot_general_nnx(
   if quant_dot_general is not None:
     if initializing:
       quant_dot_general.lazy_init(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
-    return quant_dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None, mutable=["aqt"])
+    return quant_dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None, mutable=True)
 
   return dot_general(
       inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision, out_sharding=out_sharding

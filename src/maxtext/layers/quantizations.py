@@ -35,6 +35,7 @@ import jax
 import jax.numpy as jnp
 from jax.tree_util import tree_flatten_with_path, tree_unflatten
 
+from flax import nnx
 from flax.linen import fp8_ops
 from flax.linen import initializers as flax_initializers
 import flax.linen as nn
@@ -839,14 +840,29 @@ def get_qt_provider(config):
   return None
 
 
-def maybe_quantize_model(model, config):
-  """Quantize the model if quantization is enabled."""
-  # Batch split is not using Qwix's interception feature but manual plumbing
-  if config.use_qwix_quantization and not config.use_batch_split_schedule:
-    quantization_provider = get_qt_provider(config)
-    if quantization_provider:
-      model = qwix.quantize_model(model, quantization_provider)
-  return model
+def maybe_quantize_model(model, config, *model_inputs, **model_inputs_kwargs):
+  """Quantize the model if quantization is enabled.
+
+  NNX models require sample inputs (positional or kwargs) for qwix shape
+  propagation. Linen models do not. Batch-split FP8 uses manual plumbing
+  (deepseek_batchsplit_fp8) and is excluded from this hook.
+  """
+  if not (config.use_qwix_quantization and not config.use_batch_split_schedule):
+    return model
+  provider = get_qt_provider(config)
+  if provider is None:
+    return model
+  if isinstance(model, nnx.Module):
+    if not model_inputs and not model_inputs_kwargs:
+      raise ValueError(
+          "maybe_quantize_model requires sample inputs for NNX models "
+          "to drive qwix shape propagation. Pass them positionally or as kwargs "
+          "matching Transformer.__call__ signature: "
+          "(decoder_input_tokens, decoder_positions, decoder_segment_ids, "
+          "enable_dropout=False)."
+      )
+    return qwix.quantize_model(model, provider, *model_inputs, **model_inputs_kwargs)
+  return qwix.quantize_model(model, provider)
 
 
 def _cast_reduced_from(arr, reduced_arr):
