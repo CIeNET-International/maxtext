@@ -483,11 +483,15 @@ class QuantTest(unittest.TestCase):
   @pytest.mark.gpu_only
   @pytest.mark.external_serving
   def test_fp8_gpu_quantization(self):
+    if getattr(self.cfg, "enable_nnx", False):
+      pytest.skip("We currently do not support fp8_gpu quantization with pure NNX decoder.")
     self.quantization_config("fp8_gpu", grad_tolerance=1.0)
 
   @pytest.mark.gpu_only
   @pytest.mark.external_serving
   def test_fp8_nanoo_quantization(self):
+    if getattr(self.cfg, "enable_nnx", False):
+      pytest.skip("We currently do not support fp8_nanoo quantization with pure NNX decoder.")
     self.quantization_config("fp8_nanoo", grad_tolerance=1.0)
 
   @pytest.mark.skip(reason="No runner with GPU arch >= 89 is available")
