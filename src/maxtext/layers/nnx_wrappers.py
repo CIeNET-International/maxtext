@@ -423,9 +423,27 @@ class ToLinen(linen.Module):
         module_kwargs["rngs"] = nnx.Rngs(**linen_rngs_dict(self, add_default=maybe_add_default))
       return module_kwargs
 
+    # === DEBUG-TRACE-MAIN: ToLinen.__call__ entry ===
+    print(
+        f"=== DEBUG-TRACE-MAIN ToLinen.__call__ ENTRY: "
+        f"nnx_class={self.nnx_class.__name__}, "
+        f"is_initializing={self.is_initializing()}, "
+        f"nnx_method={nnx_method!r}, "
+        f"len(args)={len(args)}, kwargs_keys={list(kwargs.keys())} ===",
+        flush=True,
+    )
+
     # init codepath
     if self.is_initializing():
+      print(
+          f"=== DEBUG-TRACE-MAIN ToLinen.__call__ INIT BRANCH: about to construct {self.nnx_class.__name__} ===",
+          flush=True,
+      )
       module = self.nnx_class(*self.args, **_module_kwargs())
+      print(
+          f"=== DEBUG-TRACE-MAIN ToLinen.__call__ INIT: {self.nnx_class.__name__} constructed OK ===",
+          flush=True,
+      )
       # TODO: add lazy_init here in case there's an `ToNNX` submodule under `module`.
       # update linen variables before call module to save initial state
       self._update_variables(module)
@@ -434,6 +452,10 @@ class ToLinen(linen.Module):
       out = method_fn(module, *args, **kwargs)
       return out
 
+    print(
+        f"=== DEBUG-TRACE-MAIN ToLinen.__call__ APPLY BRANCH: about to construct {self.nnx_class.__name__} ===",
+        flush=True,
+    )
     # create the nnx module
     module = self.nnx_class(*self.args, **_module_kwargs())
 

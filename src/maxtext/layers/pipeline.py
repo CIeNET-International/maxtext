@@ -220,6 +220,11 @@ class PipelineBase(nn.Module):
     """This vmap func is used to initialize the weights only on init."""
 
     def func_to_vmap(body_instance, stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode):
+      print(
+          f"=== DEBUG-TRACE-MAIN init func_to_vmap CALLING body_instance: "
+          f"type={type(body_instance).__name__} ===",
+          flush=True,
+      )
       return body_instance(stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode)
 
     vmap_func = nn.vmap(
@@ -278,6 +283,13 @@ class PipelineBase(nn.Module):
       self, example_inputs, example_segmentation, example_position, segment_idx, position_idx, deterministic, model_mode
   ):
     """Runs the initialization sequence mapping layers appropriately based on pipeline settings."""
+    print(
+        f"=== DEBUG-TRACE-MAIN _run_weight_initialization ENTRY: "
+        f"example_inputs.shape={example_inputs.shape}, "
+        f"layers_type={type(self.layers).__name__}, "
+        f"num_pipeline_repeats={self.config.num_pipeline_repeats} ===",
+        flush=True,
+    )
     vmap_func = self.get_vmap_func_for_init()
 
     if self.config.num_pipeline_repeats > 1:
@@ -852,7 +864,14 @@ class Pipeline(PipelineBase):
     real_iterations = self.config.num_pipeline_microbatches * self.config.num_pipeline_repeats
     total_iterations = real_iterations + bubble_iterations
 
+    print(
+        f"=== DEBUG-TRACE-MAIN Pipeline.__call__ before init check: "
+        f"is_initializing={self.is_initializing()}, "
+        f"layers_type={type(self.layers).__name__} ===",
+        flush=True,
+    )
     if self.is_initializing():
+      print("=== DEBUG-TRACE-MAIN Pipeline.__call__ INIT BRANCH -> _run_weight_initialization ===", flush=True)
       return self._run_weight_initialization(
           example_inputs, example_segmentation, example_position, segment_idx, position_idx, deterministic, model_mode
       )
