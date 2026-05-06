@@ -229,47 +229,6 @@ class DecoderLayer(nn.Module):
       return layer_output, kv_cache
 
 
-class SequentialBlockDecoderLayers(nn.Module):
-  """Sequential unscanned series of decoder layers."""
-
-  decoder_layer: Any
-  num_decoder_layers: int
-  config: Config
-  mesh: Mesh
-  quant: Quant
-  model_mode: str
-
-  @nn.compact
-  def __call__(
-      self,
-      inputs: jnp.ndarray,
-      decoder_segment_ids,
-      decoder_positions,
-      deterministic: bool,
-      model_mode,
-      slot: None | int = None,
-      page_state: None | page_manager.PageState = None,
-  ) -> jnp.ndarray:
-    for lyr in range(self.num_decoder_layers):
-      inputs = self.decoder_layer(
-          config=self.config, mesh=self.mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=model_mode
-      )(
-          inputs,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          slot=slot,
-          page_state=page_state,
-      )
-      if self.config.scan_layers:
-        inputs = inputs[0]  # When scan_layers is True the decoder layers return (outputs, None).
-    if self.config.scan_layers:
-      return inputs, None  # pytype: disable=bad-return-type
-    else:
-      return inputs
-
-
 def deepstack_process(hidden_states, bidirectional_mask, visual_embeds):
   """Process deepstack visual embeddings by adding them to hidden states at visual token positions.
 
@@ -309,20 +268,17 @@ class Decoder(nn.Module):
     self.norm_layer = self.get_norm_layer(num_features=self.config.emb_dim)
     if self.config.using_pipeline_parallelism:
       remat_policy = self.get_remat_policy()
-      if self.config.use_nnx_pipeline:
-        nnx_blocks = self._get_nnx_decoder_block_classes()
+      nnx_blocks = self._get_nnx_decoder_block_classes()
 
-        def stage_factory(rngs):
-          return self._build_nnx_pipeline_stage(nnx_blocks, rngs)
+      def stage_factory(rngs):
+        return self._build_nnx_pipeline_stage(nnx_blocks, rngs)
 
-        self.pipeline_module = pipeline.create_pipeline(
-            config=self.config, layers=stage_factory, mesh=self.mesh, remat_policy=remat_policy
-        )
-      else:
-        pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer)
-        self.pipeline_module = pipeline.create_pipeline(
-            config=self.config, layers=pipeline_stage_module, mesh=self.mesh, remat_policy=remat_policy
-        )
+      self.pipeline_module = pipeline.create_pipeline(
+          config=self.config,
+          stage_factory=stage_factory,
+          mesh=self.mesh,
+          remat_policy=remat_policy,
+      )
 
   def minimal_policy(self, with_context=False, with_quantization=False):
     """Helper for creating minimal checkpoint policies."""
@@ -542,6 +498,14 @@ class Decoder(nn.Module):
     }
 
     if cfg.decoder_block not in layer_map:
+      deferred = {DecoderBlockType.QWEN3_CUSTOM_MOE, DecoderBlockType.LLAMA2LTI}
+      if cfg.decoder_block in deferred:
+        raise NotImplementedError(
+            f"Pipeline parallelism with decoder_block={cfg.decoder_block.value} requires the NNX "
+            f"variant of this block class to be added to _get_nnx_decoder_block_classes. "
+            f"This was deferred from the Linen-pipeline-removal migration "
+            f"(see docs/superpowers/specs/2026-05-06-pipeline-linen-removal-design.md)."
+        )
       raise ValueError(f"Incorrect decoder_block name {cfg.decoder_block.value=}")
     return layer_map[cfg.decoder_block]
 
@@ -587,43 +551,6 @@ class Decoder(nn.Module):
     return NNXSequentialPipelineStage(
         base_stage_cls, cfg.num_layers_per_pipeline_stage, cfg, self.mesh, self.quant, self.model_mode, rngs=rngs
     )
-
-  def get_pipeline_stage_module(self, decoder_blocks):
-    """get pipeline stage module"""
-
-    def get_layer_to_pipeline(blocks, cfg):
-      if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
-        return blocks[1]  # return the sparse block
-      else:
-        return blocks[0]
-
-    cfg = self.config
-    base_stage = get_layer_to_pipeline(decoder_blocks, cfg)
-    if cfg.set_remat_policy_on_layers_per_stage:
-      policy = self.get_remat_policy()
-      base_stage = self.set_remat_policy([base_stage], policy)[0]
-    if cfg.num_layers_per_pipeline_stage == 1:
-      stage_module = base_stage(config=cfg, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode)
-    elif cfg.scan_layers_per_stage:
-      stage_module = self.scan_decoder_layers(
-          cfg,
-          base_stage,
-          cfg.num_layers_per_pipeline_stage,
-          "layers_per_stage",
-          self.mesh,
-          in_axes_tuple=(nn.broadcast,) * 4,
-          model_mode=self.model_mode,
-      )
-    else:
-      stage_module = SequentialBlockDecoderLayers(
-          decoder_layer=base_stage,
-          num_decoder_layers=cfg.num_layers_per_pipeline_stage,
-          config=cfg,
-          mesh=self.mesh,
-          quant=self.quant,
-          model_mode=self.model_mode,
-      )
-    return stage_module
 
   def get_norm_layer(self, num_features: int):
     """get normalization layer (return type inherits from nn.Module)"""
