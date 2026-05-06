@@ -2341,6 +2341,17 @@ class RoutedAndSharedMoE(nnx.Module):
     shared_expert_mlp_dim = (
         self.config.mlp_dim if self.config.decoder_block == ctypes.DecoderBlockType.GEMMA4 else self.config.moe_mlp_dim
     )
+    # === DEBUG-TRACE-MAIN: shared_experts MlpBlock construction inputs ===
+    _intermediate_dim = self.config.shared_experts * shared_expert_mlp_dim
+    print(
+        f"=== DEBUG-TRACE-MAIN moe.RoutedAndSharedMoE shared_experts: "
+        f"shared_experts={self.config.shared_experts!r}, "
+        f"shared_expert_mlp_dim={shared_expert_mlp_dim!r}, "
+        f"intermediate_dim={_intermediate_dim!r}, "
+        f"in_features={self.moe_expert_input_dim!r}, "
+        f"decoder_block={self.config.decoder_block!r} ===",
+        flush=True,
+    )
     self.shared_experts = linears.MlpBlock(
         mesh=self.mesh,
         in_features=self.moe_expert_input_dim,

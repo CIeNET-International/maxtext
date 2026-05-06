@@ -157,6 +157,16 @@ class DenseGeneral(nnx.Module):
     kernel_in_axis = np.arange(len(self.axis))
     kernel_out_axis = np.arange(len(self.axis), len(self.axis) + len(self.out_features_shape))
 
+    # === DEBUG-TRACE-MAIN: DenseGeneral kernel_init shape (catches the deepseek MoE shape=(28,0) bug) ===
+    if any(d == 0 for d in kernel_shape):
+      print(
+          f"=== DEBUG-TRACE-MAIN DenseGeneral KERNEL HAS ZERO DIM: "
+          f"in_features_shape={self.in_features_shape!r}, "
+          f"out_features_shape={self.out_features_shape!r}, "
+          f"kernel_shape={kernel_shape!r}, kernel_axes={self.kernel_axes!r} ===",
+          flush=True,
+      )
+
     if not quantizations.in_serve_mode(self.quant):
       self.kernel = nnx.Param(
           self.kernel_init(

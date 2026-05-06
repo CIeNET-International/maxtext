@@ -260,6 +260,23 @@ class PipelineParallelismTest(unittest.TestCase):
         base_moe_mlp_dim=1024,
         base_mlp_dim=1024,
     )
+    # === DEBUG-TRACE-MAIN: dump deepseek-relevant config to find why test passes on main ===
+    print("=== DEBUG-TRACE-MAIN: deepseek test config ===", flush=True)
+    for k in (
+        "decoder_block", "attention_type", "shared_experts",
+        "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "q_lora_rank",
+        "num_experts", "num_experts_per_tok",
+        "moe_mlp_dim", "mlp_dim",
+        "first_num_dense_layers",
+        "routed_scaling_factor", "routed_score_func", "routed_bias",
+        "fused_qkv", "num_query_heads", "num_kv_heads", "head_dim",
+        "global_batch_size_to_train_on", "max_target_length", "emb_dim",
+        "num_pipeline_repeats", "num_pipeline_microbatches", "num_decoder_layers",
+        "pipeline_parallel_layers", "num_layers_per_pipeline_stage",
+    ):
+      v = getattr(config, k, "<MISSING>")
+      print(f"  config.{k} = {v!r}", flush=True)
+    print("=== /DEBUG-TRACE-MAIN ===", flush=True)
     self.assert_pipeline_same_output_and_grad(config, single_pipeline_stage_class=deepseek.DeepSeekMoELayerToLinen)
 
   @pytest.mark.tpu_only

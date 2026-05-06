@@ -715,6 +715,18 @@ class MLA(Attention):
 
   def _init_projections(self, inputs_q_shape: Tuple, inputs_kv_shape: Tuple) -> None:
     """Initializes the MLA-specific projections."""
+    # === DEBUG-TRACE-MAIN: MLA._init_projections inputs ===
+    print(
+        f"=== DEBUG-TRACE-MAIN MLA._init_projections: "
+        f"attention_type={self.config.attention_type!r}, "
+        f"kv_lora_rank={self.kv_lora_rank!r}, q_lora_rank={self.q_lora_rank!r}, "
+        f"qk_nope_head_dim={self.qk_nope_head_dim!r}, qk_rope_head_dim={self.qk_rope_head_dim!r}, "
+        f"v_head_dim={self.v_head_dim!r}, "
+        f"num_query_heads={self.num_query_heads!r}, num_kv_heads={self.num_kv_heads!r}, "
+        f"fused_qkv={self.config.fused_qkv!r}, "
+        f"inputs_q_shape={inputs_q_shape!r}, inputs_kv_shape={inputs_kv_shape!r} ===",
+        flush=True,
+    )
     # Assert required configuration parameters for MLA attention.
     assert (
         self.config.attention_type == AttentionType.MLA.value
