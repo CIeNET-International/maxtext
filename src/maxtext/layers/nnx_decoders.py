@@ -381,6 +381,10 @@ class NNXDecoder(nnx.Module):
     self.is_gemma4 = self.config.decoder_block == DecoderBlockType.GEMMA4
 
     if config.using_pipeline_parallelism:
+      assert not (config.engram_layers and self.is_deepseek), (
+          "engram_layers + DeepSeek + pipeline_parallelism is not supported. "
+          "engram interleaving is currently only implemented in the non-pipeline path."
+      )
 
       def stage_factory(rngs):
         return self._get_pipeline_stage_module(decoder_block_classes, rngs)
@@ -406,16 +410,15 @@ class NNXDecoder(nnx.Module):
                 moe_cls, length=num_moe_outside, metadata_axis_name="moe_layers", rngs=rngs
             )
         else:
-          self.layers = nnx.List([])
           self.num_dense_layers = config.first_num_dense_layers
           for i in range(self.num_dense_layers):
-            self._create_and_register_layer(dense_cls, rngs, "dense_layers", i)
+            self._create_and_register_named_layer(dense_cls, rngs, "dense_layers", i)
           self.num_moe_outside_pipeline = (
               config.num_decoder_layers - config.first_num_dense_layers
           ) - config.pipeline_parallel_layers
           if self.num_moe_outside_pipeline > 0:
             for i in range(self.num_moe_outside_pipeline):
-              self._create_and_register_layer(moe_cls, rngs, "moe_layers_outside_pipeline", i)
+              self._create_and_register_named_layer(moe_cls, rngs, "moe_layers_outside_pipeline", i)
       else:
         remaining_layers = config.num_decoder_layers - config.pipeline_parallel_layers
         if remaining_layers > 0:
@@ -425,10 +428,9 @@ class NNXDecoder(nnx.Module):
                 base_cls, length=remaining_layers, metadata_axis_name="layers", rngs=rngs
             )
           else:
-            self.layers = nnx.List([])
             self.num_layers_outside_pipeline = remaining_layers
             for i in range(self.num_layers_outside_pipeline):
-              self._create_and_register_layer(base_cls, rngs, "layers_outside_pipeline", i)
+              self._create_and_register_named_layer(base_cls, rngs, "layers_outside_pipeline", i)
 
     else:
       if self.config.scan_layers:
@@ -587,6 +589,13 @@ class NNXDecoder(nnx.Module):
     layer = self._create_single_layer(layer_cls, rngs, **layer_kwargs)
     setattr(self, attr_name, layer)
     self.layers.append(layer)
+
+  def _create_and_register_named_layer(self, layer_cls, rngs, base_name, i, **layer_kwargs):
+    """Creates a layer registered ONLY via named attribute. Used by pipeline-outside paths
+    to avoid double-registration when self.layers list is also tracked elsewhere."""
+    attr_name = f"{base_name}_{i}"
+    layer = self._create_single_layer(layer_cls, rngs, **layer_kwargs)
+    setattr(self, attr_name, layer)
 
   def _create_single_layer(self, decoder_layer_class, rngs, **kwargs):
     """Helper to create a single layer (Linen or NNX)."""
