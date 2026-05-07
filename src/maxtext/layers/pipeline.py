@@ -2505,10 +2505,12 @@ class NNXCircularPipeline(NNXPipelineBase):
       cur_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, prev_iter)
       cur_bsw = self.from_repeat_weights_to_bsw(cur_repeat_weights, physical_partition_spec_full)
 
-      # 2. Tag both BSW slots so inner jax.checkpoint saves them
-      #    (prevents backward re-gather and double-cost).
-      cur_bsw = jax.ad_checkpoint.checkpoint_name(cur_bsw, "bsw_weights")
-      nxt_bsw = jax.ad_checkpoint.checkpoint_name(nxt_bsw, "bsw_weights")
+      # 2. Approach C: do NOT tag either BSW with checkpoint_name. The remat
+      #    policy `save_only_these_names("bsw_weights")` would save both slots
+      #    through backward, costing 2× param-size in temp HBM. Without the
+      #    tag, backward rematerializes each BSW from layers_params with one
+      #    extra all-gather per repeat — recovers ~50% temp HBM at the cost
+      #    of two extra backward all-gathers per outer iteration.
 
       # 3. Store dual buffer in closure: bsw[0]=cur (previous repeat),
       #    bsw[1]=nxt (current repeat). `get_current_weights_from_bsw` runs its
