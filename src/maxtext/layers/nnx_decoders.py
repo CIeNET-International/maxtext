@@ -294,8 +294,52 @@ class NNXScannedPipelineStage(nnx.Module):
     )(forked_rngs)
 
   def __call__(self, inputs, decoder_segment_ids, decoder_positions, deterministic, model_mode, **kwargs):
-    graphdef, params, state = nnx.split(self.scanned_layers, nnx.Param, ...)
+    num_layers = self.config.num_layers_per_pipeline_stage
+    UNROLL_THRESHOLD = 16
 
+    if num_layers > UNROLL_THRESHOLD:
+      # Fallback: keep moveaxis + jax.lax.scan path for large N to avoid
+      # compile-time blowup. See follow-up for Approach 1 long-term fix.
+      return self._call_scan_fallback(
+          inputs, decoder_segment_ids, decoder_positions, deterministic, model_mode, **kwargs
+      )
+
+    graphdef, params, state = nnx.split(self.scanned_layers, nnx.Param, ...)
+    scan_axis = self.config.param_scan_axis
+
+    carry = inputs
+    new_states = []
+    for i in range(num_layers):
+      step_params = jax.tree.map(lambda x: jnp.take(x, i, axis=scan_axis), params)
+      step_state = jax.tree.map(lambda x: x[i], state)
+      layer = nnx.merge(graphdef, step_params, step_state)
+      layer_out = layer(carry, decoder_segment_ids, decoder_positions, deterministic, model_mode, **kwargs)
+      carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+      new_states.append(nnx.state(layer))
+
+    # Restack the per-iteration states back along their original axes.
+    def stack_param(*leaves):
+      return jnp.stack(leaves, axis=scan_axis)
+    def stack_other(*leaves):
+      return jnp.stack(leaves, axis=0)
+
+    stacked_params, stacked_others = [], []
+    for st in new_states:
+      sp, so = st.split(nnx.Param, ...)
+      stacked_params.append(sp)
+      stacked_others.append(so)
+    final_params = jax.tree.map(stack_param, *stacked_params)
+    final_others = jax.tree.map(stack_other, *stacked_others)
+    final_state = nnx.State.merge(final_params, final_others)
+    nnx.update(self.scanned_layers, final_state)
+
+    if self.config.scan_layers:
+      return carry, None
+    return carry
+
+  def _call_scan_fallback(self, inputs, decoder_segment_ids, decoder_positions, deterministic, model_mode, **kwargs):
+    """Original jax.lax.scan path; preserved for num_layers_per_pipeline_stage > UNROLL_THRESHOLD."""
+    graphdef, params, state = nnx.split(self.scanned_layers, nnx.Param, ...)
     scan_axis = self.config.param_scan_axis
     if scan_axis != 0:
       params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params)
