@@ -65,6 +65,18 @@ def assert_same_output_and_grad(f1, f2, *inputs):
   f1_grad = pytree_ravel(f1_grad)
   f2_grad = pytree_ravel(f2_grad)
 
+  # DEBUG probe (V2): disambiguate pytree-mismatch vs real outlier vs jit ghost.
+  print(f"DEBUG_PROBE f1_grad.size={f1_grad.size} f2_grad.size={f2_grad.size}", flush=True)
+  print(
+      f"DEBUG_PROBE violations={int(jnp.sum(jnp.abs(f1_grad - f2_grad) > 1.0 + 0.1 * jnp.abs(f2_grad)))}",
+      flush=True,
+  )
+  print(
+      f"DEBUG_PROBE argmax={int(jnp.argmax(jnp.abs(f1_grad - f2_grad)))} "
+      f"max={float(jnp.max(jnp.abs(f1_grad - f2_grad)))}",
+      flush=True,
+  )
+
   # Element-wise check uses atol so near-zero gradient elements (whose absolute
   # diff is tiny but relative diff can be huge due to /|grad|) don't fail the
   # assertion. Pipeline scan vs reference for-loop produce mathematically

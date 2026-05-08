@@ -243,16 +243,15 @@ class PipelineSharedMixin:
   def get_pipeline_remat_policy(self):
     """Returns the pipeline remat policy for this pipeline.
 
-    Saves three named tensors during jax.checkpoint recomputation:
+    Saves two named tensors during jax.checkpoint recomputation:
       - "iteration_input": routed microbatch data entering the decoder
       - "decoder_layer_input": input to the decoder layer itself
-      - "bsw_weights": gathered BSW weights (prevents backward re-gather)
     Everything else is recomputed during backward to save memory.
     """
     if self.config.remat_policy == "custom":
       return self.remat_policy
     save_input_policy = jax.checkpoint_policies.save_only_these_names(
-        "iteration_input", "decoder_layer_input", "bsw_weights"
+        "iteration_input", "decoder_layer_input"
     )
     if self.remat_policy is not None:
       return jax.checkpoint_policies.save_from_both_policies(self.remat_policy, save_input_policy)
@@ -1960,8 +1959,8 @@ class NNXCircularPipeline(NNXPipelineBase):
   Key design decisions (from commit bb87194 through current):
     - BSW via closure (bsw_ref), NOT in scan carry. Carry blowup confirmed:
       10 GB BSW in carry x 43 iterations = 131 GB OOM.
-    - checkpoint_name("bsw_weights") tags BSW so jax.checkpoint saves it
-      during backward instead of recomputing the all-gather.
+    - BSW is NOT checkpoint_name-tagged: backward re-gathers from layers_params
+      to avoid storing two BSW residuals (~+8.5 GB temp at llama2-7b scale).
     - BSW select fast path: when bsw[0] is bsw[1], skip shard_map and use
       treedef roundtrip to refresh nnx.Variable trace state.
     - No @jax.custom_vjp — avoids tracer leak when nesting with jax.checkpoint.
@@ -2411,16 +2410,15 @@ class NNXCircularPipeline(NNXPipelineBase):
     # ---- Nested scan structure ----
     #
     # outer scan (repeats):
-    #   1. All-gather weights once → BSW
-    #   2. Tag BSW with checkpoint_name("bsw_weights") → backward won't re-gather
-    #   3. Store BSW in bsw_ref[0] (closure, NOT carry — carry would OOM)
-    #   4. Run inner scan over microbatches
+    #   1. All-gather weights into dual BSW (cur, nxt) once per repeat
+    #   2. Store BSW in bsw_ref[0] (closure, NOT carry — carry would OOM)
+    #   3. Run inner scan over microbatches
     #
     # inner scan (microbatches):
     #   1. Read BSW from bsw_ref[0] (set by outer_body)
     #   2. Run one pipeline iteration (forward through decoder)
     #   3. jax.checkpoint wraps this — recomputes forward during backward
-    #      but saves BSW (tagged) and iteration_input/decoder_layer_input
+    #      and re-gathers BSW from layers_params (Proposal C: no checkpoint_name)
     #
     # Why bsw_ref (mutable list) instead of carry:
     #   Scan stores ALL intermediate carry values for backward.
@@ -2505,12 +2503,11 @@ class NNXCircularPipeline(NNXPipelineBase):
       cur_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, prev_iter)
       cur_bsw = self.from_repeat_weights_to_bsw(cur_repeat_weights, physical_partition_spec_full)
 
-      # 2. Tag both BSW slots so inner jax.checkpoint saves them
-      #    (prevents backward re-gather and double-cost).
-      cur_bsw = jax.ad_checkpoint.checkpoint_name(cur_bsw, "bsw_weights")
-      nxt_bsw = jax.ad_checkpoint.checkpoint_name(nxt_bsw, "bsw_weights")
+      # Proposal C: do NOT checkpoint_name the BSW slots. Backward re-gathers
+      # from layers_params (already a residual) instead of saving the gathered
+      # arrays. Trades +2 all-gathers/repeat in backward for ~-4.25 GB residuals.
 
-      # 3. Store dual buffer in closure: bsw[0]=cur (previous repeat),
+      # Store dual buffer in closure: bsw[0]=cur (previous repeat),
       #    bsw[1]=nxt (current repeat). `get_current_weights_from_bsw` runs its
       #    shard_map select per stage; both slots now hold uniform-per-repeat data.
       bsw_ref[0] = (cur_bsw, nxt_bsw)
