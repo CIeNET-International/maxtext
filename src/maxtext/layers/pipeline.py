@@ -2449,29 +2449,28 @@ class NNXCircularPipeline(NNXPipelineBase):
     # ---- Outer body: runs once per repeat, does the expensive all-gather ----
     num_microbatches = self.config.num_pipeline_microbatches
 
-    # Sliding window: init w_curr for the first repeat.
-    # weight_prefetching gathers at loop_iteration + 1. For iter=0 this gives
-    # repeat_ids = [0, 0, ...] (all stages on repeat 0).
-    init_iter = jnp.array(0, dtype=jnp.int32)
-    init_w_curr = self.weight_prefetching(layers_params, physical_partition_spec_full, init_iter)
-    init_w_curr = jax.ad_checkpoint.checkpoint_name(init_w_curr, "bsw_weights")
-
     def outer_body(carry, _):
-      """One repeat: sliding window BSW → run MB microbatches.
+      """One repeat: dual-buffer BSW → run MB microbatches.
 
-      Mirrors Linen's create_pipeline_stage (pipeline_utils.py L310-337):
-        w_next = weight_prefetching(iteration)  # gathers at iteration+1
-        bsw = (w_curr, w_next)
-        ...run microbatches...
-        return (..., w_next)  # w_next becomes next iter's w_curr
+      Gathers two independent BSW slots per repeat (no carry):
+        nxt_bsw: weights at iteration+1 (all stages on current repeat R)
+        cur_bsw: weights at prev_iter (all stages on previous repeat R-1)
+      select_weights_from_bsw picks per-stage at boundary iterations.
       """
-      current_loop_state, current_layer_mutables, w_curr = carry
+      current_loop_state, current_layer_mutables = carry
       iteration = current_loop_state["loop_iteration"]
 
-      w_next = self.weight_prefetching(layers_params, physical_partition_spec_full, iteration)
-      w_next = jax.ad_checkpoint.checkpoint_name(w_next, "bsw_weights")
+      nxt_bsw = self.weight_prefetching(layers_params, physical_partition_spec_full, iteration)
+      prev_iter = jnp.maximum(iteration - num_microbatches + 1, 0)
+      cur_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, prev_iter)
+      cur_bsw = self.from_repeat_weights_to_bsw(cur_repeat_weights, physical_partition_spec_full)
 
-      bsw_ref[0] = (w_curr, w_next)
+      # FIX 2: Do NOT tag BSW with checkpoint_name in outer_body.
+      # With jax.checkpoint(outer_body), tagged BSW gets saved as residuals for ALL
+      # R repeats — scan stacks them: R × 2 × ~4.4 GB = ~17.6 GB. Without tags,
+      # BSW is recomputed during backward (1 extra all-gather per repeat).
+
+      bsw_ref[0] = (cur_bsw, nxt_bsw)
 
       if self.config.scan_pipeline_iterations:
         (new_loop_state, new_layer_mutables), inner_metrics = jax.lax.scan(
@@ -2488,29 +2487,35 @@ class NNXCircularPipeline(NNXPipelineBase):
             jax.tree.map(lambda *xs: jnp.stack(xs), *inner_metrics_list) if inner_metrics_list else layers_metrics
         )
 
-      return (new_loop_state, new_layer_mutables, w_next), inner_metrics
+      return (new_loop_state, new_layer_mutables), inner_metrics
 
-    if self.config.set_remat_policy_on_pipeline_iterations:
-      outer_body = jax.checkpoint(outer_body, policy=self.get_pipeline_remat_policy())
+    # FIX 3: Do NOT wrap outer_body in jax.checkpoint.
+    # Inner body already has its own jax.checkpoint. Outer checkpoint forces
+    # re-running the entire inner scan during backward and saves BSW residuals
+    # across R repeats. Removing it lets the scan recompute outer_body naturally
+    # without stacking BSW.
 
     # ---- Execute: outer scan (repeats) + bubble scan ----
     num_repeats = self.config.num_pipeline_repeats
 
     if self.config.scan_pipeline_iterations:
-      (loop_state, final_layer_mutables, _), repeat_metrics = jax.lax.scan(
-          outer_body, (loop_state, layers_mutables, init_w_curr), None, length=num_repeats
+      # FIX 1: _split_transpose separates param gradients from carry gradients,
+      # preventing scan backward from stacking closed-over param cotangents.
+      (loop_state, final_layer_mutables), repeat_metrics = jax.lax.scan(
+          outer_body, (loop_state, layers_mutables), None, length=num_repeats,
+          _split_transpose=True
       )
       repeat_metrics = jax.tree.map(
           lambda x: x.reshape((num_repeats * num_microbatches,) + x.shape[2:]),
           repeat_metrics,
       )
     else:
-      outer_carry = (loop_state, layers_mutables, init_w_curr)
+      outer_carry = (loop_state, layers_mutables)
       repeat_metrics_list = []
       for _ in range(num_repeats):
         outer_carry, rep_metrics = outer_body(outer_carry, None)
         repeat_metrics_list.append(rep_metrics)
-      loop_state, final_layer_mutables, _ = outer_carry
+      loop_state, final_layer_mutables = outer_carry
       repeat_metrics = (
           jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *repeat_metrics_list)
           if repeat_metrics_list
