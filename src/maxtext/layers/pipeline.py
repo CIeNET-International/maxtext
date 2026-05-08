@@ -243,15 +243,16 @@ class PipelineSharedMixin:
   def get_pipeline_remat_policy(self):
     """Returns the pipeline remat policy for this pipeline.
 
-    Saves two named tensors during jax.checkpoint recomputation:
+    Saves three named tensors during jax.checkpoint recomputation:
       - "iteration_input": routed microbatch data entering the decoder
       - "decoder_layer_input": input to the decoder layer itself
+      - "bsw_weights": gathered BSW weights (prevents backward re-gather)
     Everything else is recomputed during backward to save memory.
     """
     if self.config.remat_policy == "custom":
       return self.remat_policy
     save_input_policy = jax.checkpoint_policies.save_only_these_names(
-        "iteration_input", "decoder_layer_input"
+        "iteration_input", "decoder_layer_input", "bsw_weights"
     )
     if self.remat_policy is not None:
       return jax.checkpoint_policies.save_from_both_policies(self.remat_policy, save_input_policy)
@@ -1959,8 +1960,8 @@ class NNXCircularPipeline(NNXPipelineBase):
   Key design decisions (from commit bb87194 through current):
     - BSW via closure (bsw_ref), NOT in scan carry. Carry blowup confirmed:
       10 GB BSW in carry x 43 iterations = 131 GB OOM.
-    - BSW is NOT checkpoint_name-tagged: backward re-gathers from layers_params
-      to avoid storing two BSW residuals (~+8.5 GB temp at llama2-7b scale).
+    - checkpoint_name("bsw_weights") tags BSW so jax.checkpoint saves it
+      during backward instead of recomputing the all-gather.
     - BSW select fast path: when bsw[0] is bsw[1], skip shard_map and use
       treedef roundtrip to refresh nnx.Variable trace state.
     - No @jax.custom_vjp — avoids tracer leak when nesting with jax.checkpoint.
@@ -2409,26 +2410,41 @@ class NNXCircularPipeline(NNXPipelineBase):
 
     # ---- Nested scan structure ----
     #
-    # outer scan (repeats):
-    #   1. All-gather weights into dual BSW (cur, nxt) once per repeat
-    #   2. Store BSW in bsw_ref[0] (closure, NOT carry — carry would OOM)
-    #   3. Run inner scan over microbatches
+    # outer scan (repeats), sliding window:
+    #   carry = (loop_state, layers_mutables, w_curr)
+    #   1. Gather nxt_bsw once per repeat (w_curr is from last iter's nxt_bsw via carry)
+    #   2. Tag nxt_bsw with checkpoint_name("bsw_weights") → backward won't re-gather
+    #   3. Store (w_curr, nxt_bsw) in bsw_ref[0] (closure ref, NOT carry)
+    #   4. Run inner scan over microbatches
+    #   5. Return nxt_bsw as next iter's w_curr (Linen sliding-window pattern)
     #
     # inner scan (microbatches):
     #   1. Read BSW from bsw_ref[0] (set by outer_body)
     #   2. Run one pipeline iteration (forward through decoder)
     #   3. jax.checkpoint wraps this — recomputes forward during backward
-    #      and re-gathers BSW from layers_params (Proposal C: no checkpoint_name)
+    #      but saves BSW (tagged) and iteration_input/decoder_layer_input
     #
-    # Why bsw_ref (mutable list) instead of carry:
-    #   Scan stores ALL intermediate carry values for backward.
-    #   BSW is ~3-10 GB. In carry: N iterations × 10 GB = OOM.
-    #   As closure: 1 copy, shared across all inner iterations.
+    # Why bsw_ref (mutable list) for INNER scan instead of carry:
+    #   Inner scan stores ALL intermediate carry values for backward.
+    #   BSW is ~3-10 GB. In inner carry: MB iterations × 10 GB per outer step = OOM.
+    #   As closure: 1 copy, shared across all inner iterations within one repeat.
+    # Note: outer scan DOES carry w_curr (sliding window) — eliminates one of two
+    # gathers per repeat. Per-repeat residual is one BSW slot, stacked R times,
+    # which XLA can handle.
     #
     # Why bsw_ref is a list [None], not a plain variable:
     #   Python closures can mutate list contents (bsw_ref[0] = x)
     #   but cannot reassign outer variables (bsw = x creates local).
     bsw_ref = [None]
+
+    # Sliding window: w_curr starts as gather at iter=0 (uniform-on-0).
+    # Slot is unused at R=0 (no stage has repeat_id < stage0_repeat_id) but
+    # JAX requires a real array for scan carry. After iter 0, w_curr is
+    # set to previous iter's nxt_bsw via carry — eliminates one of two gathers per repeat.
+    init_iter = jnp.array(0, dtype=jnp.int32)
+    init_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, init_iter)
+    init_w_curr = self.from_repeat_weights_to_bsw(init_repeat_weights, physical_partition_spec_full)
+    init_w_curr = jax.ad_checkpoint.checkpoint_name(init_w_curr, "bsw_weights")
 
     def inner_body(carry, _):
       current_loop_state, current_layer_mutables = carry
@@ -2460,9 +2476,9 @@ class NNXCircularPipeline(NNXPipelineBase):
     num_microbatches = self.config.num_pipeline_microbatches
 
     def outer_body(carry, _):
-      """One repeat: gather weights for current repeat AND previous repeat → run MB microbatches.
+      """One repeat: gather nxt_bsw, slide w_curr from prev iter → run MB microbatches.
 
-      DUAL-BUFFER fix (mirrors Linen `CircularPipeline.weight_prefetching` semantics).
+      SLIDING-WINDOW (mirrors Linen `CircularPipeline.weight_prefetching` semantics).
 
       `from_all_variables_to_repeat_weights(weights, iteration)` returns per-stage
       weights derived from `repeat_ids = microbatches_processed // num_microbatches`
@@ -2472,15 +2488,15 @@ class NNXCircularPipeline(NNXPipelineBase):
       so all stages see the same repeat (no boundary mix). We reproduce this here:
         - `nxt_bsw`: gather at `iteration + 1` → repeat_ids = [R, R, ...] (current repeat,
           all stages on R because the +1 offset clears the boundary lag).
-        - `cur_bsw`: gather at `max(iteration - num_microbatches + 1, 0)` → repeat_ids =
-          [R-1, R-1, ...] (previous repeat). Lagging stages still finishing repeat R-1
-          read this slot at boundary microbatch iter R*MB.
+        - `w_curr` (from carry): previous outer iter's `nxt_bsw`, gathered at
+          `(R-1)*MB + 1` → repeat_ids = [R-1, R-1, ...]. Lagging stages still
+          finishing repeat R-1 read this slot at boundary microbatch iter R*MB.
 
       `get_current_weights_from_bsw`'s `select_weights_from_bsw` shard_map then picks
       per-stage based on `repeat_id == stage0_repeat_id`:
         - At boundary iter R*MB: stage0_repeat_id=R, repeat_ids=[R, R-1].
-            Stage 0 (R==R) → picks nxt_bsw[0] = repeat R ✓.
-            Stage 1 (R-1≠R) → picks cur_bsw[1] = repeat R-1 ✓.
+            Stage 0 (R==R) → picks bsw[1] = nxt_bsw = repeat R ✓.
+            Stage 1 (R-1≠R) → picks bsw[0] = w_curr = repeat R-1 ✓.
         - At iter R*MB+k (k≥1): both stages on R → both pick nxt_bsw = repeat R ✓.
 
       The previous single-BSW code (`bsw=(cur_bsw, cur_bsw)` from `iteration`) used the
@@ -2488,29 +2504,24 @@ class NNXCircularPipeline(NNXPipelineBase):
       stage 1 on stale repeat-R-1 weights for 7-of-8 microbatches per repeat
       (~7% loss / ~20% grad-norm divergence vs the per-layer reference).
       """
-      current_loop_state, current_layer_mutables = carry
+      current_loop_state, current_layer_mutables, w_curr = carry
       iteration = current_loop_state["loop_iteration"]
 
-      # 1a. Current repeat's weights, uniform across stages (all on repeat R).
-      #     iteration + 1 clears the boundary lag so repeat_ids = [R, R, ...].
+      # 1. Current repeat's weights, uniform across stages (all on repeat R).
+      #    Linen sliding window: gather only nxt_bsw; cur_bsw = previous iter's
+      #    nxt_bsw via carry (was gathered last outer iter at iteration+1, which
+      #    for outer iter R-1 means iter (R-1)*MB+1 → repeat_ids = [R-1, ...]).
       nxt_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, iteration + 1)
       nxt_bsw = self.from_repeat_weights_to_bsw(nxt_repeat_weights, physical_partition_spec_full)
 
-      # 1b. Previous repeat's weights, uniform across stages (all on repeat R-1).
-      #     For R=0 the clamp keeps prev_iter=0 → repeat_ids = [0, 0, ...]; the slot
-      #     is unused at R=0 anyway because no stage has repeat_id < stage0_repeat_id.
-      prev_iter = jnp.maximum(iteration - num_microbatches + 1, 0)
-      cur_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, prev_iter)
-      cur_bsw = self.from_repeat_weights_to_bsw(cur_repeat_weights, physical_partition_spec_full)
+      # 2. Tag nxt_bsw so inner jax.checkpoint saves it. w_curr already tagged
+      #    on entry (initial carry or last iter's return value).
+      nxt_bsw = jax.ad_checkpoint.checkpoint_name(nxt_bsw, "bsw_weights")
 
-      # Proposal C: do NOT checkpoint_name the BSW slots. Backward re-gathers
-      # from layers_params (already a residual) instead of saving the gathered
-      # arrays. Trades +2 all-gathers/repeat in backward for ~-4.25 GB residuals.
-
-      # Store dual buffer in closure: bsw[0]=cur (previous repeat),
-      #    bsw[1]=nxt (current repeat). `get_current_weights_from_bsw` runs its
-      #    shard_map select per stage; both slots now hold uniform-per-repeat data.
-      bsw_ref[0] = (cur_bsw, nxt_bsw)
+      # 3. Store dual buffer in closure: bsw[0]=cur (prev repeat from carry),
+      #    bsw[1]=nxt (current repeat just gathered). `get_current_weights_from_bsw`
+      #    runs its shard_map select per stage; both slots hold uniform-per-repeat data.
+      bsw_ref[0] = (w_curr, nxt_bsw)
 
       # Inner scan over microbatches with fixed BSW
       if self.config.scan_pipeline_iterations:
@@ -2528,14 +2539,15 @@ class NNXCircularPipeline(NNXPipelineBase):
             jax.tree.map(lambda *xs: jnp.stack(xs), *inner_metrics_list) if inner_metrics_list else layers_metrics
         )
 
-      return (new_loop_state, new_layer_mutables), inner_metrics
+      # nxt_bsw becomes next iter's w_curr (sliding window).
+      return (new_loop_state, new_layer_mutables, nxt_bsw), inner_metrics
 
     # ---- Execute: outer scan (repeats) + bubble scan ----
     num_repeats = self.config.num_pipeline_repeats
 
     if self.config.scan_pipeline_iterations:
-      (loop_state, final_layer_mutables), repeat_metrics = jax.lax.scan(
-          outer_body, (loop_state, layers_mutables), None, length=num_repeats
+      (loop_state, final_layer_mutables, _), repeat_metrics = jax.lax.scan(
+          outer_body, (loop_state, layers_mutables, init_w_curr), None, length=num_repeats
       )
       # repeat_metrics: [num_repeats, num_microbatches, ...] → flatten to [R*MB, ...]
       repeat_metrics = jax.tree.map(
@@ -2543,12 +2555,12 @@ class NNXCircularPipeline(NNXPipelineBase):
           repeat_metrics,
       )
     else:
-      outer_carry = (loop_state, layers_mutables)
+      outer_carry = (loop_state, layers_mutables, init_w_curr)
       repeat_metrics_list = []
       for _ in range(num_repeats):
         outer_carry, rep_metrics = outer_body(outer_carry, None)
         repeat_metrics_list.append(rep_metrics)
-      loop_state, final_layer_mutables = outer_carry
+      loop_state, final_layer_mutables, _ = outer_carry
       repeat_metrics = (
           jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *repeat_metrics_list)
           if repeat_metrics_list
