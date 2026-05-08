@@ -65,26 +65,48 @@ def assert_same_output_and_grad(f1, f2, *inputs):
   f1_grad = pytree_ravel(f1_grad)
   f2_grad = pytree_ravel(f2_grad)
 
-  # Element-wise check uses atol so near-zero gradient elements (whose absolute
-  # diff is tiny but relative diff can be huge due to /|grad|) don't fail the
-  # assertion. Pipeline scan vs reference for-loop produce mathematically
-  # equivalent outputs but differ at FP32 precision (e.g. DeepSeek MoE softmax /
-  # top-k reduction order); typical seen abs-diff is <1e-1 against grad norm ~10^3.
+  g_diff = jnp.abs(f1_grad - f2_grad)
+  v_diff = jnp.abs(f1_value - f2_value)
+
+  print(
+      f"PROBE size f1={f1_grad.size} f2={f2_grad.size} "
+      f"nan f1={int(jnp.sum(jnp.isnan(f1_grad)))} f2={int(jnp.sum(jnp.isnan(f2_grad)))} "
+      f"inf f1={int(jnp.sum(jnp.isinf(f1_grad)))} f2={int(jnp.sum(jnp.isinf(f2_grad)))}",
+      flush=True,
+  )
+  print(
+      f"PROBE value f1={float(f1_value):.6f} f2={float(f2_value):.6f} "
+      f"abs_diff={float(v_diff):.6e}",
+      flush=True,
+  )
+  print(
+      f"PROBE grad abs_diff max={float(g_diff.max()):.6e} mean={float(g_diff.mean()):.6e} "
+      f"norm f1={float(jnp.linalg.norm(f1_grad)):.4f} f2={float(jnp.linalg.norm(f2_grad)):.4f}",
+      flush=True,
+  )
+  print(
+      f"PROBE grad violations(atol=1.0,rtol=0.1)="
+      f"{int(jnp.sum(g_diff > 1.0 + 0.1 * jnp.abs(f2_grad)))} "
+      f"argmax={int(jnp.argmax(g_diff))} "
+      f"at_argmax f1={float(f1_grad[jnp.argmax(g_diff)]):.6e} "
+      f"f2={float(f2_grad[jnp.argmax(g_diff)]):.6e}",
+      flush=True,
+  )
+
   value_close = bool(jax.numpy.allclose(f1_value, f2_value, rtol=1e-2, atol=1e-1, equal_nan=False))
   grad_close = bool(jax.numpy.allclose(f1_grad, f2_grad, rtol=1e-1, atol=1.0, equal_nan=False))
   assert value_close, (
-      f"value mismatch: f1={float(f1_value)} vs f2={float(f2_value)}, " f"abs_diff={float(jnp.abs(f1_value - f2_value))}"
+      f"value mismatch: f1={float(f1_value)} vs f2={float(f2_value)}, "
+      f"abs_diff={float(v_diff)}"
   )
-  if not grad_close:
-    g_diff = jnp.abs(f1_grad - f2_grad)
-    raise AssertionError(
-        f"grad mismatch: abs_diff_max={float(g_diff.max())}, "
-        f"abs_diff_mean={float(g_diff.mean())}, "
-        f"f1_grad_norm={float(jnp.linalg.norm(f1_grad))}, "
-        f"f2_grad_norm={float(jnp.linalg.norm(f2_grad))}, "
-        f"grad_size={f1_grad.size}, "
-        f"tolerance=rtol=1e-1+atol=1.0"
-    )
+  assert grad_close, (
+      f"grad mismatch: abs_diff_max={float(g_diff.max())}, "
+      f"abs_diff_mean={float(g_diff.mean())}, "
+      f"f1_grad_norm={float(jnp.linalg.norm(f1_grad))}, "
+      f"f2_grad_norm={float(jnp.linalg.norm(f2_grad))}, "
+      f"grad_size={f1_grad.size}, "
+      f"tolerance=rtol=1e-1+atol=1.0"
+  )
 
 
 class PipelineParallelismTest(unittest.TestCase):
