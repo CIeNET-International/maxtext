@@ -2515,16 +2515,6 @@ class NNXCircularPipeline(NNXPipelineBase):
       #    shard_map select per stage; both slots now hold uniform-per-repeat data.
       bsw_ref[0] = (cur_bsw, nxt_bsw)
 
-      # === DEBUG-TRACE-FIX: per-outer-iter trace (TPU verification) ===
-      _, dbg_repeat_ids = self.get_microbatch_and_repeat_ids(iteration)
-      _, dbg_nxt_repeat_ids = self.get_microbatch_and_repeat_ids(iteration + 1)
-      _, dbg_prev_repeat_ids = self.get_microbatch_and_repeat_ids(prev_iter)
-      jax.debug.print(
-          "=== DEBUG-FIX outer_body iter={iter} prev_iter={pi} "
-          "(cur:repeat_ids={prids}, nxt:repeat_ids={nrids}, this_iter_repeat_ids={rids}) ===",
-          iter=iteration, pi=prev_iter, prids=dbg_prev_repeat_ids, nrids=dbg_nxt_repeat_ids, rids=dbg_repeat_ids,
-      )
-
       # Inner scan over microbatches with fixed BSW
       if self.config.scan_pipeline_iterations:
         (new_loop_state, new_layer_mutables), inner_metrics = jax.lax.scan(

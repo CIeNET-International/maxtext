@@ -73,8 +73,7 @@ def assert_same_output_and_grad(f1, f2, *inputs):
   value_close = bool(jax.numpy.allclose(f1_value, f2_value, rtol=1e-2, atol=1e-1, equal_nan=False))
   grad_close = bool(jax.numpy.allclose(f1_grad, f2_grad, rtol=1e-1, atol=1.0, equal_nan=False))
   assert value_close, (
-      f"value mismatch: f1={float(f1_value)} vs f2={float(f2_value)}, "
-      f"abs_diff={float(jnp.abs(f1_value - f2_value))}"
+      f"value mismatch: f1={float(f1_value)} vs f2={float(f2_value)}, " f"abs_diff={float(jnp.abs(f1_value - f2_value))}"
   )
   if not grad_close:
     g_diff = jnp.abs(f1_grad - f2_grad)
@@ -108,16 +107,12 @@ class PipelineParallelismTest(unittest.TestCase):
       )
       raw_stage_class = simple_layer.SimpleDecoderLayer
     elif issubclass(single_pipeline_stage_class, nnx_wrappers.ToLinen):
-      single_pipeline_stage = single_pipeline_stage_class(
-          config=config, mesh=mesh, model_mode=model_mode, rngs=rngs
-      )
+      single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
       # `to_linen_class` stores the wrapped NNX class as the `module_class` class attribute
       # (see `nnx_wrappers.py:to_linen_class` -> `ToLinenPartial.module_class = base_nnx_class`).
       raw_stage_class = single_pipeline_stage_class.module_class
     else:
-      single_pipeline_stage = single_pipeline_stage_class(
-          config=config, mesh=mesh, model_mode=model_mode, rngs=rngs
-      )
+      single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
       raw_stage_class = single_pipeline_stage_class
 
     def get_inputs(batch_size, sequence, features):
@@ -152,8 +147,10 @@ class PipelineParallelismTest(unittest.TestCase):
     # has already removed it; in that case the only remaining path is the NNX one.
     use_nnx_pipeline = getattr(config, "use_nnx_pipeline", True)
     if use_nnx_pipeline:
+
       def stage_factory(stage_rngs):
         return raw_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=stage_rngs)
+
       layers_arg = stage_factory
     else:
       layers_arg = single_pipeline_stage
