@@ -959,6 +959,16 @@ class PipelineParallelism(BaseModel):
       "When False, create_pipeline returns native Linen pipeline (PipelineLinen/CircularPipelineLinen). "
       "Pure NNX decoders use create_nnx_pipeline directly.",
   )
+  use_nnx_pipeline_custom_vjp_prefetch: bool = Field(
+      False,
+      description="EXPERIMENTAL (NNX circular pipeline only). When True, wrap weight_prefetching "
+      "with @jax.custom_vjp + jax.linear_transpose so the FSDP all-gather's backward becomes an "
+      "explicit reduce-scatter into the FSDP-sharded layers_params (mirrors Linen's "
+      "create_pipeline_stage). When True, the outer-scan jax.checkpoint wrap is also removed "
+      "(custom_vjp + jax.checkpoint nesting causes tracer leaks). When False (default), the "
+      "auto-diff path is used (matches existing battle-tested behaviour). Requires TPU validation "
+      "before enabling.",
+  )
 
 
 class RematAndOffload(BaseModel):
