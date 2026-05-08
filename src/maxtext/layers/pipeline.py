@@ -1950,84 +1950,6 @@ class NNXPipeline(NNXPipelineBase):
     )
 
 
-# -----------------------------------------------------------------------------
-# Phase 2 (EXPERIMENTAL): custom_vjp + linear_transpose for FSDP gather backward
-# -----------------------------------------------------------------------------
-# Mirrors Linen `pipeline_utils.create_pipeline_stage` (lines 306-355). Wraps
-# the FSDP-style all-gather inside the Buffer Sliding Window (BSW) build with
-# `@jax.custom_vjp`. The custom backward uses `jax.linear_transpose` so the
-# cotangent of the gathered BSW becomes a reduce-scatter back into the
-# FSDP-sharded `weights_state` slab — avoiding the R-stacked accumulator that
-# auto-diff produces when this gather is invoked under `jax.lax.scan`.
-#
-# Why a module-level function and not a `@jax.custom_vjp` *method*?
-# `jax.custom_vjp` expects a pure function. Methods carry `self`, which JAX
-# cannot trace as a pytree (`nnx.Module` instances are not registered pytrees).
-# We resolve this by lifting the entry point to module scope and routing the
-# `self`-bound state through `nondiff_argnums=(0, 2)` (the model and the
-# `physical_partition_spec`, which is a leaf-pytree of `P` specs and not
-# differentiable).
-#
-# Tracer leak avoidance: the caller (`outer_body`) MUST remove the outer
-# `jax.checkpoint(outer_body)` wrap when this path is enabled. Nested
-# `custom_vjp` inside `jax.checkpoint` re-runs `_fwd` during recomputation
-# while `_bwd` may execute against tracers from a different scope; this is the
-# tracer leak documented at `NNXCircularPipeline` (L1967). The flag
-# `config.use_nnx_pipeline_custom_vjp_prefetch` gates BOTH the wrap and the
-# checkpoint removal, keeping them in lockstep.
-@functools.partial(jax.custom_vjp, nondiff_argnums=(0, 2))
-def _weight_prefetching_custom_vjp(model, weights_state, physical_partition_spec, target_iter):
-  """custom_vjp entry point for FSDP-aware weight prefetching.
-
-  Args:
-    model: NNXCircularPipeline instance (nondiff). Held by-reference so its
-      methods can be called inside fwd/bwd; not traced as a pytree.
-    weights_state: differentiable FSDP-sharded weights pytree.
-    physical_partition_spec: per-leaf P spec (nondiff).
-    target_iter: differentiable scalar (technically int, JAX traces it but it
-      doesn't propagate gradients meaningfully).
-
-  Returns:
-    Materialized BSW pytree (same structure as `weights_state` pre-stacked
-    over stages, post-gather).
-  """
-  return _weight_prefetching_fwd(model, weights_state, physical_partition_spec, target_iter)[0]
-
-
-def _weight_prefetching_fwd(model, weights_state, physical_partition_spec, target_iter):
-  """Forward: gather weights and capture a `linear_transpose` for the backward."""
-  repeat_weights = model.from_all_variables_to_repeat_weights(weights_state, target_iter)
-  bsw = model.from_repeat_weights_to_bsw(repeat_weights, physical_partition_spec)
-  # Bind the static (nondiff) args so we can take linear_transpose w.r.t.
-  # `weights_state` only. We close over `target_iter` because it is part of the
-  # same trace as `_fwd` (no tracer leak — passed as an arg to `_fwd`, not a
-  # checkpoint-scoped capture).
-  def _gather_only_w(w):
-    rw = model.from_all_variables_to_repeat_weights(w, target_iter)
-    return model.from_repeat_weights_to_bsw(rw, physical_partition_spec)
-
-  weight_prefetching_t = jax.linear_transpose(_gather_only_w, weights_state)
-  return bsw, weight_prefetching_t
-
-
-def _weight_prefetching_bwd(model, physical_partition_spec, residuals, g_bsw):
-  """Backward: apply linear_transpose to fold cotangents into FSDP-sharded space.
-
-  Returns one cotangent per differentiable input of the primal. The primal
-  signature is `(weights_state, target_iter)` (after dropping `nondiff_argnums`),
-  so we return `(g_weights_state, g_target_iter)`. `target_iter` is an int
-  index — its cotangent is meaningless; return zero-like.
-  """
-  weight_prefetching_t = residuals
-  (g_weights_state,) = weight_prefetching_t(g_bsw)
-  # `target_iter` is a scalar int used for indexing; cotangent is zero. Use
-  # None so JAX's symbolic-zero handling kicks in.
-  return (g_weights_state, None)
-
-
-_weight_prefetching_custom_vjp.defvjp(_weight_prefetching_fwd, _weight_prefetching_bwd)
-
-
 class NNXCircularPipeline(NNXPipelineBase):
   """NNX circular pipeline with nested scan and BSW weight caching.
 
@@ -2193,44 +2115,10 @@ class NNXCircularPipeline(NNXPipelineBase):
       return _from_repeat_weights_to_bsw_shardmap(repeat_weights, physical_partition_spec, axes_to_gather=axes_to_gather)
     return _from_repeat_weights_to_bsw_hint(repeat_weights)
 
-  def weight_prefetching(self, weights_state, physical_partition_spec, loop_iteration, offset=1):
-    """Gather a single BSW slot for `loop_iteration + offset`.
-
-    A single named seam for both BSW slots (`cur_bsw` at offset = -num_microbatches+1
-    clamped, `nxt_bsw` at offset = +1) so a Phase 2 `custom_vjp` /
-    `linear_transpose` wrapper has one entry point to hook (mirrors Linen's
-    `pipeline_utils.create_pipeline_stage` calling `model.weight_prefetching`).
-
-    Args:
-      weights_state: Full FSDP-sharded weights pytree (the layers_params slab).
-      physical_partition_spec: Per-leaf physical partition spec used to derive the
-        per-stage BSW spec.
-      loop_iteration: The pipeline iteration the BSW slot is "for".
-      offset: Integer offset added to `loop_iteration` to compute the gather
-        target. `+1` reproduces the original "next repeat" prefetch (`nxt_bsw`).
-        Negative offsets (after `jnp.maximum(..., 0)` clamping by the caller)
-        produce the previous-repeat slot (`cur_bsw`). The clamp must be applied
-        by the caller because it depends on `num_microbatches`, which is not a
-        property of the `weight_prefetching` op itself.
-
-    Note:
-      Body is unchanged (same two ops as before); the `offset` parameter is
-      purely additive on the iteration index.
-
-      When `self.config.use_nnx_pipeline_custom_vjp_prefetch=True`, this method
-      delegates to a `@jax.custom_vjp`-wrapped variant whose backward uses
-      `jax.linear_transpose` to fold the gather's cotangent directly into the
-      FSDP-sharded `weights_state` (avoids the R-stacked accumulator slab that
-      auto-diff produces when scanned). Mirrors Linen's
-      `pipeline_utils.create_pipeline_stage` pattern. EXPERIMENTAL: caller must
-      remove the outer `jax.checkpoint(outer_body)` wrap to avoid tracer leaks
-      from custom_vjp / checkpoint nesting (see L1967 docstring note).
-    """
-    target_iter = loop_iteration + offset
-    if getattr(self.config, "use_nnx_pipeline_custom_vjp_prefetch", False):
-      return _weight_prefetching_custom_vjp(self, weights_state, physical_partition_spec, target_iter)
-    repeat_weights = self.from_all_variables_to_repeat_weights(weights_state, target_iter)
-    return self.from_repeat_weights_to_bsw(repeat_weights, physical_partition_spec)
+  def weight_prefetching(self, weights_state, physical_partition_spec, loop_iteration):
+    """Prefetch next repeat's weights for the Buffer Sliding Window."""
+    nxt_repeat_weights = self.from_all_variables_to_repeat_weights(weights_state, loop_iteration + 1)
+    return self.from_repeat_weights_to_bsw(nxt_repeat_weights, physical_partition_spec)
 
   def fetch_active_stage_weights(self, bsw, loop_iteration, physical_partition_spec=None):
     """The module fetches the actively prefetched weights
@@ -2239,18 +2127,12 @@ class NNXCircularPipeline(NNXPipelineBase):
     return self.get_current_weights_from_bsw(bsw, loop_iteration, physical_partition_spec)
 
   def get_current_weights_from_bsw(self, bsw, loop_iteration, physical_partition_spec):
-    """Pulls the fully gathered parameters for the current repeat from the BSW dual-buffer.
+    """Pulls the fully gathered parameters for the current repeat from the BSW."""
+    if bsw[0] is bsw[1]:
+      treedef = jax.tree.structure(bsw[0])
+      leaves = jax.tree.leaves(bsw[0])
+      return treedef.unflatten(leaves)
 
-    `bsw` is now a TRUE dual buffer `(cur_bsw, nxt_bsw)` produced by `outer_body`'s
-    dual-gather. `select_weights_from_bsw` picks per-stage between the two slots
-    based on whether the stage's `repeat_id` matches `stage0_repeat_id` (i.e. has
-    crossed the repeat boundary). Mirrors Linen `CircularPipeline`.
-
-    The legacy fast-path that returned `bsw[0]` when `bsw[0] is bsw[1]` was the
-    correctness bug: it treated the boundary microbatch's per-stage gather as
-    valid for all 8 microbatches in the repeat, leaving stale weights in the
-    lagging stage's slot. Removed.
-    """
     bsw_pps = jax.tree.map(self._remove_fsdp_from_physical_partition_spec, physical_partition_spec)
     _, repeat_ids = self.get_microbatch_and_repeat_ids(loop_iteration)
     stage0_repeat_id = jnp.maximum(loop_iteration, 0) // self.config.num_pipeline_microbatches
@@ -2568,65 +2450,17 @@ class NNXCircularPipeline(NNXPipelineBase):
     num_microbatches = self.config.num_pipeline_microbatches
 
     def outer_body(carry, _):
-      """One repeat: gather weights for current repeat AND previous repeat → run MB microbatches.
-
-      DUAL-BUFFER fix (mirrors Linen `CircularPipeline.weight_prefetching` semantics).
-
-      `from_all_variables_to_repeat_weights(weights, iteration)` returns per-stage
-      weights derived from `repeat_ids = microbatches_processed // num_microbatches`
-      where `microbatches_processed = max(iteration - forwarding_delay * arange(num_stages), 0)`.
-
-      Linen's prefetcher calls `from_all_variables_to_repeat_weights(weights, iteration + 1)`
-      so all stages see the same repeat (no boundary mix). We reproduce this here:
-        - `nxt_bsw`: gather at `iteration + 1` → repeat_ids = [R, R, ...] (current repeat,
-          all stages on R because the +1 offset clears the boundary lag).
-        - `cur_bsw`: gather at `max(iteration - num_microbatches + 1, 0)` → repeat_ids =
-          [R-1, R-1, ...] (previous repeat). Lagging stages still finishing repeat R-1
-          read this slot at boundary microbatch iter R*MB.
-
-      `get_current_weights_from_bsw`'s `select_weights_from_bsw` shard_map then picks
-      per-stage based on `repeat_id == stage0_repeat_id`:
-        - At boundary iter R*MB: stage0_repeat_id=R, repeat_ids=[R, R-1].
-            Stage 0 (R==R) → picks nxt_bsw[0] = repeat R ✓.
-            Stage 1 (R-1≠R) → picks cur_bsw[1] = repeat R-1 ✓.
-        - At iter R*MB+k (k≥1): both stages on R → both pick nxt_bsw = repeat R ✓.
-
-      The previous single-BSW code (`bsw=(cur_bsw, cur_bsw)` from `iteration`) used the
-      boundary-iter per-stage mix as the only BSW for all 8 microbatches, leaving
-      stage 1 on stale repeat-R-1 weights for 7-of-8 microbatches per repeat
-      (~7% loss / ~20% grad-norm divergence vs the per-layer reference).
-      """
+      """One repeat: gather weights (1 all-gather) → run MB microbatches."""
       current_loop_state, current_layer_mutables = carry
       iteration = current_loop_state["loop_iteration"]
 
-      # 1a. Current repeat's weights, uniform across stages (all on repeat R).
-      #     iteration + 1 clears the boundary lag so repeat_ids = [R, R, ...].
-      #     Routed through `self.weight_prefetching(..., offset=+1)` so a future
-      #     Phase 2 `@jax.custom_vjp` / `linear_transpose` wrapper has a single
-      #     entry point (mirrors Linen `pipeline_utils.create_pipeline_stage`).
-      nxt_bsw = self.weight_prefetching(layers_params, physical_partition_spec_full, iteration, offset=1)
+      cur_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, iteration)
+      cur_bsw = self.from_repeat_weights_to_bsw(cur_repeat_weights, physical_partition_spec_full)
 
-      # 1b. Previous repeat's weights, uniform across stages (all on repeat R-1).
-      #     For R=0 the clamp keeps prev_iter=0 → repeat_ids = [0, 0, ...]; the slot
-      #     is unused at R=0 anyway because no stage has repeat_id < stage0_repeat_id.
-      #     Clamp is applied here (not inside `weight_prefetching`) because it
-      #     depends on `num_microbatches`, which is a pipeline property, not a
-      #     gather property. We pass the clamped iteration with `offset=0` so the
-      #     gather goes through the same symmetrized seam as `nxt_bsw`.
-      prev_iter = jnp.maximum(iteration - num_microbatches + 1, 0)
-      cur_bsw = self.weight_prefetching(layers_params, physical_partition_spec_full, prev_iter, offset=0)
-
-      # 2. Tag both BSW slots so inner jax.checkpoint saves them
-      #    (prevents backward re-gather and stacked [R, ...] gather residuals).
       cur_bsw = jax.ad_checkpoint.checkpoint_name(cur_bsw, "bsw_weights")
-      nxt_bsw = jax.ad_checkpoint.checkpoint_name(nxt_bsw, "bsw_weights")
 
-      # 3. Store dual buffer in closure: bsw[0]=cur (previous repeat),
-      #    bsw[1]=nxt (current repeat). `get_current_weights_from_bsw` runs its
-      #    shard_map select per stage; both slots now hold uniform-per-repeat data.
-      bsw_ref[0] = (cur_bsw, nxt_bsw)
+      bsw_ref[0] = (cur_bsw, cur_bsw)
 
-      # Inner scan over microbatches with fixed BSW
       if self.config.scan_pipeline_iterations:
         (new_loop_state, new_layer_mutables), inner_metrics = jax.lax.scan(
             inner_body, (current_loop_state, current_layer_mutables), None, length=num_microbatches
@@ -2644,102 +2478,27 @@ class NNXCircularPipeline(NNXPipelineBase):
 
       return (new_loop_state, new_layer_mutables), inner_metrics
 
-    # Wrap outer_body in jax.checkpoint so the outer scan stores ONE carry per
-    # iter instead of R-stacked gather-residual accumulators. Backward recomputes
-    # outer_body for each repeat; inner_body's checkpoint policy still saves the
-    # named tensors (iteration_input/decoder_layer_input/bsw_weights) during
-    # recomputation. Trades extra forward recompute per backward for ~-3 to -5 GB
-    # Temp residuals at llama2-7b scale.
-    #
-    # PHASE 2 (custom_vjp + linear_transpose): when
-    # `use_nnx_pipeline_custom_vjp_prefetch=True`, SKIP this wrap. Reason:
-    # `_weight_prefetching_custom_vjp` is invoked from inside `outer_body` (via
-    # `weight_prefetching`); nesting a `@jax.custom_vjp` inside a
-    # `jax.checkpoint` triggers tracer leaks where `_bwd` runs against
-    # checkpoint-recomputation tracers (see L1967 docstring). The custom_vjp's
-    # backward already reduces the gather-residual to the FSDP-sharded slab via
-    # `linear_transpose`, so the same -3 to -5 GB savings should be recovered
-    # by the explicit reduce-scatter; net memory delta should be near-zero with
-    # an additional perf win from reduce-scatter / compute overlap (mirrors
-    # Linen `pipeline_utils.create_pipeline_stage`).
-    if self.config.set_remat_policy_on_pipeline_iterations and not getattr(
-        self.config, "use_nnx_pipeline_custom_vjp_prefetch", False
-    ):
+    if self.config.set_remat_policy_on_pipeline_iterations:
       outer_body = jax.checkpoint(outer_body, policy=self.get_pipeline_remat_policy())
 
     # ---- Execute: outer scan (repeats) + bubble scan ----
     num_repeats = self.config.num_pipeline_repeats
 
-    # ---- L2 gradient accumulation (no custom_vjp) ----
-    #
-    # When `use_nnx_pipeline_l2_grad_accum=True`, the outer loop over repeats
-    # is executed as a Python for-loop instead of `jax.lax.scan`, while the
-    # inner loop over microbatches remains a `jax.lax.scan`.
-    #
-    # Why this reduces memory:
-    #
-    # With `jax.lax.scan` on the outer loop, JAX's backward pass must maintain
-    # gradient accumulators for `layers_params` (closed over by `outer_body`)
-    # across ALL R repeats simultaneously. Each repeat derives BSW from
-    # `layers_params` via all-gather, and the scan backward stacks R copies of
-    # the all-gather cotangent (reduce-scatter) buffers. For llama2-7b with
-    # R=2, this creates ~9.4 GB of extra Temp memory vs Linen.
-    #
-    # With a Python for-loop, backward processes one repeat at a time:
-    #   1. `jax.checkpoint(outer_body)` triggers recomputation of that repeat's
-    #      forward (including BSW all-gather).
-    #   2. Backward of that repeat flows through the recomputed BSW back to
-    #      `layers_params`, producing a single reduce-scatter cotangent.
-    #   3. JAX accumulates `d_layers_params` sequentially (+=), not stacked.
-    #   4. The repeat's gradient buffers are freed before the next repeat starts.
-    #
-    # Net effect: only 1 repeat's cotangent buffers are live at a time, matching
-    # Linen's memory profile (~13.6 GB Temp vs NNX-scan's ~22.9 GB Temp).
-    #
-    # Trade-off: the for-loop unrolls R iterations in the XLA HLO, increasing
-    # compilation time slightly for R>4. For typical R=2-4, this is negligible.
-    # The inner microbatch scan remains compiled as a single XLA while-loop.
-    #
-    # This approach requires NO custom_vjp, avoiding the UnexpectedTracerError
-    # that crashed the previous L2 attempt (custom_vjp + nondiff_argnums on TPU).
-    use_l2_grad_accum = getattr(self.config, "use_nnx_pipeline_l2_grad_accum", False)
-    if use_l2_grad_accum and not self.config.set_remat_policy_on_pipeline_iterations:
-      raise ValueError(
-          "use_nnx_pipeline_l2_grad_accum=True requires "
-          "set_remat_policy_on_pipeline_iterations=True. The for-loop outer path "
-          "depends on jax.checkpoint(outer_body) to free gradient buffers between "
-          "repeats; without it, all R forward graphs remain live during backward."
-      )
-    if use_l2_grad_accum and getattr(self.config, "use_nnx_pipeline_custom_vjp_prefetch", False):
-      raise ValueError(
-          "use_nnx_pipeline_l2_grad_accum=True is incompatible with "
-          "use_nnx_pipeline_custom_vjp_prefetch=True. The custom_vjp flag skips "
-          "jax.checkpoint(outer_body), which the L2 for-loop path requires."
-      )
-
-    if self.config.scan_pipeline_iterations and not use_l2_grad_accum:
+    if self.config.scan_pipeline_iterations:
       (loop_state, final_layer_mutables), repeat_metrics = jax.lax.scan(
           outer_body, (loop_state, layers_mutables), None, length=num_repeats
       )
-      # repeat_metrics: [num_repeats, num_microbatches, ...] → flatten to [R*MB, ...]
       repeat_metrics = jax.tree.map(
           lambda x: x.reshape((num_repeats * num_microbatches,) + x.shape[2:]),
           repeat_metrics,
       )
     else:
-      # For-loop path: used when scan_pipeline_iterations=False (original)
-      # OR when use_nnx_pipeline_l2_grad_accum=True (L2 memory optimization).
-      # In the L2 case, scan_pipeline_iterations=True still applies to the INNER
-      # microbatch loop (inside outer_body) — only the OUTER repeat loop is unrolled.
       outer_carry = (loop_state, layers_mutables)
       repeat_metrics_list = []
       for _ in range(num_repeats):
         outer_carry, rep_metrics = outer_body(outer_carry, None)
         repeat_metrics_list.append(rep_metrics)
       loop_state, final_layer_mutables = outer_carry
-      # Both L2 (inner scan, outer for-loop) and original non-scan (both for-loops)
-      # produce [num_microbatches, ...] shaped metrics per repeat. Concatenate
-      # along axis=0 to get [R*MB, ...].
       repeat_metrics = (
           jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *repeat_metrics_list)
           if repeat_metrics_list
@@ -2748,14 +2507,10 @@ class NNXCircularPipeline(NNXPipelineBase):
 
     # ---- Bubble iterations (pipeline drain) ----
     if bubble_iterations > 0:
-      # Use last repeat's BSW (already set in bsw_ref[0])
       if self.config.scan_pipeline_iterations:
-        # Need to re-create BSW for bubble since bsw_ref is Python-level.
-        # Bubble path uses raw `bubble_iter` (no +1) -> offset=0 keeps same gather
-        # while routing through the symmetrized `weight_prefetching` seam so all
-        # three BSW gather sites in this method share one entry point.
         bubble_iter = loop_state["loop_iteration"]
-        bubble_bsw = self.weight_prefetching(layers_params, physical_partition_spec_full, bubble_iter, offset=0)
+        bubble_weights = self.from_all_variables_to_repeat_weights(layers_params, bubble_iter)
+        bubble_bsw = self.from_repeat_weights_to_bsw(bubble_weights, physical_partition_spec_full)
         bsw_ref[0] = (bubble_bsw, bubble_bsw)
         (loop_state, final_layer_mutables), bubble_metrics = jax.lax.scan(
             inner_body, (loop_state, final_layer_mutables), None, length=bubble_iterations

@@ -959,29 +959,6 @@ class PipelineParallelism(BaseModel):
       "When False, create_pipeline returns native Linen pipeline (PipelineLinen/CircularPipelineLinen). "
       "Pure NNX decoders use create_nnx_pipeline directly.",
   )
-  use_nnx_pipeline_custom_vjp_prefetch: bool = Field(
-      False,
-      description="EXPERIMENTAL (NNX circular pipeline only). When True, wrap weight_prefetching "
-      "with @jax.custom_vjp + jax.linear_transpose so the FSDP all-gather's backward becomes an "
-      "explicit reduce-scatter into the FSDP-sharded layers_params (mirrors Linen's "
-      "create_pipeline_stage). When True, the outer-scan jax.checkpoint wrap is also removed "
-      "(custom_vjp + jax.checkpoint nesting causes tracer leaks). When False (default), the "
-      "auto-diff path is used (matches existing battle-tested behaviour). Requires TPU validation "
-      "before enabling.",
-  )
-  use_nnx_pipeline_l2_grad_accum: bool = Field(
-      False,
-      description="EXPERIMENTAL (NNX circular pipeline only). When True, the outer repeat "
-      "loop is unrolled into a Python for-loop instead of jax.lax.scan, while the inner "
-      "microbatch loop remains a jax.lax.scan. This avoids custom_vjp entirely. "
-      "Memory reduction mechanism: with jax.lax.scan on the outer loop, backward stacks "
-      "R copies of the BSW all-gather cotangent (reduce-scatter) buffers simultaneously. "
-      "With a for-loop, backward processes one repeat at a time — each repeat's "
-      "jax.checkpoint recomputes BSW, backward flows through it sequentially, and gradient "
-      "buffers are freed before the next repeat. Only 1 repeat's cotangent is live at a time. "
-      "Coexists with outer jax.checkpoint and inner remat policy. "
-      "When False (default), the standard outer jax.lax.scan path is used.",
-  )
 
 
 class RematAndOffload(BaseModel):
