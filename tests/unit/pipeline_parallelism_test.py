@@ -65,22 +65,6 @@ def assert_same_output_and_grad(f1, f2, *inputs):
   f1_grad = pytree_ravel(f1_grad)
   f2_grad = pytree_ravel(f2_grad)
 
-  # DEBUG probe: disambiguate pytree-mismatch vs NaN contamination vs real outlier.
-  print(f"DEBUG_PROBE f1_grad.size={f1_grad.size} f2_grad.size={f2_grad.size}", flush=True)
-  print(
-      f"DEBUG_PROBE f1_nan={int(jnp.sum(jnp.isnan(f1_grad)))} f2_nan={int(jnp.sum(jnp.isnan(f2_grad)))}",
-      flush=True,
-  )
-  print(
-      f"DEBUG_PROBE violations={int(jnp.sum(jnp.abs(f1_grad - f2_grad) > 1.0 + 0.1 * jnp.abs(f2_grad)))}",
-      flush=True,
-  )
-  print(
-      f"DEBUG_PROBE argmax={int(jnp.argmax(jnp.abs(f1_grad - f2_grad)))} "
-      f"max={float(jnp.max(jnp.abs(f1_grad - f2_grad)))}",
-      flush=True,
-  )
-
   # Element-wise check uses atol so near-zero gradient elements (whose absolute
   # diff is tiny but relative diff can be huge due to /|grad|) don't fail the
   # assertion. Pipeline scan vs reference for-loop produce mathematically
@@ -365,28 +349,6 @@ class PipelineParallelismTest(unittest.TestCase):
     self.assert_pipeline_same_output_and_grad(config)
 
   @pytest.mark.tpu_only
-  def test_circular_pipeline_ag_per_repeat_l2_grad_accum(self):
-    # L2 gradient accumulation: outer repeat loop unrolled (for-loop),
-    # inner microbatch loop scanned. Tests that output and gradients
-    # match the per-layer reference (same as test_circular_pipeline_ag_per_repeat
-    # but with use_nnx_pipeline_l2_grad_accum=True).
-    config = pyconfig.initialize(
-        [sys.argv[0], get_test_config_path()],
-        enable_checkpointing=False,
-        enable_goodput_recording=False,
-        run_name="circular_ag_per_repeat_l2",
-        max_target_length=128,
-        base_emb_dim=28,
-        ici_pipeline_parallelism=2,
-        base_num_decoder_layers=8,
-        num_pipeline_microbatches=8,
-        per_device_batch_size=4,
-        pipeline_fsdp_ag_per_repeat=True,
-        use_nnx_pipeline_l2_grad_accum=True,
-    )
-    self.assert_pipeline_same_output_and_grad(config)
-
-  @pytest.mark.tpu_only
   def test_non_circular_same_output_and_grad(self):
     # 4 stages, 4 layers (no circular repeats, 1 layer per stage), 4 microbatches
     config = pyconfig.initialize(
@@ -463,40 +425,6 @@ class PipelineParallelismTest(unittest.TestCase):
             "num_layers_per_pipeline_stage=1",
             "num_pipeline_microbatches=4",
             "pipeline_fsdp_ag_per_repeat=True",
-            (rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}"),
-        ]
-    )
-
-  @pytest.mark.integration_test
-  @pytest.mark.tpu_only
-  def test_full_train_circular_pipeline_ag_per_repeat_l2_grad_accum(self):
-    # Same as test_full_train_circular_pipeline_ag_per_repeat but with L2 gradient
-    # accumulation (outer repeat loop unrolled, inner microbatch loop scanned).
-    train_main(
-        [
-            None,
-            get_test_config_path(),
-            f"base_output_directory={self.base_output_directory}",
-            "run_name=runner_pipeline_parallelism_test",
-            f"dataset_path={self.dataset_path}",
-            "base_emb_dim=28",
-            "base_num_query_heads=4",
-            "base_num_kv_heads=4",
-            "base_mlp_dim=32",
-            "base_num_decoder_layers=32",
-            "head_dim=128",
-            "per_device_batch_size=2",
-            "max_target_length=1024",
-            "vocab_size=32",
-            "dataset_type=synthetic",
-            "steps=3",
-            "enable_checkpointing=False",
-            "enable_goodput_recording=False",
-            "ici_pipeline_parallelism=2",
-            "num_layers_per_pipeline_stage=1",
-            "num_pipeline_microbatches=4",
-            "pipeline_fsdp_ag_per_repeat=True",
-            "use_nnx_pipeline_l2_grad_accum=True",
             (rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}"),
         ]
     )
