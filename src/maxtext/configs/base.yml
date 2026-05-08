@@ -1179,6 +1179,11 @@ use_nnx_pipeline: True  # Set to False to use native Linen pipeline (with custom
 # EXPERIMENTAL: wrap NNX weight_prefetching with @jax.custom_vjp + linear_transpose
 # (mirrors Linen create_pipeline_stage). Requires TPU validation; default False.
 use_nnx_pipeline_custom_vjp_prefetch: False
+# EXPERIMENTAL: L2 gradient accumulation for NNX circular pipeline.
+# Unrolls outer repeat loop (for-loop) while keeping inner microbatch scan (jax.lax.scan).
+# No custom_vjp — backward processes one repeat at a time, avoiding R-stacked BSW cotangent
+# buffers. Expected memory reduction: ~9 GB for llama2-7b scale.
+use_nnx_pipeline_l2_grad_accum: False
 
 
 ################################## Qwen3-Next Specific Configs ##################################

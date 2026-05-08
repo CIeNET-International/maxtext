@@ -2670,7 +2670,54 @@ class NNXCircularPipeline(NNXPipelineBase):
     # ---- Execute: outer scan (repeats) + bubble scan ----
     num_repeats = self.config.num_pipeline_repeats
 
-    if self.config.scan_pipeline_iterations:
+    # ---- L2 gradient accumulation (no custom_vjp) ----
+    #
+    # When `use_nnx_pipeline_l2_grad_accum=True`, the outer loop over repeats
+    # is executed as a Python for-loop instead of `jax.lax.scan`, while the
+    # inner loop over microbatches remains a `jax.lax.scan`.
+    #
+    # Why this reduces memory:
+    #
+    # With `jax.lax.scan` on the outer loop, JAX's backward pass must maintain
+    # gradient accumulators for `layers_params` (closed over by `outer_body`)
+    # across ALL R repeats simultaneously. Each repeat derives BSW from
+    # `layers_params` via all-gather, and the scan backward stacks R copies of
+    # the all-gather cotangent (reduce-scatter) buffers. For llama2-7b with
+    # R=2, this creates ~9.4 GB of extra Temp memory vs Linen.
+    #
+    # With a Python for-loop, backward processes one repeat at a time:
+    #   1. `jax.checkpoint(outer_body)` triggers recomputation of that repeat's
+    #      forward (including BSW all-gather).
+    #   2. Backward of that repeat flows through the recomputed BSW back to
+    #      `layers_params`, producing a single reduce-scatter cotangent.
+    #   3. JAX accumulates `d_layers_params` sequentially (+=), not stacked.
+    #   4. The repeat's gradient buffers are freed before the next repeat starts.
+    #
+    # Net effect: only 1 repeat's cotangent buffers are live at a time, matching
+    # Linen's memory profile (~13.6 GB Temp vs NNX-scan's ~22.9 GB Temp).
+    #
+    # Trade-off: the for-loop unrolls R iterations in the XLA HLO, increasing
+    # compilation time slightly for R>4. For typical R=2-4, this is negligible.
+    # The inner microbatch scan remains compiled as a single XLA while-loop.
+    #
+    # This approach requires NO custom_vjp, avoiding the UnexpectedTracerError
+    # that crashed the previous L2 attempt (custom_vjp + nondiff_argnums on TPU).
+    use_l2_grad_accum = getattr(self.config, "use_nnx_pipeline_l2_grad_accum", False)
+    if use_l2_grad_accum and not self.config.set_remat_policy_on_pipeline_iterations:
+      raise ValueError(
+          "use_nnx_pipeline_l2_grad_accum=True requires "
+          "set_remat_policy_on_pipeline_iterations=True. The for-loop outer path "
+          "depends on jax.checkpoint(outer_body) to free gradient buffers between "
+          "repeats; without it, all R forward graphs remain live during backward."
+      )
+    if use_l2_grad_accum and getattr(self.config, "use_nnx_pipeline_custom_vjp_prefetch", False):
+      raise ValueError(
+          "use_nnx_pipeline_l2_grad_accum=True is incompatible with "
+          "use_nnx_pipeline_custom_vjp_prefetch=True. The custom_vjp flag skips "
+          "jax.checkpoint(outer_body), which the L2 for-loop path requires."
+      )
+
+    if self.config.scan_pipeline_iterations and not use_l2_grad_accum:
       (loop_state, final_layer_mutables), repeat_metrics = jax.lax.scan(
           outer_body, (loop_state, layers_mutables), None, length=num_repeats
       )
@@ -2680,12 +2727,19 @@ class NNXCircularPipeline(NNXPipelineBase):
           repeat_metrics,
       )
     else:
+      # For-loop path: used when scan_pipeline_iterations=False (original)
+      # OR when use_nnx_pipeline_l2_grad_accum=True (L2 memory optimization).
+      # In the L2 case, scan_pipeline_iterations=True still applies to the INNER
+      # microbatch loop (inside outer_body) — only the OUTER repeat loop is unrolled.
       outer_carry = (loop_state, layers_mutables)
       repeat_metrics_list = []
       for _ in range(num_repeats):
         outer_carry, rep_metrics = outer_body(outer_carry, None)
         repeat_metrics_list.append(rep_metrics)
       loop_state, final_layer_mutables = outer_carry
+      # Both L2 (inner scan, outer for-loop) and original non-scan (both for-loops)
+      # produce [num_microbatches, ...] shaped metrics per repeat. Concatenate
+      # along axis=0 to get [R*MB, ...].
       repeat_metrics = (
           jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *repeat_metrics_list)
           if repeat_metrics_list
