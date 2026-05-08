@@ -1176,6 +1176,9 @@ enable_nnx: False
 pure_nnx_decoder: False
 pure_nnx: False
 use_nnx_pipeline: True  # Set to False to use native Linen pipeline (with custom VJP)
+nnx_pipeline_no_outer_checkpoint: False
+nnx_pipeline_no_bsw_checkpoint_name: False
+nnx_pipeline_split_transpose: False
 
 
 ################################## Qwen3-Next Specific Configs ##################################

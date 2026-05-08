@@ -959,6 +959,21 @@ class PipelineParallelism(BaseModel):
       "When False, create_pipeline returns native Linen pipeline (PipelineLinen/CircularPipelineLinen). "
       "Pure NNX decoders use create_nnx_pipeline directly.",
   )
+  nnx_pipeline_no_outer_checkpoint: bool = Field(
+      False,
+      description="When True, skip jax.checkpoint on the outer repeat body in NNXCircularPipeline. "
+      "Inner body checkpoint is always applied.",
+  )
+  nnx_pipeline_no_bsw_checkpoint_name: bool = Field(
+      False,
+      description="When True, skip checkpoint_name('bsw_weights') tagging on BSW in outer_body. "
+      "BSW is recomputed during backward instead of saved as residuals.",
+  )
+  nnx_pipeline_split_transpose: bool = Field(
+      False,
+      description="When True, pass _split_transpose=True to outer jax.lax.scan. "
+      "Separates param gradients from carry gradients in scan backward.",
+  )
 
 
 class RematAndOffload(BaseModel):
