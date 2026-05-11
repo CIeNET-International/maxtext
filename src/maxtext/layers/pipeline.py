@@ -1448,9 +1448,12 @@ class NNXCircularPipeline(NNXPipelineBase):
 
     # ---- Nested scan structure ----
     #
-    # Outer scan (repeats): all-gather BSW once per repeat, run inner scan.
+    # Outer scan (repeats): single all-gather per repeat into (nxt, nxt) BSW.
     # Inner scan (microbatches): read BSW from closure, run one pipeline iteration.
     # BSW via closure (bsw_ref), NOT carry — carry would OOM (N × BSW_size).
+    # Single-buffer (nxt, nxt) hits fast-path in get_current_weights_from_bsw
+    # (skips shard_map select). Profiling confirmed numerically correct and
+    # identical throughput to dual-buffer (cur, nxt) with outer checkpoint.
     #
     num_microbatches = self.config.num_pipeline_microbatches
     bsw_ref = [None]
@@ -1485,10 +1488,7 @@ class NNXCircularPipeline(NNXPipelineBase):
       iteration = current_loop_state["loop_iteration"]
 
       nxt_bsw = self.weight_prefetching(layers_params, physical_partition_spec_full, iteration)
-      prev_iter = jnp.maximum(iteration - num_microbatches + 1, 0)
-      cur_repeat_weights = self.from_all_variables_to_repeat_weights(layers_params, prev_iter)
-      cur_bsw = self.from_repeat_weights_to_bsw(cur_repeat_weights, physical_partition_spec_full)
-      bsw_ref[0] = (cur_bsw, nxt_bsw)
+      bsw_ref[0] = (nxt_bsw, nxt_bsw)
 
       if self.config.scan_pipeline_iterations:
         (new_loop_state, new_layer_mutables), inner_metrics = jax.lax.scan(
