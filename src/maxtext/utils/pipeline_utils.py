@@ -20,6 +20,7 @@ from jax.sharding import PartitionSpec as P
 from flax import linen as nn
 from flax.linen.spmd import LogicallyPartitioned
 import jax.numpy as jnp
+from maxtext.utils import max_logging
 
 
 def get_mesh_axis_dim_indices(physical_partition_spec, axis_name="fsdp"):
@@ -194,6 +195,8 @@ def create_gradient_accumulation_scan(
     A JAX custom_vjp function that executes the `length` pipeline iterations.
   """
 
+  max_logging.log(f"[PIPELINE-DIAG] create_gradient_accumulation_scan: L1+L2 custom_vjp, length={length}")
+
   @jax.custom_vjp
   def run_single_microbatch_custom(lightweight_state, bsw, pos_arg, seg_arg):
     return run_single_microbatch_custom_fwd(lightweight_state, bsw, pos_arg, seg_arg)[0]
@@ -208,6 +211,11 @@ def create_gradient_accumulation_scan(
     # Rematerialize the inner step to save activation memory
     _run_remat = jax.remat(_run, policy=model.get_pipeline_remat_policy())
     out, vjp_fun = jax.vjp(_run_remat, lightweight_state, bsw)
+    max_logging.log(
+        f"[PIPELINE-DIAG] L1 fwd: residual=vjp_fun, "
+        f"lightweight_state_leaves={len(jax.tree.leaves(lightweight_state))}, "
+        f"bsw_leaves={len(jax.tree.leaves(bsw))}"
+    )
     return out, vjp_fun
 
   def run_single_microbatch_custom_bwd(res, g_out):
@@ -233,6 +241,11 @@ def create_gradient_accumulation_scan(
         bsw,
     )
 
+    max_logging.log(
+        f"[PIPELINE-DIAG] L2 fwd: residual=scan_vjp_fun over {length}-step scan, "
+        f"loop_state_leaves={len(jax.tree.leaves(loop_state))}, "
+        f"bsw_leaves={len(jax.tree.leaves(bsw))}"
+    )
     return (final_lightweight, bsw), scan_vjp_fun
 
   def run_pipeline_microbatches_custom_bwd(residuals, g_final_state):
@@ -308,32 +321,29 @@ def create_pipeline_stage(
       return execute_pipeline_stage_pure_fwd(loop_state, w_curr, pipeline_weights)[0]
 
     def execute_pipeline_stage_pure_fwd(loop_state, w_curr, pipeline_weights):
-      # Prefetch FSDP-sharded weights for the upcoming pipeline repeat
       w_next = model.weight_prefetching(
           pipeline_weights,
           physical_partition_spec,
           loop_state["loop_iteration"],
       )
-      # Construct a buffered sliding window (BSW) of weights.
-      # w_curr: Weights actively used for the current microbatch steps.
-      # w_next: Newly gathered weights that will be carried forward as the new w_curr.
       bsw = (w_curr, w_next)
-      # Bind arguments to the weight prefetching function to prepare it for linear transpose
       p_weight_prefetching = functools.partial(
           model.weight_prefetching,
           physical_partition_spec=physical_partition_spec,
           loop_iteration=loop_state["loop_iteration"],
       )
-      # Since weight gathering (all-gather) is a linear operation, we can derive its dual
-      # (reduce-scatter) via jax.linear_transpose. This avoids redundant forward passes
       weight_prefetching_t = jax.linear_transpose(
           p_weight_prefetching,
           pipeline_weights,
       )
-      # Execute the forward pass of the microbatches and generate its VJP.
-      # The VJP captures necessary checkpoints to evaluate gradients later.
       (loop_state, _), scan_microbatches_vjp = jax.vjp(scan_microbatches_fn, loop_state, bsw, positions, segment_ids)
-      # Discard the old weights (w_curr) and advance w_next to act as the current weights in the next iteration
+      max_logging.log(
+          f"[PIPELINE-DIAG] L3 execute_pipeline_stage_pure_fwd: "
+          f"residuals=(scan_microbatches_vjp, weight_prefetching_t), "
+          f"w_curr_leaves={len(jax.tree.leaves(w_curr))}, "
+          f"pipeline_weights_leaves={len(jax.tree.leaves(pipeline_weights))}, "
+          f"w_next_leaves={len(jax.tree.leaves(w_next))}"
+      )
       return (loop_state, w_next), (scan_microbatches_vjp, weight_prefetching_t)
 
     def execute_pipeline_stage_pure_bwd(residuals, g_outputs):
@@ -380,6 +390,13 @@ def create_flax_pipeline_scan(pipeline_stage_fn, length, remat_policy, use_scan=
     A Flax scanned function that executes the full pipeline schedule.
   """
   unroll_length = 1 if use_scan else length
+  max_logging.log(
+      f"[PIPELINE-DIAG] create_flax_pipeline_scan: nn.scan(nn.remat(stage_fn)), "
+      f"length={length}, use_scan={use_scan}, unroll={unroll_length}, "
+      f"variable_broadcast=['_overwrite_with_gradient','non_trainable'], "
+      f"variable_axes={{summaries:0, aux_loss:0, intermediates:0, hyper_params:0}}, "
+      f"split_rngs={{random:True}}"
+  )
   return nn.scan(
       nn.remat(
           pipeline_stage_fn,

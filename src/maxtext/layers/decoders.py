@@ -310,6 +310,15 @@ class Decoder(nn.Module):
     if self.config.using_pipeline_parallelism:
       pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer)
       remat_policy = self.get_remat_policy()
+      max_logging.log(
+          f"[DECODER-DIAG] setup: creating native Linen pipeline, "
+          f"pipeline_class={'CircularPipeline' if self.config.pipeline_fsdp_ag_per_repeat else 'Pipeline'}, "
+          f"remat_policy={self.config.remat_policy}, "
+          f"pipeline_parallel_layers={self.config.pipeline_parallel_layers}, "
+          f"num_decoder_layers={self.config.num_decoder_layers}, "
+          f"scan_layers={self.config.scan_layers}, "
+          f"stage_pattern=get_pipeline_stage_module (Linen nn.Module)"
+      )
       self.pipeline_module = pipeline.create_pipeline(
           config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy
       )
@@ -812,6 +821,11 @@ class Decoder(nn.Module):
           self.pipeline_module.get_weight_sharding(y, decoder_segment_ids, decoder_positions, deterministic, model_mode)
           if cfg.pipeline_fsdp_ag_once or cfg.pipeline_fsdp_ag_per_repeat
           else None
+      )
+      max_logging.log(
+          f"[DECODER-DIAG] __call__: invoking pipeline, input y={y.shape}/{y.dtype}, "
+          f"pipeline_class={self.pipeline_module.__class__.__name__}, "
+          f"has_logical_partition_spec={logical_partition_spec is not None}"
       )
       if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
         assert len(RemattedBlockLayers) == 2, "Scanned layers must have a length of 2 using deepseek."

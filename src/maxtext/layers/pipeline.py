@@ -37,6 +37,34 @@ from maxtext.utils.sharding import (
     logical_to_mesh,
 )
 from maxtext.utils import pipeline_utils
+from maxtext.utils import max_logging
+
+
+def _log_pytree_summary(name, tree, prefix=""):
+  """Log shape/dtype summary of a pytree for memory diagnostics."""
+  leaves = jax.tree.leaves(tree)
+  num_leaves = len(leaves)
+  total_bytes = sum(getattr(l, "nbytes", 0) if hasattr(l, "shape") else 0 for l in leaves)
+  shapes = [f"{l.shape}/{l.dtype}" for l in leaves[:5] if hasattr(l, "shape")]
+  extra = f" ... +{num_leaves - 5} more" if num_leaves > 5 else ""
+  max_logging.log(
+      f"[PIPELINE-DIAG] {prefix}{name}: {num_leaves} leaves, {total_bytes / 1e9:.4f} GB, first5={shapes}{extra}"
+  )
+
+
+def _log_scan_carry(name, carry, prefix=""):
+  """Log scan carry structure for comparison."""
+  if isinstance(carry, tuple):
+    max_logging.log(f"[PIPELINE-DIAG] {prefix}{name}: tuple of {len(carry)} elements")
+    for i, elem in enumerate(carry):
+      _log_pytree_summary(f"{name}[{i}]", elem, prefix=prefix + "  ")
+  elif isinstance(carry, dict):
+    max_logging.log(f"[PIPELINE-DIAG] {prefix}{name}: dict with keys={list(carry.keys())}")
+    for k, v in carry.items():
+      if hasattr(v, "shape"):
+        max_logging.log(f"[PIPELINE-DIAG] {prefix}  {name}[{k}]: {v.shape}/{v.dtype}")
+  else:
+    _log_pytree_summary(name, carry, prefix=prefix)
 
 
 class PipelineBase(nn.Module):
@@ -55,6 +83,18 @@ class PipelineBase(nn.Module):
     microbatches_per_stage = self.config.num_pipeline_microbatches // self.num_stages
     self.microbatches_per_stage = microbatches_per_stage
     self.use_circ_storage = self.need_circ_storage()
+    max_logging.log(
+        f"[PIPELINE-DIAG] setup: class={self.__class__.__name__}, "
+        f"num_stages={self.num_stages}, microbatches_per_stage={microbatches_per_stage}, "
+        f"forwarding_delay={self.forwarding_delay}, use_circ_storage={self.use_circ_storage}, "
+        f"pipeline_microbatch_size={self.pipeline_microbatch_size}, "
+        f"scan_pipeline_iterations={self.config.scan_pipeline_iterations}, "
+        f"scan_pipeline_repeats={self.config.scan_pipeline_repeats}, "
+        f"set_remat_policy_on_pipeline_iterations={self.config.set_remat_policy_on_pipeline_iterations}, "
+        f"num_pipeline_repeats={self.config.num_pipeline_repeats}, "
+        f"num_pipeline_microbatches={self.config.num_pipeline_microbatches}, "
+        f"pipeline_fsdp_ag_per_repeat={self.config.pipeline_fsdp_ag_per_repeat}"
+    )
 
     self.batch_axis_name = "activation_batch"
     self.seq_len_axis_name = "activation_length"
@@ -258,6 +298,8 @@ class PipelineBase(nn.Module):
           },
       )
       return body_instance.apply(weights, stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode)
+
+    max_logging.log("[PIPELINE-DIAG] get_main_vmap_func (Linen): " "nn.vmap(body_instance.apply) returns ONLY fwd output")
 
     vmap_func = nn.vmap(
         func_to_vmap,
@@ -984,6 +1026,13 @@ class CircularPipeline(PipelineBase):
         "loop_iteration": 0,
         "prev_outputs": prev_outputs,
     }
+    max_logging.log(f"[PIPELINE-DIAG] init_states: state_io={state_io.shape}, shift={shift.shape}")
+    _log_pytree_summary("init_loop_state", init_loop_state, prefix="  ")
+    if bsw is not None:
+      _log_pytree_summary("bsw[0] (w_curr)", bsw[0], prefix="  ")
+      _log_pytree_summary("bsw[1] (w_next)", bsw[1], prefix="  ")
+    else:
+      max_logging.log("[PIPELINE-DIAG]   bsw=None (initializing)")
     return init_loop_state, bsw
 
   def gather_weights_across_stages_vmap(self, weights, repeat_ids, repeat_dim_in_weights, stages_dim_in_weights):
@@ -1251,12 +1300,7 @@ class CircularPipeline(PipelineBase):
     return self.from_repeat_weights_to_bsw(repeat_weights, physical_partition_spec)
 
   def run_one_iteration(self, loop_state, bsw, positions, segment_ids, deterministic, model_mode, logical_partition_spec):
-    """Executes the forward/backward logic for a single microbatch inside the pipeline.
-
-    This acts as the core step function that our `jax.lax.scan` wrappers call. It routes
-    the active BSW weights, sequences, and position IDs into the layer blocks, and then
-    advances the pipeline communication buffers via `advance_circular_buffers`.
-    """
+    """Executes the forward/backward logic for a single microbatch inside the pipeline."""
     state_io = loop_state["state_io"]
     shift = loop_state["shift"]
     circ_storage = loop_state["circ_storage"]
@@ -1280,11 +1324,20 @@ class CircularPipeline(PipelineBase):
         is_initializing=self.is_initializing(),
     )
 
+    max_logging.log(
+        f"[PIPELINE-DIAG] CircularPipeline.run_one_iteration: "
+        f"stages_inputs={stages_inputs.shape}, "
+        f"vmap_func={vmap_func.__class__.__name__ if hasattr(vmap_func, '__class__') else type(vmap_func).__name__}"
+    )
+    _log_pytree_summary("stage_weights (from BSW)", stage_weights, prefix="  ")
+
     stages_output = vmap_func(
         self.layers, stage_weights, stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode
     )
     if self.config.scan_layers:
       stages_output = stages_output[0]
+
+    max_logging.log(f"[PIPELINE-DIAG]   stages_output shape={stages_output.shape}")
 
     new_state = self.advance_circular_buffers(stages_output, loop_state)
     return new_state
@@ -1347,6 +1400,12 @@ class CircularPipeline(PipelineBase):
       )
 
     logical_partition_spec = pipeline_utils.strip_pipeline_repeat_logical_axis(logical_partition_spec)
+    max_logging.log(
+        f"[PIPELINE-DIAG] CircularPipeline.__call__: inputs={inputs.shape}, "
+        f"bubble_iterations={bubble_iterations}, "
+        f"num_repeats={self.config.num_pipeline_repeats}, "
+        f"num_microbatches={self.config.num_pipeline_microbatches}"
+    )
 
     def run_iteration_scannable(model, loop_state, bsw):
       return (
@@ -1363,13 +1422,17 @@ class CircularPipeline(PipelineBase):
       )
 
     if self.config.set_remat_policy_on_pipeline_iterations:
+      policy = self.get_pipeline_remat_policy()
+      max_logging.log(
+          f"[PIPELINE-DIAG] nn.remat applied to run_iteration_scannable, policy={policy}"
+      )
       run_iteration_scannable = nn.remat(
           run_iteration_scannable,
           prevent_cse=not self.config.scan_pipeline_iterations,
-          policy=self.get_pipeline_remat_policy(),
+          policy=policy,
       )
 
-    # base scannable function used twice for real and bubble runs
+    # L1+L2+L3 custom_vjp architecture via pipeline_utils
     base_scannable = functools.partial(
         pipeline_utils.create_pipeline_stage,
         deterministic=deterministic,
@@ -1395,7 +1458,50 @@ class CircularPipeline(PipelineBase):
         remat_policy=self.get_pipeline_remat_policy(),
         use_scan=self.config.scan_pipeline_repeats,
     )
+
+    # Carry structure: (loop_state, w_curr, pipeline_weights)
+    # - loop_state: dict with state_io, shift, circ_storage, loop_iteration, etc.
+    # - w_curr: BSW buffer[0] — gathered weights for current repeat (no repeat dim)
+    # - pipeline_weights: self.layers.variables — full FSDP-sharded params (with repeat dim)
     initial_carry_repeats = (loop_state, bsw[0], self.layers.variables)
+    max_logging.log("[PIPELINE-DIAG] === OUTER SCAN CARRY STRUCTURE (Linen) ===")
+    max_logging.log("[PIPELINE-DIAG] carry = (loop_state, w_curr, pipeline_weights)")
+    max_logging.log(f"[PIPELINE-DIAG] carry has {len(initial_carry_repeats)} elements")
+    _log_scan_carry("loop_state", loop_state, prefix="  ")
+    _log_pytree_summary("w_curr (bsw[0])", bsw[0], prefix="  ")
+    _log_pytree_summary("pipeline_weights (self.layers.variables)", self.layers.variables, prefix="  ")
+    # C-1 gap: total carry leaf count
+    total_carry_leaves = len(jax.tree.leaves(initial_carry_repeats))
+    total_carry_bytes = sum(
+        getattr(l, "nbytes", 0) for l in jax.tree.leaves(initial_carry_repeats) if hasattr(l, "shape")
+    )
+    max_logging.log(
+        f"[PIPELINE-DIAG] TOTAL carry leaves: {total_carry_leaves}, "
+        f"TOTAL carry GB: {total_carry_bytes / 1e9:.4f}"
+    )
+    # C-1 gap: Linen variable_broadcast is NOT in carry — handled by nn.scan
+    max_logging.log(
+        "[PIPELINE-DIAG] Linen variable_broadcast (NOT in carry, shared via nn.scan closure): "
+        "['_overwrite_with_gradient','non_trainable']"
+    )
+    max_logging.log(
+        "[PIPELINE-DIAG] Linen variable_axes (stacked per iteration): "
+        "{summaries:0, aux_loss:0, intermediates:0, hyper_params:0}"
+    )
+    max_logging.log(
+        "[PIPELINE-DIAG] Linen split_rngs: {random:True}"
+    )
+    max_logging.log(
+        "[PIPELINE-DIAG] Linen custom_vjp: L1=per-MB remat+vjp, "
+        "L2=gradient accumulation scan, "
+        "L3=weight_prefetching+linear_transpose"
+    )
+    # C-3 gap: scatter-update flag
+    max_logging.log(
+        "[PIPELINE-DIAG] scatter_update_non_params: False "
+        "(nn.scan handles via variable_axes auto-stacking)"
+    )
+
     (loop_state, w_curr, pipeline_weights), _ = run_repeats_scanned(self, initial_carry_repeats)
     initial_carry_bubbles = (loop_state, w_curr, pipeline_weights)
     (loop_state, _, pipeline_weights), _ = run_bubbles_scanned(self, initial_carry_bubbles)
@@ -1406,6 +1512,7 @@ class CircularPipeline(PipelineBase):
         (self.config.micro_batch_size_to_train_on, self.config.max_target_length, self.config.emb_dim),
         out_sharding=self.output_sharding,
     )
+    max_logging.log(f"[PIPELINE-DIAG] CircularPipeline.__call__ complete: output={final_output.shape}")
     return final_output
 
 
@@ -1413,6 +1520,11 @@ def create_pipeline(config: Config, layers: nn.Module, mesh: Mesh, remat_policy:
   """Factory function to instantiate the correct Pipeline module based on config."""
 
   if config.pipeline_fsdp_ag_per_repeat:
-    return CircularPipeline(config=config, layers=layers, mesh=mesh, remat_policy=remat_policy)
-
-  return Pipeline(config=config, layers=layers, mesh=mesh, remat_policy=remat_policy)
+    cls = CircularPipeline
+  else:
+    cls = Pipeline
+  max_logging.log(
+      f"[PIPELINE-DIAG] create_pipeline: class={cls.__name__} (native Linen), "
+      f"stage_module={type(layers).__name__}"
+  )
+  return cls(config=config, layers=layers, mesh=mesh, remat_policy=remat_policy)
