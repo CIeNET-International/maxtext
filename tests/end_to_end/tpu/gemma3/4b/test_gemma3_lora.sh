@@ -59,12 +59,14 @@ python3 -m maxtext.trainers.post_train.sft.train_sft \
 
 # Step 4: Run inference on the checkpoint generated from the previous run
 python3 -m maxtext.inference.vllm_decode \
-    src/maxtext/configs/base.yml \
     --use_tunix=True \
     model_name=${MODEL_NAME} \
     tokenizer_path='google/gemma-3-4b-it' \
-    model='gemma3-4b' \
-    load_parameters_path=${BASE_OUTPUT_DIRECTORY}/sft/${run_id}/checkpoints/5/model_params \
+    load_parameters_path=${UNSCANNED_CKPT_PATH} \
+    lora.enable_lora=True \
+    lora.lora_restore_path=${BASE_OUTPUT_DIRECTORY}/lora/${run_id}/checkpoints/5/model_params \
+    lora.lora_rank=16 \
+    lora.lora_alpha=32.0 \
     vllm_hf_overrides='{architectures: ["MaxTextForCausalLM"]}' \
     hbm_utilization_vllm=0.5 \
     prompt="Suggest some famous landmarks in London." \
@@ -79,5 +81,6 @@ python3 -m maxtext.inference.vllm_decode \
 python3 -m maxtext.checkpoint_conversion.to_huggingface \
     model_name=${MODEL_NAME} \
     load_parameters_path=${BASE_OUTPUT_DIRECTORY}/sft/${run_id}/checkpoints/5/model_params \
+    lora.lora_restore_path=${BASE_OUTPUT_DIRECTORY}/lora/${run_id}/checkpoints/5/model_params \
     base_output_directory=${BASE_OUTPUT_DIRECTORY}/to_huggingface/unscanned/${run_id} \
     use_multimodal=false scan_layers=true
