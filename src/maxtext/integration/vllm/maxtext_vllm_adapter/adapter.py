@@ -327,6 +327,5 @@ class MaxTextForCausalLM(nnx.Module):
       if self.maxtext_config.lora.enable_lora:
         model = lora_utils.apply_lora_to_model(model, self.mesh, self.maxtext_config)
         if self.maxtext_config.lora.lora_restore_path:
-          mock_trainer = type("MockTrainer", (), {"model": model, "train_steps": 0})
-          lora_utils.restore_lora_from_path(mock_trainer, self.maxtext_config)
+          lora_utils.restore_lora_from_path(model, self.maxtext_config)
       self.model = nnx.data(model)

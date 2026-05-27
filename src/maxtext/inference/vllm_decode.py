@@ -99,13 +99,15 @@ def decode_with_vllm(config: Config) -> None:
   }
 
   if config.lora.enable_lora:
-    vllm_args["additional_config"]["maxtext_config"].update({
-        "lora.enable_lora": config.lora.enable_lora,
-        "lora.lora_restore_path": config.lora.lora_restore_path,
-        "lora.lora_rank": config.lora.lora_rank,
-        "lora.lora_alpha": config.lora.lora_alpha,
-        "lora.lora_module_path": config.lora.lora_module_path,
-    })
+    vllm_args["additional_config"]["maxtext_config"].update(
+        {
+            "lora.enable_lora": config.lora.enable_lora,
+            "lora.lora_restore_path": config.lora.lora_restore_path,
+            "lora.lora_rank": config.lora.lora_rank,
+            "lora.lora_alpha": config.lora.lora_alpha,
+            "lora.lora_module_path": config.lora.lora_module_path,
+        }
+    )
 
   if config.load_parameters_path:
     vllm_args["additional_config"]["maxtext_config"]["load_parameters_path"] = config.load_parameters_path
@@ -225,18 +227,18 @@ def decode_with_tunix(
       max_tokens_to_generate=max_tokens_to_generate,
       max_prompt_length=max_prompt_length,
       rollout_vllm_model_version=config.tokenizer_path,
-      rollout_vllm_hbm_utilization=config.hbm_utilization_vllm, 
+      rollout_vllm_hbm_utilization=config.hbm_utilization_vllm,
       rollout_vllm_init_with_random_weights=True,
       rollout_vllm_tpu_backend_type="jax",
-      rollout_vllm_hf_config_path=config.model if hasattr(config, 'model') else None
-  ) 
+      rollout_vllm_hf_config_path=config.model if hasattr(config, "model") else None,
+  )
 
   vllm_rollout = VllmRollout(
       model=tunix_model,
       tokenizer=tokenizer,
       cache_config_or_size=max_prompt_length + max_tokens_to_generate + 256,
       mesh=mesh,
-      rollout_config=r_config
+      rollout_config=r_config,
   )
 
   # Generate text
@@ -252,7 +254,7 @@ def main(argv: Sequence[str]) -> None:
     os.environ["LIBTPU_INIT_ARGS"] = (
         os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"
     )
-  
+
   remaining_argv = FLAGS(argv, known_only=True)
   config = pyconfig.initialize(argv)
 
@@ -261,8 +263,7 @@ def main(argv: Sequence[str]) -> None:
     if config.lora.enable_lora:
       maxtext_model = lora_utils.apply_lora_to_model(maxtext_model, mesh, config)
       if config.lora.lora_restore_path:
-        mock_trainer = type("MockTrainer", (), {"model": maxtext_model, "train_steps": 0})
-        lora_utils.restore_lora_from_path(mock_trainer, config)
+        lora_utils.restore_lora_from_path(maxtext_model, config)
     decode_with_tunix(config, model=maxtext_model, mesh=mesh)
   else:
     decode_with_vllm(config)

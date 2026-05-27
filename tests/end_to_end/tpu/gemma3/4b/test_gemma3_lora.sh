@@ -1,18 +1,18 @@
 #!/bin/bash
 
-# Validates the Gemma3-4B SFT pipeline using a pre-converted MaxText checkpoint.
+# Validates the Gemma3-4B LoRA pipeline using a pre-converted MaxText checkpoint.
 
 # The flow of this script is as follows:
 # 1. Run inference on the pre-converted checkpoint.
-# 2. Run SFT starting from the pre-converted checkpoint.
-# 3. Run inference on the checkpoint produced by the SFT run.
-# 4. Convert the checkpoint produced by the SFT run back to HuggingFace format.
+# 2. Run LoRA starting from the pre-converted checkpoint.
+# 3. Run inference on the checkpoint produced by the LoRA run.
+# 4. Convert the checkpoint produced by the LoRA run back to HuggingFace format.
 
 # Usage:
 # export HF_TOKEN=<your Hugging Face access token>
 # export RUN_ID=$(date +%Y-%m-%d-%H-%M)
 # bash test_gemma3_to_mt.sh $RUN_ID
-# bash test_gemma3_sft.sh $RUN_ID
+# bash test_gemma3_lora.sh $RUN_ID
 
 
 set -ex
@@ -39,7 +39,7 @@ python3 -m maxtext.inference.vllm_decode \
 
 # Step 3: Run LoRA on the converted checkpoint
 python3 -m maxtext.trainers.post_train.sft.train_sft \
-    base_output_directory=${BASE_OUTPUT_DIRECTORY}/sft \
+    base_output_directory=${BASE_OUTPUT_DIRECTORY}/lora \
     load_parameters_path=${SCANNED_CKPT_PATH} \
     per_device_batch_size=1 run_name=${run_id} \
     steps=5 scan_layers=true \
@@ -54,6 +54,8 @@ python3 -m maxtext.trainers.post_train.sft.train_sft \
     lora.enable_lora=True \
     lora.lora_rank=16 \
     lora.lora_alpha=32.0 \
+    enable_nnx=True \
+    pure_nnx_decoder=True \
     enable_single_controller=True \
     checkpoint_storage_use_zarr3=False checkpoint_storage_use_ocdbt=False
 
@@ -61,8 +63,7 @@ python3 -m maxtext.trainers.post_train.sft.train_sft \
 python3 -m maxtext.inference.vllm_decode \
     --use_tunix=True \
     model_name=${MODEL_NAME} \
-    tokenizer_path='google/gemma-3-4b-it' \
-    load_parameters_path=${UNSCANNED_CKPT_PATH} \
+    load_parameters_path=${SCANNED_CKPT_PATH} \
     lora.enable_lora=True \
     lora.lora_restore_path=${BASE_OUTPUT_DIRECTORY}/lora/${run_id}/checkpoints/5/model_params \
     lora.lora_rank=16 \
@@ -73,14 +74,12 @@ python3 -m maxtext.inference.vllm_decode \
     use_chat_template=True \
     enable_nnx=True \
     pure_nnx_decoder=True \
-    scan_layers=True \
-    dtype=bfloat16 \
-    weight_dtype=bfloat16
+    scan_layers=True
 
 # Step 5: Convert the checkpoint from MaxText format to Hugging Face format
 python3 -m maxtext.checkpoint_conversion.to_huggingface \
     model_name=${MODEL_NAME} \
-    load_parameters_path=${BASE_OUTPUT_DIRECTORY}/sft/${run_id}/checkpoints/5/model_params \
+    load_parameters_path=${SCANNED_CKPT_PATH} \
     lora.lora_restore_path=${BASE_OUTPUT_DIRECTORY}/lora/${run_id}/checkpoints/5/model_params \
     base_output_directory=${BASE_OUTPUT_DIRECTORY}/to_huggingface/unscanned/${run_id} \
-    use_multimodal=false scan_layers=true
+    scan_layers=true
