@@ -223,6 +223,14 @@ def decode_with_tunix(
     )
 
   # Create vLLM rollout for inference
+  rollout_vllm_lora_config = None
+  if config.lora.enable_lora:
+    rollout_vllm_lora_config = {
+        "module_path": lora_utils._get_lora_module_path(config),
+        "rank": config.lora.lora_rank,
+        "alpha": config.lora.lora_alpha,
+    }
+
   r_config = RolloutConfig(
       max_tokens_to_generate=max_tokens_to_generate,
       max_prompt_length=max_prompt_length,
@@ -231,6 +239,10 @@ def decode_with_tunix(
       rollout_vllm_init_with_random_weights=True,
       rollout_vllm_tpu_backend_type="jax",
       rollout_vllm_hf_config_path=config.model if hasattr(config, "model") else None,
+      rollout_vllm_lora_config=rollout_vllm_lora_config,
+      rollout_vllm_kwargs={
+          "hf_overrides": config.vllm_hf_overrides,
+      } if hasattr(config, "vllm_hf_overrides") and config.vllm_hf_overrides else {},
   )
 
   vllm_rollout = VllmRollout(

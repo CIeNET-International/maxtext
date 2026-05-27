@@ -18,6 +18,9 @@ run_id=${1:-$(date +%Y-%m-%d-%H-%M)}
 MODEL_NAME='gemma3-4b'
 HF_GOLDEN_MODEL='google/gemma-3-4b-it'
 
+# Activate virtual environment
+source /home/jackyf_google_com/5-4-qlora/bin/activate
+
 # To convert the multimodal model, make sure the use_multimodal is set to be true
 USE_MULTIMODAL=false
 

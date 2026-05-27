@@ -20,6 +20,9 @@ set -ex
 run_id=${1:-$(date +%Y-%m-%d-%H-%M)}
 MODEL_NAME='gemma3-4b'
 
+# Activate virtual environment
+source /home/jackyf_google_com/5-4-qlora/bin/activate
+
 # Non-Googlers please remember to point `BASE_OUTPUT_DIRECTORY` to the GCS paths where you have the scanned and unscanned checkpoints stored
 BASE_OUTPUT_DIRECTORY=gs://runner-maxtext-logs/${MODEL_NAME}
 UNSCANNED_CKPT_PATH=${BASE_OUTPUT_DIRECTORY}/to_maxtext/unscanned/${run_id}/0/items
@@ -33,7 +36,7 @@ python3 -m maxtext.inference.vllm_decode \
     model_name=${MODEL_NAME} \
     load_parameters_path=${UNSCANNED_CKPT_PATH} \
     vllm_hf_overrides='{architectures: ["MaxTextForCausalLM"]}' \
-    hbm_utilization_vllm=0.5 \
+    hbm_utilization_vllm=0.2 \
     prompt="Suggest some famous landmarks in London." \
     use_chat_template=True scan_layers=false
 
@@ -47,7 +50,7 @@ python3 -m maxtext.trainers.post_train.sft.train_sft \
     hf_path=openai/gsm8k \
     train_split=train \
     hf_data_dir=main \
-    train_data_column=['question','answer'] \
+    train_data_columns=['question','answer'] \
     max_target_length=1024 \
     learning_rate=3e-6 \
     chat_template_path=maxtext/examples/chat_templates/math_qa.json \
@@ -59,6 +62,7 @@ python3 -m maxtext.trainers.post_train.sft.train_sft \
     enable_single_controller=True \
     checkpoint_storage_use_zarr3=False checkpoint_storage_use_ocdbt=False
 
+
 # Step 4: Run inference on the checkpoint generated from the previous run
 python3 -m maxtext.inference.vllm_decode \
     --use_tunix=True \
@@ -69,7 +73,7 @@ python3 -m maxtext.inference.vllm_decode \
     lora.lora_rank=16 \
     lora.lora_alpha=32.0 \
     vllm_hf_overrides='{architectures: ["MaxTextForCausalLM"]}' \
-    hbm_utilization_vllm=0.5 \
+    hbm_utilization_vllm=0.2 \
     prompt="Suggest some famous landmarks in London." \
     use_chat_template=True \
     enable_nnx=True \
