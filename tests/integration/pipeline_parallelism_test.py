@@ -14,7 +14,9 @@
 
 """Tests for pipeline parallelism."""
 
+import contextlib
 import functools
+import os
 import os.path
 import sys
 import unittest
@@ -52,6 +54,19 @@ def _adapt_parallelism(args, pipeline_stages=4):
       args.append(f"ici_data_parallelism={data_par}")
 
 
+@contextlib.contextmanager
+def _temporary_env(name, value):
+  old_value = os.environ.get(name)
+  os.environ[name] = value
+  try:
+    yield
+  finally:
+    if old_value is None:
+      os.environ.pop(name, None)
+    else:
+      os.environ[name] = old_value
+
+
 def assert_same_output_and_grad(f1, f2, *inputs):
   """check that the output and gradient are the same"""
   f1_value, f1_grad = jax.value_and_grad(f1)(*inputs)
@@ -68,8 +83,8 @@ def assert_same_output_and_grad(f1, f2, *inputs):
   g_diff = jnp.abs(f1_grad - f2_grad)
   v_diff = jnp.abs(f1_value - f2_value)
 
-  value_close = bool(jax.numpy.allclose(f1_value, f2_value, rtol=1e-2, atol=1e-1, equal_nan=False))
-  grad_close = bool(jax.numpy.allclose(f1_grad, f2_grad, rtol=1e-1, atol=1.0, equal_nan=False))
+  value_close = bool(jax.numpy.allclose(f1_value, f2_value, rtol=1e-2, atol=1e-2, equal_nan=False))
+  grad_close = bool(jax.numpy.allclose(f1_grad, f2_grad, rtol=1e-1, atol=2e-1, equal_nan=False))
   assert value_close, f"value mismatch: f1={float(f1_value)} vs f2={float(f2_value)}, " f"abs_diff={float(v_diff)}"
   assert grad_close, (
       f"grad mismatch: abs_diff_max={float(g_diff.max())}, "
@@ -80,14 +95,13 @@ def assert_same_output_and_grad(f1, f2, *inputs):
       f"tolerance=rtol=1e-1+atol=1.0"
   )
 
-
 @pytest.mark.integration_test
 class PipelineParallelismTest(unittest.TestCase):
   decoupled = is_decoupled()
   base_output_directory = get_test_base_output_directory()
   dataset_path = get_test_dataset_path()
 
-  def assert_pipeline_same_output_and_grad(self, config, single_pipeline_stage_class=None):
+  def assert_pipeline_matches_sequential_output_and_grad(self, config, single_pipeline_stage_class=None):
     """check that the output and gradient are the same"""
     devices_array = maxtext_utils.create_device_mesh(config)
     mesh = Mesh(devices_array, config.mesh_axes)
@@ -225,6 +239,27 @@ class PipelineParallelismTest(unittest.TestCase):
         dummy_targets,
     )
 
+  def assert_pipeline_same_output_and_grad(self, config, single_pipeline_stage_class=None):
+    self.assert_pipeline_matches_sequential_output_and_grad(config, single_pipeline_stage_class)
+
+  def _assert_circular_pipeline_ag_per_repeat_core(self, core):
+    # 2 stages, 8 microbatches, enable pipeline ag per repeat.
+    with _temporary_env("MAXTEXT_CIRCULAR_PIPELINE_CORE", core):
+      config = pyconfig.initialize(
+          [sys.argv[0], get_test_config_path()],
+          enable_checkpointing=False,
+          enable_goodput_recording=False,
+          run_name=f"circular_ag_per_repeat_{core}",
+          max_target_length=128,
+          base_emb_dim=28,
+          ici_pipeline_parallelism=2,
+          base_num_decoder_layers=8,
+          num_pipeline_microbatches=8,
+          per_device_batch_size=4,
+          pipeline_fsdp_ag_per_repeat=True,
+      )
+      self.assert_pipeline_matches_sequential_output_and_grad(config)
+
   @pytest.mark.tpu_only
   def test_circular_minimum_microbatches_same_output_and_grad(self):
     # 4 stages, 8 layers (2 repeats, 1 layer per stage), 4 microbatches
@@ -240,7 +275,7 @@ class PipelineParallelismTest(unittest.TestCase):
         num_pipeline_microbatches=4,
         per_device_batch_size=4,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
   @pytest.mark.tpu_only
   def test_circular_extra_microbatches_same_output_and_grad(self):
@@ -257,7 +292,7 @@ class PipelineParallelismTest(unittest.TestCase):
         num_pipeline_microbatches=8,
         per_device_batch_size=4,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
   @pytest.mark.tpu_only
   def test_circular_deepseek_megablox_same_output_and_grad(self):
@@ -291,7 +326,9 @@ class PipelineParallelismTest(unittest.TestCase):
         attention_type="mla",
         shared_experts=1,
     )
-    self.assert_pipeline_same_output_and_grad(config, single_pipeline_stage_class=deepseek.DeepSeekMoELayerToLinen)
+    self.assert_pipeline_matches_sequential_output_and_grad(
+        config, single_pipeline_stage_class=deepseek.DeepSeekMoELayerToLinen
+    )
 
   @pytest.mark.tpu_only
   def test_circular_ag_once(self):
@@ -309,25 +346,15 @@ class PipelineParallelismTest(unittest.TestCase):
         per_device_batch_size=4,
         pipeline_fsdp_ag_once=True,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
   @pytest.mark.tpu_only
   def test_circular_pipeline_ag_per_repeat(self):
-    # 2 stages, 8 microbatches, enable pipeline ag per repeat
-    config = pyconfig.initialize(
-        [sys.argv[0], get_test_config_path()],
-        enable_checkpointing=False,
-        enable_goodput_recording=False,
-        run_name="circular_ag_per_repeat",
-        max_target_length=128,
-        base_emb_dim=28,
-        ici_pipeline_parallelism=2,
-        base_num_decoder_layers=8,
-        num_pipeline_microbatches=8,
-        per_device_batch_size=4,
-        pipeline_fsdp_ag_per_repeat=True,
-    )
-    self.assert_pipeline_same_output_and_grad(config)
+    self._assert_circular_pipeline_ag_per_repeat_core("nnx_scan")
+
+  @pytest.mark.tpu_only
+  def test_circular_pipeline_ag_per_repeat_jax_state_core(self):
+    self._assert_circular_pipeline_ag_per_repeat_core("jax_state")
 
   @pytest.mark.tpu_only
   def test_non_circular_same_output_and_grad(self):
@@ -343,7 +370,7 @@ class PipelineParallelismTest(unittest.TestCase):
         num_pipeline_microbatches=4,
         per_device_batch_size=4,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
@@ -426,7 +453,7 @@ class PipelineParallelismTest(unittest.TestCase):
         per_device_batch_size=4,
         pipeline_delay_activation_forwarding=True,
     )
-    self.assert_pipeline_same_output_and_grad(config)
+    self.assert_pipeline_matches_sequential_output_and_grad(config)
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only

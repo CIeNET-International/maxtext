@@ -702,7 +702,7 @@ class NNXDecoder(nnx.Module):
 
     # Linen FP8 ops keep amax_history in mutable Linen scope; jax.checkpoint
     # re-traces and hits UnexpectedTracerError. Skip remat for FP8.
-    uses_linen_fp8_mutable_state = self.config.quantization in ("fp8_nanoo", "fp8_gpu")
+    uses_linen_fp8_mutable_state = self.config.quantization in ("fp8", "nanoo_fp8", "fp8_nanoo", "fp8_gpu")
     if uses_linen_fp8_mutable_state:
       out, new_state = pure_layer_fn(state, y)
     else:
@@ -713,7 +713,7 @@ class NNXDecoder(nnx.Module):
     return out
 
   def _apply_layers_sequentially(self, layers, x_in, *args, length: int, kv_caches_stacked=None, **kwargs):
-    """Runs the layer stack using nnx.scan.
+    """Runs the layer stack using an explicit JAX scan over NNX state.
 
     Args:
       layers: The stacked NNX module whose params are scanned over.
@@ -831,7 +831,7 @@ class NNXDecoder(nnx.Module):
       # Linen FP8 ops keep amax_history in mutable Linen scope; jax.lax.scan
       # leaks the tracer and hits UnexpectedTracerError. Use a Python for-loop
       # for FP8 instead.
-      uses_linen_fp8_mutable_state = self.config.quantization in ("fp8_nanoo", "fp8_gpu")
+      uses_linen_fp8_mutable_state = self.config.quantization in ("fp8", "nanoo_fp8", "fp8_nanoo", "fp8_gpu")
       if uses_linen_fp8_mutable_state:
         carry = x_in
         per_layer_states = []

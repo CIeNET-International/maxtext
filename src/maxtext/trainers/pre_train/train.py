@@ -135,6 +135,14 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         model_vars["batch_stats"] = sparsity_state
     else:
       model_vars = params
+    param_leaves = jax.tree.leaves(model_vars)
+    param_bytes = sum(getattr(l, "nbytes", 0) for l in param_leaves if hasattr(l, "shape"))
+    max_logging.log(
+        f"[MEM-TRACE] loss_fn: model.apply, "
+        f"param_leaves={len(param_leaves)}, "
+        f"param_GB={param_bytes / 1e9:.3f}, "
+        f"input_shape={data['inputs'].shape}"
+    )
     logits, intermediate_outputs = model.apply(
         model_vars,
         data["inputs"],
@@ -674,6 +682,7 @@ def train_loop(config, recorder, state=None):
       compiled = p_train_step.lower(*lower_args).compile(compiler_options=compiler_options)
       compiled_stats = compiled.memory_analysis()
       max_utils.print_compiled_memory_stats(compiled_stats)
+      max_utils.print_mem_stats("[MEM-TRACE] after compile")
 
   start_step = get_first_step(model, state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)

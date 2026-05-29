@@ -25,6 +25,9 @@ import jax.ad_checkpoint
 
 from aqt.jax.v2 import aqt_tensor
 from flax import linen as nn
+from flax.core import meta
+from flax import linen as nn
+from flax.linen.spmd import LogicallyPartitioned
 from flax import nnx
 from maxtext.layers import initializers
 from maxtext.layers.nnx_wrappers import is_linen_initializing, to_linen_class
@@ -619,10 +622,10 @@ class NNXPipelineBase(nnx.Module):
     # spmd_axis_name is handled manually: in EXPLICIT mode, sharding is applied
     # by with_sharding_constraint calls in the pipeline. In AUTO mode, we apply
     # the axis name via jax.vmap's spmd_axis_name if available (JAX 0.4.31+).
-    vmap_kwargs = {
-        "in_axes": (None, 0, 0, 0, 0, None, None),
-        "out_axes": (0, 0),
-    }
+    vmap_kwargs = dict(
+        in_axes=(None, 0, 0, 0, 0, None, None),
+        out_axes=(0, 0),
+    )
     if self.spmd_axis_name is not None:
       vmap_kwargs["spmd_axis_name"] = self.spmd_axis_name
     return jax.vmap(func_to_vmap, **vmap_kwargs)

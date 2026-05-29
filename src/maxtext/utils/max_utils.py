@@ -764,11 +764,16 @@ def summarize_pytree_data(params, name="Params", raw=False):
 def print_mem_stats(label: str):
   max_logging.log(f"\nMemstats: {label}:")
   try:
-    for d in jax.local_devices():
+    for d in jax.local_devices()[:1]:
       stats = d.memory_stats()
       used = round(stats["bytes_in_use"] / 2**30, 2)
       limit = round(stats["bytes_limit"] / 2**30, 2)
-      max_logging.log(f"\tUsing (GB) {used} / {limit} ({used/limit:%}) on {d}")
+      peak = round(stats.get("peak_bytes_in_use", 0) / 2**30, 2)
+      num_allocs = stats.get("num_allocs", "N/A")
+      max_logging.log(
+          f"\t{d}: used={used} GB, peak={peak} GB, limit={limit} GB "
+          f"({used/limit:%}), num_allocs={num_allocs}"
+      )
   except (RuntimeError, KeyError, TypeError) as ex:
     max_logging.log(f"\tMemstats unavailable, error: {ex}")
 
@@ -806,6 +811,13 @@ def print_compiled_memory_stats(compiled_stats):
   max_logging.log(
       f"Total memory size: {total_gb:.1f} GB, Output size: {output_gb:.1f} GB, Temp size: {temp_gb:.1f} GB, "
       f"Argument size: {argument_gb:.1f} GB, Host temp size: {host_temp_gb:.1f} GB."
+  )
+  max_logging.log(
+      f"[MEM-DETAIL] alias={alias_gb:.3f} GB, "
+      f"output_bytes={compiled_stats.output_size_in_bytes}, "
+      f"temp_bytes={compiled_stats.temp_size_in_bytes}, "
+      f"arg_bytes={compiled_stats.argument_size_in_bytes}, "
+      f"alias_bytes={compiled_stats.alias_size_in_bytes}"
   )
 
 

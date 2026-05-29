@@ -169,10 +169,14 @@ def current_linen_module() -> linen.Module | None:
 
 
 def is_linen_initializing() -> bool:
-  """Returns True if currently inside a Linen ``init()`` call.
+  """Check if the current execution context is inside a Linen init() call.
 
-  Used by NNX pipeline modules to short-circuit the scan during init,
-  where only the output shape/dtype is needed.
+  Returns True when called from within a ``to_linen_class`` wrapper's
+  ``init()`` path. Uses :func:`current_linen_module` to access the Linen
+  module stack (private API already used by this module).
+
+  This is used by NNX pipeline modules to short-circuit the full scan
+  during Linen init, where only the output shape/dtype is needed.
   """
   module = current_linen_module()
   if module is not None and hasattr(module, "is_initializing") and callable(module.is_initializing):
@@ -242,6 +246,15 @@ class ToNNX(Module):
     """A shortcut of calling `nnx.bridge.lazy_init()` upon this module."""
     return lazy_init(self, *args, **kwargs)
 
+  def to_linen_variables(self) -> dict[str, Any]:
+    """Return this wrapped module's state as Linen-style variables."""
+    nnx_attrs = {
+        k: v
+        for k, v in vars(self).items()
+        if not k.startswith("to_nnx__") and not k.startswith("_pytree__") and not k.startswith("_object__")
+    }
+    return nnx_attrs_to_linen_vars(nnx_attrs)
+
   def __getattr__(self, name: str):
     if hasattr(super(), name):
       return super().__getattribute__(name)
@@ -275,12 +288,7 @@ class ToNNX(Module):
     if self._pytree__state.initializing:
       out, updates = self.to_nnx__module.init_with_output(_rngs, *args, method=method, **kwargs)
     else:
-      nnx_attrs = {
-          k: v
-          for k, v in vars(self).items()
-          if not k.startswith("to_nnx__") and not k.startswith("_pytree__") and not k.startswith("_object__")
-      }
-      variables = nnx_attrs_to_linen_vars(nnx_attrs)
+      variables = self.to_linen_variables()
 
       # Get `mutable` from top level bridge.Module context if any
       if mutable is not None:

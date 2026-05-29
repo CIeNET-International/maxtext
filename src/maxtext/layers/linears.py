@@ -78,6 +78,17 @@ def _compute_dot_general(inputs, kernel, kernel_axes, axis, contract_ind, matmul
   return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision)
 
 
+def _quant_dot_general_mutable_collections(quant_dot_general: nnx_wrappers.ToNNX | None) -> list[str]:
+  """Return Linen mutable collections required by a wrapped quantized dot op."""
+  if quant_dot_general is None:
+    return ["aqt"]
+  variables = quant_dot_general.to_linen_variables()
+  mutable = ["aqt"]
+  if "_overwrite_with_gradient" in variables:
+    mutable.append("_overwrite_with_gradient")
+  return mutable
+
+
 def _compute_dot_general_nnx(
     inputs,
     kernel,
@@ -94,7 +105,13 @@ def _compute_dot_general_nnx(
   if quant_dot_general is not None:
     if initializing:
       quant_dot_general.lazy_init(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
-    return quant_dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None, mutable=["aqt"])
+    return quant_dot_general(
+        inputs,
+        kernel,
+        ((axis, contract_ind), ((), ())),
+        precision=None,
+        mutable=_quant_dot_general_mutable_collections(quant_dot_general),
+    )
 
   return dot_general(
       inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision, out_sharding=out_sharding

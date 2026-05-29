@@ -39,6 +39,14 @@ import pytest
 
 _QUERY_REGEX = ".*/query"
 _VALUE_REGEX = ".*/value"
+_FP8_OVERWRITE_WITH_GRADIENT_KEYS = {
+    "input_amax_history",
+    "input_scale",
+    "kernel_amax_history",
+    "kernel_scale",
+    "output_grad_amax_history",
+    "output_grad_scale",
+}
 
 
 class QuantTestModule(nnx.Module):
@@ -127,8 +135,41 @@ def _apply(quant_str=""):
   return inputs, res_einsum, res_dg
 
 
+def _to_linen_variables(to_nnx_module):
+  """Exports a ToNNX module's state through the existing bridge conversion helper.
+
+  Local ToNNX has no public state export method, so these tests intentionally
+  mirror ToNNX.__call__'s own conversion path instead of changing wrapper code.
+  """
+  nnx_attrs = {
+      k: v
+      for k, v in vars(to_nnx_module).items()
+      if not k.startswith("to_nnx__") and not k.startswith("_pytree__") and not k.startswith("_object__")
+  }
+  return nnx_wrappers.nnx_attrs_to_linen_vars(nnx_attrs)
+
+
+def _linen_variable_value(variable):
+  return variable.value if hasattr(variable, "value") else variable
+
+
 class QuantizationTest(unittest.TestCase):
   """Tests for quantization."""
+
+  def _assert_overwrite_with_gradient_leaves_survive(self, variables_before, variables_after):
+    self.assertIn("_overwrite_with_gradient", variables_before)
+    self.assertIn("_overwrite_with_gradient", variables_after)
+
+    leaves_before = variables_before["_overwrite_with_gradient"]
+    leaves_after = variables_after["_overwrite_with_gradient"]
+    self.assertEqual(set(leaves_before.keys()), _FP8_OVERWRITE_WITH_GRADIENT_KEYS)
+    self.assertEqual(set(leaves_after.keys()), _FP8_OVERWRITE_WITH_GRADIENT_KEYS)
+
+    for key in _FP8_OVERWRITE_WITH_GRADIENT_KEYS:
+      value_before = _linen_variable_value(leaves_before[key])
+      value_after = _linen_variable_value(leaves_after[key])
+      self.assertEqual(value_before.shape, value_after.shape)
+      self.assertEqual(value_before.dtype, value_after.dtype)
 
   def test_in_quant_mode(self):
     quant = _configure_quantization(quant_str="int8", mode_str="convert")
@@ -153,6 +194,77 @@ class QuantizationTest(unittest.TestCase):
     for quant_mode in ["train", "serve", "convert"]:
       quant = _configure_quantization(quant_str="int8", mode_str=quant_mode)
       self.assertNotEqual(quant, None)
+
+  def test_direct_fp8_dot_general_nnx_updates_overwrite_with_gradient(self):
+    quant = _configure_quantization(quant_str="fp8")
+    dot_general_linen = quant.dot_general_cls()()
+    dot_general_nnx = nnx_wrappers.ToNNX(dot_general_linen, rngs=nnx.Rngs(params=0))
+
+    lhs = jnp.ones((2, 4), dtype=jnp.float32)
+    rhs = jnp.ones((4, 3), dtype=jnp.float32)
+    dimension_numbers = (((1,), (0,)), ((), ()))
+
+    dot_general_nnx.lazy_init(lhs, rhs, dimension_numbers, precision=None)
+    variables_before = _to_linen_variables(dot_general_nnx)
+
+    _ = dot_general_nnx(
+        lhs,
+        rhs,
+        dimension_numbers,
+        precision=None,
+        mutable=["aqt"],
+    )
+    variables_after = _to_linen_variables(dot_general_nnx)
+
+    self._assert_overwrite_with_gradient_leaves_survive(variables_before, variables_after)
+
+  def test_direct_nanoo_fp8_dot_general_nnx_updates_overwrite_with_gradient(self):
+    quant = _configure_quantization(quant_str="nanoo_fp8")
+    dot_general_linen = quant.dot_general_cls()()
+    dot_general_nnx = nnx_wrappers.ToNNX(dot_general_linen, rngs=nnx.Rngs(params=0))
+
+    lhs = jnp.ones((2, 4), dtype=jnp.float32)
+    rhs = jnp.ones((4, 3), dtype=jnp.float32)
+    dimension_numbers = (((1,), (0,)), ((), ()))
+
+    dot_general_nnx.lazy_init(lhs, rhs, dimension_numbers, precision=None)
+    variables_before = _to_linen_variables(dot_general_nnx)
+
+    _ = dot_general_nnx(
+        lhs,
+        rhs,
+        dimension_numbers,
+        precision=None,
+        mutable=["aqt", "_overwrite_with_gradient"],
+    )
+    variables_after = _to_linen_variables(dot_general_nnx)
+
+    self._assert_overwrite_with_gradient_leaves_survive(variables_before, variables_after)
+
+  def test_dense_general_nnx_fp8_exposes_overwrite_with_gradient_state(self):
+    from maxtext.layers import linears
+
+    quant = _configure_quantization(quant_str="fp8")
+    dense = linears.DenseGeneral(
+        in_features_shape=4,
+        out_features_shape=3,
+        dtype=jnp.float32,
+        weight_dtype=jnp.float32,
+        quant=quant,
+        rngs=nnx.Rngs(params=0, aqt=1),
+    )
+
+    quant_dot_general = dense.quant_dot_general
+    self.assertIsNotNone(quant_dot_general)
+    variables_before = _to_linen_variables(quant_dot_general)
+
+    inputs = jnp.ones((2, 4), dtype=jnp.float32)
+    _ = dense(inputs)
+
+    quant_dot_general = dense.quant_dot_general
+    self.assertIsNotNone(quant_dot_general)
+    variables_after = _to_linen_variables(quant_dot_general)
+    self._assert_overwrite_with_gradient_leaves_survive(variables_before, variables_after)
 
   @pytest.mark.tpu_only  # b/421002974
   def test_aqt_quantization(self):
