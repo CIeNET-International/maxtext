@@ -73,6 +73,7 @@ SKIP_RL="${SKIP_RL:-0}"                       # 1 = skip PT-04/05/06
 RUN_LINEN="${RUN_LINEN:-1}"                   # 1 = also run Linen for PT-01/02
 STRICT="${STRICT:-0}"                         # 1 = missing dep is fatal, not skipped
 USE_DOC_LITERAL="${USE_DOC_LITERAL:-0}"       # 1 = doc's verbatim (buggy) flags
+DRY_RUN="${DRY_RUN:-0}"                        # 1 = print expanded commands, execute nothing
 
 # ---- corrected vs literal flag fragments (BUG A / BUG B) --------------------
 if [[ "${USE_DOC_LITERAL}" == "1" ]]; then
@@ -159,6 +160,11 @@ preflight() {
   log "Preflight (repo=${REPO_ROOT}, run_id=${RUN_ID})"
   mkdir -p "${LOG_DIR}"
 
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    warn "DRY_RUN=1 — expanded commands will be printed; no preflight, no execution."
+    return 0
+  fi
+
   if [[ -z "${HF_TOKEN}" ]]; then
     err "HF_TOKEN is empty. Export it: export HF_TOKEN=hf_xxx  (gates Llama/Qwen tokenizers+datasets)"
     exit 2
@@ -222,6 +228,11 @@ run_case() {
   local id="$1" mode="$2" desc="$3" cmd="$4"
   local logf="${LOG_DIR}/${id}_${mode}.log"
   log "PT-${id} [${mode}] ${desc}"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    printf '%s--- CMD ---%s\n%s\n\n' "$c_cyn" "$c_rst" "${cmd}"
+    RESULTS+=("${id}|${mode}|DRYRUN|-")
+    return 0
+  fi
   {
     echo "### PT-${id} mode=${mode} run_id=${RUN_ID} $(date -u +%FT%TZ)"
     echo "### CMD: ${cmd}"
@@ -352,7 +363,7 @@ summary() {
     printf '%-6s %-7s %-16s %s\n' "PT-${id}" "${mode}" "${status}" "${logf##*/}"
     case "${status}" in
       PASS*) ((passes++)) ;;
-      SKIP)  ((skips++))  ;;
+      SKIP|DRYRUN)  ((skips++))  ;;
       *)     ((fails++))  ;;
     esac
   done
