@@ -17,6 +17,11 @@
 #   CASES=quick                       # PT-01, PT-04, PT-05, PT-07, PT-09
 #   CASES=pt01_sft_nnx_smoke,pt09_lora_sft
 #
+# Run dump:
+#   DUMP_LOGS=1                        # default; writes ${LOG_DIR}/run_dump.md
+#   PRINT_LOG_DUMP=1                   # default; prints the dump at the end
+#   LOG_TAIL_LINES=40                  # default; per-case log tail length
+#
 # The cases mirror "MaxText NNX Migration - Smoke Test Status.md". A few
 # defaults are intentionally adjusted for an 8-chip TPU VM:
 #   - ICI_DATA_PARALLELISM defaults to 1, not the doc's 4, because
@@ -63,6 +68,10 @@ SKIP_ENV_CHECKS="${SKIP_ENV_CHECKS:-0}"
 SKIP_MISSING_CASES="${SKIP_MISSING_CASES:-0}"
 STRICT_DOC_PROGRESS="${STRICT_DOC_PROGRESS:-0}"
 PRINT_ENV="${PRINT_ENV:-1}"
+DUMP_LOGS="${DUMP_LOGS:-1}"
+LOG_DUMP_FILE="${LOG_DUMP_FILE:-${LOG_DIR}/run_dump.md}"
+LOG_TAIL_LINES="${LOG_TAIL_LINES:-40}"
+PRINT_LOG_DUMP="${PRINT_LOG_DUMP:-1}"
 
 # Common training knobs.
 SFT_TRAINER_MODULE="${SFT_TRAINER_MODULE:-maxtext.trainers.post_train.sft.train_sft}"
@@ -224,10 +233,72 @@ print_startup() {
   printf 'Repo root: %s\n' "${REPO_ROOT}"
   printf 'Base output: %s\n' "${BASE_OUTPUT_DIRECTORY}"
   printf 'Log dir: %s\n' "${LOG_DIR}"
+  printf 'Log dump: %s (enabled=%s, print=%s, tail_lines=%s)\n' \
+    "${LOG_DUMP_FILE}" "${DUMP_LOGS}" "${PRINT_LOG_DUMP}" "${LOG_TAIL_LINES}"
   printf 'SFT/distill ICI: fsdp=%s data=%s\n' "${ICI_FSDP_PARALLELISM}" "${ICI_DATA_PARALLELISM}"
   printf 'RL topology: chips_per_vm=%s trainer_fraction=%s sampler_fraction=%s rollout_dp=%s rollout_tp=%s rollout_ep=%s\n' \
     "${CHIPS_PER_VM}" "${TRAINER_DEVICES_FRACTION}" "${SAMPLER_DEVICES_FRACTION}" \
     "${RL_ROLLOUT_DATA_PARALLELISM}" "${RL_ROLLOUT_TENSOR_PARALLELISM}" "${RL_ROLLOUT_EXPERT_PARALLELISM}"
+}
+
+write_log_dump() {
+  local exit_status="${1:-0}"
+  [ "${DUMP_LOGS}" = "1" ] || return 0
+
+  set +e
+  mkdir -p "$(dirname "${LOG_DUMP_FILE}")"
+  mkdir -p "${LOG_DIR}"
+
+  local tmp_file="${LOG_DUMP_FILE}.tmp.$$"
+  {
+    printf '# Post-train NNX smoke run dump\n\n'
+    printf 'Generated UTC: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'Exit status: %s\n' "${exit_status}"
+    printf 'Run id: %s\n' "${RUN_ID}"
+    printf 'Run prefix: %s\n' "${RUN_PREFIX}"
+    printf 'Mode: %s\n' "${MODE}"
+    printf 'Cases: %s\n' "${CASES}"
+    printf 'Repo root: %s\n' "${REPO_ROOT}"
+    printf 'Base output: %s\n' "${BASE_OUTPUT_DIRECTORY}"
+    printf 'Log dir: %s\n' "${LOG_DIR}"
+    printf 'Summary file: %s\n' "${SUMMARY_FILE}"
+    if [ -n "${HF_TOKEN:-}" ]; then
+      printf 'HF token: set\n'
+    else
+      printf 'HF token: unset\n'
+    fi
+    printf 'DRY_RUN: %s\n' "${DRY_RUN}"
+    printf 'CONTINUE_ON_FAILURE: %s\n' "${CONTINUE_ON_FAILURE}"
+    printf 'SKIP_MISSING_CASES: %s\n' "${SKIP_MISSING_CASES}"
+    printf 'STRICT_DOC_PROGRESS: %s\n' "${STRICT_DOC_PROGRESS}"
+
+    printf '\n## Summary\n\n'
+    if [ -f "${SUMMARY_FILE}" ]; then
+      column -t -s $'\t' "${SUMMARY_FILE}" 2>/dev/null || cat "${SUMMARY_FILE}"
+    else
+      printf '(summary file not found)\n'
+    fi
+
+    printf '\n## Log file tails\n'
+    local found_logs=0
+    local log_file
+    while IFS= read -r log_file; do
+      found_logs=1
+      printf '\n### %s\n\n' "${log_file}"
+      tail -n "${LOG_TAIL_LINES}" "${log_file}" 2>&1
+    done < <(find "${LOG_DIR}" -maxdepth 1 -type f -name '*.log' | sort)
+
+    if [ "${found_logs}" -eq 0 ]; then
+      printf '\n(no .log files found; dry runs only write the summary)\n'
+    fi
+  } > "${tmp_file}"
+
+  mv "${tmp_file}" "${LOG_DUMP_FILE}"
+  printf '\nLog dump: %s\n' "${LOG_DUMP_FILE}"
+  if [ "${PRINT_LOG_DUMP}" = "1" ]; then
+    printf '\n'
+    cat "${LOG_DUMP_FILE}"
+  fi
 }
 
 common_sft_args() {
@@ -471,6 +542,7 @@ run_local() {
   cd "${REPO_ROOT}"
   mkdir -p "${LOG_DIR}"
   printf 'case\tstatus\treason\tlog\n' > "${SUMMARY_FILE}"
+  trap 'write_log_dump "$?"' EXIT
 
   mapfile -t cases_to_run < <(selected_cases)
   preflight "${cases_to_run[@]}"
@@ -533,6 +605,9 @@ run_remote() {
   remote_cmd+="$(remote_env_assignment CONTINUE_ON_FAILURE "${CONTINUE_ON_FAILURE}")"
   remote_cmd+="$(remote_env_assignment SKIP_MISSING_CASES "${SKIP_MISSING_CASES}")"
   remote_cmd+="$(remote_env_assignment STRICT_DOC_PROGRESS "${STRICT_DOC_PROGRESS}")"
+  remote_cmd+="$(remote_env_assignment DUMP_LOGS "${DUMP_LOGS}")"
+  remote_cmd+="$(remote_env_assignment LOG_TAIL_LINES "${LOG_TAIL_LINES}")"
+  remote_cmd+="$(remote_env_assignment PRINT_LOG_DUMP "${PRINT_LOG_DUMP}")"
   remote_cmd+="$(remote_env_assignment ICI_FSDP_PARALLELISM "${ICI_FSDP_PARALLELISM}")"
   remote_cmd+="$(remote_env_assignment ICI_DATA_PARALLELISM "${ICI_DATA_PARALLELISM}")"
   remote_cmd+="$(remote_env_assignment CHIPS_PER_VM "${CHIPS_PER_VM}")"

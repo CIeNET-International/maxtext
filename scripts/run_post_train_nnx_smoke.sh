@@ -13,6 +13,17 @@
 #   - PASS = exit 0 AND "completed step:" seen AND no "loss: nan/inf" AND no Traceback.
 #   - Prints a summary table; exits 1 if any case FAILs.
 #
+# LOG DUMP / COLLECTION (so logs leave the TPU VM)
+#   Everything lands under $LOG_DIR (default <repo>/smoke_logs/<RUN_ID>/):
+#     console.log     full run transcript (preflight + status + summary)
+#     <id>_<mode>.log per-case training stdout, prefixed with the exact CMD
+#     manifest.txt    run_id, git commit, jax/libtpu/tunix/vllm versions, toggles
+#     summary.tsv     case<TAB>mode<TAB>status<TAB>log
+#     summary.json    {run_id,pass,fail,skip,results:[...]}  (for MaxView/parsing)
+#   Then bundled to  <repo>/smoke_logs/post_train_smoke_<RUN_ID>.tgz  and, if
+#   UPLOAD_LOGS=1 (default), pushed to  $LOG_GCS_DIR  (BASE_OUTPUT_DIR/smoke_logs).
+#   Set UPLOAD_LOGS=0 to keep logs local only.
+#
 # DOC BUGS CORRECTED (validated against source; see
 #   docs/superpowers/specs/2026-06-04-posttrain-doc-validation.md §8):
 #   A) Doc uses ici_fsdp_parallelism=8 ici_data_parallelism=4 (=32) but V6e-8 has
@@ -48,6 +59,8 @@ HF_TOKEN="${HF_TOKEN:-}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-gs://lance-maxtext/pt_ckpt_${RUN_ID}}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/smoke_logs/${RUN_ID}}"
+UPLOAD_LOGS="${UPLOAD_LOGS:-1}"                       # 1 = also push the log bundle to GCS
+LOG_GCS_DIR="${LOG_GCS_DIR:-${BASE_OUTPUT_DIR}/smoke_logs/${RUN_ID}}"
 
 # Seed checkpoints (from the doc; override if your bucket differs)
 SEED_LINEN_CKPT="${SEED_LINEN_CKPT:-gs://lance-maxtext/pt_seed_ckpts/pt_seed_ckpts/pt_seed_ckpt_gpt352k_linen/checkpoints/9/items}"
@@ -104,6 +117,42 @@ err()  { printf '%s[x]%s %s\n' "$c_red" "$c_rst" "$*" >&2; }
 
 declare -a RESULTS   # "id|mode|STATUS|logfile"
 RL_AVAILABLE=1
+
+# ---- manifest: record exactly what produced these logs ----------------------
+write_manifest() {
+  local m="${LOG_DIR}/manifest.txt"
+  {
+    echo "run_id:        ${RUN_ID}"
+    echo "date_utc:      $(date -u +%FT%TZ)"
+    echo "host:          $(hostname 2>/dev/null || echo NA)"
+    echo "repo_root:     ${REPO_ROOT}"
+    echo "git_branch:    $(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo NA)"
+    echo "git_commit:    $(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo NA)"
+    echo "cases:         ${CASES}"
+    echo "toggles:       USE_DOC_LITERAL=${USE_DOC_LITERAL} USE_OPEN_MIRRORS=${USE_OPEN_MIRRORS} RUN_LINEN=${RUN_LINEN} SKIP_RL=${SKIP_RL} STRICT=${STRICT}"
+    echo "sft_shard:     ${SFT_SHARD}"
+    echo "vocab_fix:     ${VOCAB_FIX:-<none>}"
+    echo "llama2_tok:    ${LLAMA2_TOK}"
+    echo "llama31_tok:   ${LLAMA31_TOK}"
+    echo "base_output:   ${BASE_OUTPUT_DIR}"
+    echo "--- package versions ---"
+    python3 - <<'PY' 2>/dev/null || echo "version probe failed"
+import importlib
+for p in ("jax","jaxlib","libtpu","flax","maxtext","tunix","vllm"):
+    try:
+        m = importlib.import_module(p)
+        print(f"{p}: {getattr(m,'__version__','?')}")
+    except Exception:
+        print(f"{p}: NOT INSTALLED")
+try:
+    import jax
+    print("jax_devices:", jax.device_count(), "/", jax.devices()[0].device_kind)
+except Exception:
+    print("jax_devices: probe failed")
+PY
+  } > "${m}"
+  log "Manifest -> ${m}"
+}
 
 # ---- preflight --------------------------------------------------------------
 preflight() {
@@ -309,10 +358,62 @@ summary() {
   done
   echo ""
   printf 'PASS=%d  FAIL=%d  SKIP=%d   logs: %s\n' "${passes}" "${fails}" "${skips}" "${LOG_DIR}"
+
+  # machine-readable dumps (for MaxView / parsing)
+  local tsv="${LOG_DIR}/summary.tsv" js="${LOG_DIR}/summary.json" first=1
+  printf 'case\tmode\tstatus\tlog\n' > "${tsv}"
+  {
+    printf '{"run_id":"%s","pass":%d,"fail":%d,"skip":%d,"results":[' "${RUN_ID}" "${passes}" "${fails}" "${skips}"
+    for row in "${RESULTS[@]}"; do
+      IFS='|' read -r id mode status logf <<< "${row}"
+      printf 'PT-%s\t%s\t%s\t%s\n' "${id}" "${mode}" "${status}" "${logf##*/}" >> "${tsv}"
+      [[ "${first}" -eq 1 ]] || printf ','
+      first=0
+      printf '{"case":"PT-%s","mode":"%s","status":"%s","log":"%s"}' "${id}" "${mode}" "${status}" "${logf##*/}"
+    done
+    printf ']}\n'
+  } > "${js}"
+
   [[ "${fails}" -gt 0 ]] && return 1 || return 0
 }
 
+# ---- collect: bundle + (optionally) upload so logs leave the TPU VM ----------
+collect_logs() {
+  local parent base tarball
+  parent="$(dirname "${LOG_DIR}")"; base="$(basename "${LOG_DIR}")"
+  tarball="${parent}/post_train_smoke_${RUN_ID}.tgz"
+  if tar -czf "${tarball}" -C "${parent}" "${base}" 2>/dev/null; then
+    ok "Archive -> ${tarball}"
+  else
+    warn "tar failed; per-case logs still at ${LOG_DIR}"
+  fi
+
+  if [[ "${UPLOAD_LOGS}" == "1" ]]; then
+    if command -v gcloud >/dev/null 2>&1; then
+      if gcloud storage cp -r "${LOG_DIR}" "${LOG_GCS_DIR%/}/" >/dev/null 2>&1 \
+         || gsutil -m cp -r "${LOG_DIR}" "${LOG_GCS_DIR%/}/" >/dev/null 2>&1; then
+        gcloud storage cp "${tarball}" "${LOG_GCS_DIR%/}/" >/dev/null 2>&1 || true
+        ok "Uploaded -> ${LOG_GCS_DIR}"
+        log "Pull (anywhere):  gcloud storage cp -r ${LOG_GCS_DIR} ."
+      else
+        warn "GCS upload failed (auth/bucket?). Bundle kept locally: ${tarball}"
+      fi
+    else
+      warn "gcloud not found; skipping upload. Bundle: ${tarball}"
+    fi
+  fi
+  log "Local bundle:   ${tarball}"
+  log "From laptop:    gcloud compute tpus tpu-vm scp --recurse <TPU_NAME>:${tarball} . --zone <ZONE>"
+}
+
 # ---- main -------------------------------------------------------------------
+mkdir -p "${LOG_DIR}"
+# Mirror everything printed below into console.log so the whole run is one file.
+exec > >(tee -a "${LOG_DIR}/console.log") 2>&1
+
+write_manifest
 preflight
 dispatch
-summary
+summary; SUMMARY_RC=$?
+collect_logs
+exit "${SUMMARY_RC}"
