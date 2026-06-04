@@ -57,7 +57,7 @@ cd "${REPO_ROOT}" || { echo "cannot cd to ${REPO_ROOT}" >&2; exit 1; }
 # ---- configuration (env-overridable) ----------------------------------------
 HF_TOKEN="${HF_TOKEN:-}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-gs://lance-maxtext/pt_ckpt_${RUN_ID}}"
+BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-gs://mesa-maxtext/post_train/pt_ckpt_${RUN_ID}}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/smoke_logs/${RUN_ID}}"
 UPLOAD_LOGS="${UPLOAD_LOGS:-1}"                       # 1 = also push the log bundle to GCS
 LOG_GCS_DIR="${LOG_GCS_DIR:-${BASE_OUTPUT_DIR}/smoke_logs/${RUN_ID}}"
@@ -389,17 +389,13 @@ collect_logs() {
   fi
 
   if [[ "${UPLOAD_LOGS}" == "1" ]]; then
-    if command -v gcloud >/dev/null 2>&1; then
-      if gcloud storage cp -r "${LOG_DIR}" "${LOG_GCS_DIR%/}/" >/dev/null 2>&1 \
-         || gsutil -m cp -r "${LOG_DIR}" "${LOG_GCS_DIR%/}/" >/dev/null 2>&1; then
-        gcloud storage cp "${tarball}" "${LOG_GCS_DIR%/}/" >/dev/null 2>&1 || true
-        ok "Uploaded -> ${LOG_GCS_DIR}"
-        log "Pull (anywhere):  gcloud storage cp -r ${LOG_GCS_DIR} ."
-      else
-        warn "GCS upload failed (auth/bucket?). Bundle kept locally: ${tarball}"
-      fi
+    log "Uploading logs to GCS using bucket_agent.py..."
+    if python3 "${REPO_ROOT}/bucket_agent.py" "${LOG_DIR}" "${LOG_GCS_DIR%/}/" && \
+       python3 "${REPO_ROOT}/bucket_agent.py" "${tarball}" "${LOG_GCS_DIR%/}/"; then
+      ok "Uploaded -> ${LOG_GCS_DIR}"
+      log "Pull (anywhere):  gcloud storage cp -r ${LOG_GCS_DIR} ."
     else
-      warn "gcloud not found; skipping upload. Bundle: ${tarball}"
+      warn "GCS upload failed via bucket_agent.py. Bundle kept locally: ${tarball}"
     fi
   fi
   log "Local bundle:   ${tarball}"
