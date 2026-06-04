@@ -285,7 +285,7 @@ case_03() {
 case_04() {
   run_case 04 nnx "RL GRPO smoke (Qwen3-0.6B)" \
     "${RL_MOD} model_name=qwen3-0.6b tokenizer_path=Qwen/Qwen3-0.6B chips_per_vm=${NUM_CHIPS} num_batches=2 \
-     rollout_data_parallelism=$((${NUM_CHIPS} / 2)) trainer_devices_fraction=1.0 sampler_devices_fraction=1.0 \
+     rollout_data_parallelism=${NUM_CHIPS} trainer_devices_fraction=1.0 sampler_devices_fraction=1.0 \
      async_scheduling=False log_config=False enable_goodput_recording=False profiler=xplane debug.rl=False \
      ${NNX_FLAGS} hf_access_token=${HF_TOKEN} \
      base_output_directory=${BASE_OUTPUT_DIR}/04_rl_grpo_smoke run_name=pt_rl_grpo_smoke rl.loss_algo=grpo"
@@ -295,7 +295,7 @@ case_04() {
 case_05() {
   run_case 05 nnx "RL GSPO smoke (Qwen3-0.6B)" \
     "${RL_MOD} model_name=qwen3-0.6b tokenizer_path=Qwen/Qwen3-0.6B chips_per_vm=${NUM_CHIPS} num_batches=2 \
-     rollout_data_parallelism=$((${NUM_CHIPS} / 2)) trainer_devices_fraction=1.0 sampler_devices_fraction=1.0 \
+     rollout_data_parallelism=${NUM_CHIPS} trainer_devices_fraction=1.0 sampler_devices_fraction=1.0 \
      async_scheduling=False log_config=False enable_goodput_recording=False profiler=xplane debug.rl=False \
      ${NNX_FLAGS} hf_access_token=${HF_TOKEN} \
      base_output_directory=${BASE_OUTPUT_DIR}/05_rl_gspo_smoke run_name=pt_rl_gspo_smoke rl.loss_algo=gspo-token"
@@ -305,7 +305,7 @@ case_05() {
 case_06() {
   run_case 06 nnx "RL GRPO functional (Llama3.1-8B)" \
     "${RL_MOD} model_name=llama3.1-8b tokenizer_path=meta-llama/Llama-3.1-8B-Instruct chips_per_vm=${NUM_CHIPS} num_batches=2 \
-     rollout_data_parallelism=$((${NUM_CHIPS} / 2)) trainer_devices_fraction=1.0 sampler_devices_fraction=1.0 \
+     rollout_data_parallelism=${NUM_CHIPS} trainer_devices_fraction=1.0 sampler_devices_fraction=1.0 \
      async_scheduling=False log_config=False enable_goodput_recording=False profiler=xplane debug.rl=False \
      convert_checkpoint_if_possible=False enable_checkpointing=False \
      ${NNX_FLAGS} hf_access_token=${HF_TOKEN} \
