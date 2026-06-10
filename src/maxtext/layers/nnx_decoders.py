@@ -69,7 +69,6 @@ from maxtext.multimodal import utils as mm_utils
 from maxtext.utils import max_logging, max_utils, maxtext_utils, sharding
 from maxtext.utils.maxtext_utils_nnx import nnx_ensure_scan_leading_axis
 from maxtext.utils.sharding import create_sharding
-# from maxtext.layers.pipeline import create_nnx_pipeline
 
 # ------------------------------------------------------------------------------
 # The network: Decoder Definitions
@@ -317,11 +316,6 @@ class NNXDecoder(nnx.Module):
 
   def _init_decoder_layers(self, decoder_block_classes, rngs, mesh):
     """Routes layer construction through three main paths: pipeline, scanned non-pipeline, sequential.
-
-    Three main paths:
-    - Pipeline parallelism: distribute layers across devices
-    - Scanned (non-pipeline): loop-scanned layers
-    - Sequential: explicit per-layer loop
     """
     config = self.config
 
@@ -331,79 +325,10 @@ class NNXDecoder(nnx.Module):
       if config.using_pipeline_parallelism or config.scan_layers:
         raise ValueError("gemma4_small (Gemma4 E2B/E4B) does not support pipeline parallelism or scan_layers.")
       self._init_gemma4_small_layers(rngs)
-    # elif config.using_pipeline_parallelism:
-    #   self._init_pipeline_layers(decoder_block_classes, rngs, mesh)
     elif config.scan_layers:
       self._init_scanned_layers(decoder_block_classes, rngs, mesh)
     else:
       self._init_sequential_layers(decoder_block_classes, rngs)
-
-  def _init_pipeline_layers(self, decoder_block_classes, rngs, mesh):
-    """Initializes decoder layers with pipeline parallelism."""
-    config = self.config
-    assert not (config.engram_layers and self.is_deepseek), (
-        "engram_layers + DeepSeek + pipeline_parallelism is not supported. "
-        "engram interleaving is currently only implemented in the non-pipeline path."
-    )
-
-    def build_pipeline_stage_layers(rngs):
-      return self._get_pipeline_stage_module(decoder_block_classes, rngs)
-
-    self.pipeline_module = None
-
-    if self.is_deepseek:
-      self._init_pipeline_deepseek(decoder_block_classes, rngs)
-    else:
-      self._init_pipeline_generic(decoder_block_classes, rngs)
-
-  def _init_pipeline_deepseek(self, decoder_block_classes, rngs):
-    """Initializes DeepSeek dense and MoE layers outside pipeline."""
-    config = self.config
-    assert len(decoder_block_classes) == 2
-    dense_cls, moe_cls = decoder_block_classes
-    if config.scan_layers:
-      self.dense_layers = self._create_scanned_layers(
-          dense_cls,
-          length=config.first_num_dense_layers,
-          metadata_axis_name="dense_layers",
-          rngs=rngs,
-      )
-      num_moe_outside = (config.num_decoder_layers - config.first_num_dense_layers) - config.pipeline_parallel_layers
-      if num_moe_outside > 0:
-        self.moe_layers_outside_pipeline = self._create_scanned_layers(
-            moe_cls,
-            length=num_moe_outside,
-            metadata_axis_name="moe_layers",
-            rngs=rngs,
-        )
-    else:
-      self.num_dense_layers = config.first_num_dense_layers
-      for i in range(self.num_dense_layers):
-        self._create_and_register_named_layer(dense_cls, rngs, "dense_layers", i)
-      self.num_moe_outside_pipeline = (
-          config.num_decoder_layers - config.first_num_dense_layers
-      ) - config.pipeline_parallel_layers
-      if self.num_moe_outside_pipeline > 0:
-        for i in range(self.num_moe_outside_pipeline):
-          self._create_and_register_named_layer(moe_cls, rngs, "moe_layers_outside_pipeline", i)
-
-  def _init_pipeline_generic(self, decoder_block_classes, rngs):
-    """Initializes generic decoder layers outside pipeline."""
-    config = self.config
-    remaining_layers = config.num_decoder_layers - config.pipeline_parallel_layers
-    if remaining_layers > 0:
-      base_cls = decoder_block_classes[0]
-      if config.scan_layers:
-        self.layers_outside_pipeline = self._create_scanned_layers(
-            base_cls,
-            length=remaining_layers,
-            metadata_axis_name="layers",
-            rngs=rngs,
-        )
-      else:
-        self.num_layers_outside_pipeline = remaining_layers
-        for i in range(self.num_layers_outside_pipeline):
-          self._create_and_register_named_layer(base_cls, rngs, "layers_outside_pipeline", i)
 
   def _init_scanned_layers(self, decoder_block_classes, rngs, mesh):
     """Initializes decoder layers with scanning (non-pipeline)."""
@@ -649,33 +574,6 @@ class NNXDecoder(nnx.Module):
       )
       setattr(self, f"layers_{lyr}", layer)
       self.layers.append(layer)
-
-  def _get_pipeline_stage_module(self, decoder_blocks, rngs):
-    """Retrieves the wrapper module formatted for single pipeline stage execution."""
-    cfg = self.config
-    base_stage_cls = decoder_blocks[1] if self.is_deepseek else decoder_blocks[0]
-
-    if cfg.num_layers_per_pipeline_stage == 1:
-      return self._create_single_layer(base_stage_cls, rngs)
-    elif cfg.scan_layers_per_stage:
-      return NNXScannedPipelineStage(
-          base_stage_cls,
-          cfg.num_layers_per_pipeline_stage,
-          cfg,
-          self.mesh,
-          self.quant,
-          self.model_mode,
-          rngs=rngs,
-      )
-    return NNXSequentialPipelineStage(
-        base_stage_cls,
-        cfg.num_layers_per_pipeline_stage,
-        cfg,
-        self.mesh,
-        self.quant,
-        self.model_mode,
-        rngs=rngs,
-    )
 
   def _create_and_register_layer(self, layer_cls, rngs, base_name, i, **layer_kwargs):
     attr_name = f"{base_name}_{i}"
@@ -1483,95 +1381,7 @@ class NNXDecoder(nnx.Module):
     if attention_metadata is not None:
       layer_kwargs["attention_metadata"] = attention_metadata
 
-    # if cfg.using_pipeline_parallelism:
-    #   logical_partition_spec = (
-    #       self.pipeline_module.get_weight_sharding()
-    #       if (cfg.pipeline_fsdp_ag_once or cfg.pipeline_fsdp_ag_per_repeat)
-    #       else None
-    #   )
-
-    #   if self.is_deepseek:
-    #     # Pre-pipeline: dense layers + outside-pipeline MoE layers under PP-as-DP axis rules.
-    #     ds_layer_kwargs = {
-    #         "previous_chunk": previous_chunk,
-    #         "slot": slot,
-    #     }
-    #     logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
-    #     with self.mesh, nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp):
-    #       if cfg.scan_layers:
-    #         if getattr(self, "dense_layers", None) is not None and cfg.first_num_dense_layers > 0:
-    #           y, self.dense_layers, _ = self._apply_layers_sequentially(
-    #               self.dense_layers,
-    #               y,
-    #               *layer_args,
-    #               length=cfg.first_num_dense_layers,
-    #               **ds_layer_kwargs,
-    #           )
-    #         if hasattr(self, "moe_layers_outside_pipeline") and self.moe_layers_outside_pipeline is not None:
-    #           num_moe_outside = (cfg.num_decoder_layers - cfg.first_num_dense_layers) - cfg.pipeline_parallel_layers
-    #           y, self.moe_layers_outside_pipeline, _ = self._apply_layers_sequentially(
-    #               self.moe_layers_outside_pipeline,
-    #               y,
-    #               *layer_args,
-    #               length=num_moe_outside,
-    #               **ds_layer_kwargs,
-    #           )
-    #       else:
-    #         # Unscanned: iterate registered layers by name.
-    #         for i in range(getattr(self, "num_dense_layers", 0)):
-    #           layer = getattr(self, f"dense_layers_{i}")
-    #           out = layer(y, *layer_args, **ds_layer_kwargs)
-    #           y = out[0] if isinstance(out, tuple) else out
-    #         for i in range(getattr(self, "num_moe_outside_pipeline", 0)):
-    #           layer = getattr(self, f"moe_layers_outside_pipeline_{i}")
-    #           out = layer(y, *layer_args, **ds_layer_kwargs)
-    #           y = out[0] if isinstance(out, tuple) else out
-
-    #     y = self.pipeline_module(
-    #         y,
-    #         decoder_segment_ids,
-    #         decoder_positions,
-    #         deterministic,
-    #         model_mode,
-    #         logical_partition_spec=logical_partition_spec,
-    #     )
-    #   else:
-    #     # Standard pipeline run (non-DeepSeek, incl. Gemma4 — matches Linen decoders.py).
-    #     # Gemma4 routes through the pipeline here; _apply_gemma4_scanned_blocks is
-    #     # non-pipeline-only (its layers/layers_remainder are not built when
-    #     # pipeline parallelism is enabled).
-    #     y = self.pipeline_module(
-    #         y,
-    #         decoder_segment_ids,
-    #         decoder_positions,
-    #         deterministic,
-    #         model_mode,
-    #         logical_partition_spec=logical_partition_spec,
-    #     )
-
-    #     # Remaining standard layers (outside the pipeline)
-    #     if hasattr(self, "layers_outside_pipeline") or hasattr(self, "num_layers_outside_pipeline"):
-    #       logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
-    #       with (
-    #           self.mesh,
-    #           nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp),
-    #       ):
-    #         if cfg.scan_layers and hasattr(self, "layers_outside_pipeline"):
-    #           remaining = cfg.num_decoder_layers - cfg.pipeline_parallel_layers
-    #           y, self.layers_outside_pipeline, _ = self._apply_layers_sequentially(
-    #               self.layers_outside_pipeline,
-    #               y,
-    #               *layer_args,
-    #               length=remaining,
-    #               **layer_kwargs,
-    #           )
-    #         elif (not cfg.scan_layers) and hasattr(self, "num_layers_outside_pipeline"):
-    #           for i in range(self.num_layers_outside_pipeline):
-    #             layer = getattr(self, f"layers_outside_pipeline_{i}")
-    #             out = layer(y, *layer_args, **layer_kwargs)
-    #             y = out[0] if isinstance(out, tuple) else out
-
-    # else:
+  
     if self.is_gemma4_small:
       y, kv_caches = self._apply_gemma4_small_layers(
           y,
@@ -1910,11 +1720,6 @@ class NNXDecoder(nnx.Module):
       slot=None,
   ):
     """Apply Gemma 4 small (E2B/E4B) decoder layers (pure-NNX).
-
-    Threads PLE per-layer inputs (sliced per layer), the shared_kv_states donor dict
-    (donor layer index -> rotated/normed K/V consumed by downstream KV-shared layers), and
-    per-layer kv_caches (KV-shared layers reuse the donor's slot via cache_index_of). Returns
-    (y, kv_caches). Scan-over-layers and pipeline parallelism are not supported.
     """
     cfg = self.config
     bidirectional_mask_value = multimodal_input.bidirectional_mask if multimodal_input is not None else None
