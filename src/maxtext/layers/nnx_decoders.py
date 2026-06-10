@@ -69,7 +69,7 @@ from maxtext.multimodal import utils as mm_utils
 from maxtext.utils import max_logging, max_utils, maxtext_utils, sharding
 from maxtext.utils.maxtext_utils_nnx import nnx_ensure_scan_leading_axis
 from maxtext.utils.sharding import create_sharding
-from maxtext.layers.pipeline import create_nnx_pipeline
+# from maxtext.layers.pipeline import create_nnx_pipeline
 
 # ------------------------------------------------------------------------------
 # The network: Decoder Definitions
@@ -349,13 +349,7 @@ class NNXDecoder(nnx.Module):
     def build_pipeline_stage_layers(rngs):
       return self._get_pipeline_stage_module(decoder_block_classes, rngs)
 
-    self.pipeline_module = create_nnx_pipeline(
-        config=config,
-        stage_factory=build_pipeline_stage_layers,
-        mesh=mesh,
-        remat_policy=self.get_remat_policy(),
-        rngs=rngs,
-    )
+    self.pipeline_module = None
 
     if self.is_deepseek:
       self._init_pipeline_deepseek(decoder_block_classes, rngs)
