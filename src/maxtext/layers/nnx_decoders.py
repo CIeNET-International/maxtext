@@ -1098,7 +1098,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.QWEN3_5,
     }:
       return functools.partial(
-          normalizations.RMSNorm,
+          normalizations.Qwen3NextRMSNorm,
           num_features=num_features,
           shard_mode=self.config.shard_mode,
           rngs=rngs,
@@ -1125,6 +1125,9 @@ class NNXDecoder(nnx.Module):
       image_embeddings = multimodal_input.image_embeddings
       bidirectional_mask = multimodal_input.bidirectional_mask
       image_masks = multimodal_input.image_masks
+      video_embeddings = getattr(multimodal_input, "video_embeddings", None)
+      video_masks = getattr(multimodal_input, "video_masks", None)
+      bidirectional_mask_video = getattr(multimodal_input, "bidirectional_mask_video", None)
       audio_embeddings = multimodal_input.audio_embeddings
       audio_masks = multimodal_input.audio_masks
 
@@ -1151,6 +1154,17 @@ class NNXDecoder(nnx.Module):
           )
         else:
           raise ValueError(f"Unsupported model_name for multimodal: {cfg.model_name}")
+
+      if video_embeddings is not None and cfg.use_multimodal:
+        if cfg.model_name in {"qwen3-omni-30b-a3b", "qwen3.5-35b-a3b", "qwen3.5-397b-a17b"}:
+          y = mm_utils.merge_mm_embeddings(
+              text_embeddings=y,
+              multimodal_embeddings=video_embeddings,
+              mask=bidirectional_mask_video,
+              token_masks=video_masks,
+          )
+        else:
+          raise ValueError(f"Unsupported model_name for video: {cfg.model_name}")
 
       if audio_embeddings is not None and cfg.use_audio:
         if cfg.model_name in {"qwen3-omni-30b-a3b"}:
