@@ -181,7 +181,7 @@ class NNXDecoderLayer(nnx.Module):
     else:
       logical_axis_names = (
           "activation_batch",
-          "activation_length_no_exp",
+          "activation_length",
           "activation_embed",
       )
 
@@ -315,8 +315,7 @@ class NNXDecoder(nnx.Module):
     self._init_decoder_layers(decoder_block_classes, rngs, mesh)
 
   def _init_decoder_layers(self, decoder_block_classes, rngs, mesh):
-    """Routes layer construction through three main paths: pipeline, scanned non-pipeline, sequential.
-    """
+    """Routes layer construction through three main paths: pipeline, scanned non-pipeline, sequential."""
     config = self.config
 
     if self.is_gemma4_small:
@@ -1195,7 +1194,7 @@ class NNXDecoder(nnx.Module):
     if cfg.shard_mode == ShardMode.EXPLICIT:
       norm_out_sharding = create_sharding(
           self.mesh,
-          ("activation_batch", "activation_length_no_exp", "activation_embed"),
+          ("activation_batch", "activation_length", "activation_embed"),
       )
     else:
       norm_out_sharding = None
@@ -1210,7 +1209,7 @@ class NNXDecoder(nnx.Module):
           self.mesh,
           (
               "activation_embed_and_logits_batch",
-              "activation_length_no_exp",
+              "activation_length",
               "activation_vocab",
           ),
       )
@@ -1395,7 +1394,6 @@ class NNXDecoder(nnx.Module):
     if attention_metadata is not None:
       layer_kwargs["attention_metadata"] = attention_metadata
 
-  
     if self.is_gemma4_small:
       y, kv_caches = self._apply_gemma4_small_layers(
           y,
@@ -1457,7 +1455,7 @@ class NNXDecoder(nnx.Module):
             policy = self.get_remat_policy()
             mock_params = self._build_linen_params(self.moe_layers)
 
-            if cfg.use_qwix_quantization:
+            if cfg.use_qwix_quantization and not cfg.use_manual_quantization:
               y = deepseek_batchsplit_fp8.scan_batch_split_layers(
                   y,
                   mock_params,
@@ -1688,7 +1686,7 @@ class NNXDecoder(nnx.Module):
     scan_length = cfg.num_decoder_layers // attention_pattern_length
 
     layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
-    layer_kwargs = {"bidirectional_mask": bidirectional_mask}
+    layer_kwargs = {"bidirectional_mask": bidirectional_mask, "slot": slot, "previous_chunk": previous_chunk}
 
     # Apply the main scan over the full blocks
     if scan_length > 0:
@@ -1705,8 +1703,6 @@ class NNXDecoder(nnx.Module):
         out_y, _ = merged_layer(
             y_in,
             *layer_args,
-            previous_chunk=previous_chunk,
-            slot=slot,
             **layer_kwargs,
         )
         return out_y, nnx.state(merged_layer)
@@ -1733,8 +1729,7 @@ class NNXDecoder(nnx.Module):
       previous_chunk=None,
       slot=None,
   ):
-    """Apply Gemma 4 small (E2B/E4B) decoder layers (pure-NNX).
-    """
+    """Apply Gemma 4 small (E2B/E4B) decoder layers (pure-NNX)."""
     cfg = self.config
     bidirectional_mask_value = multimodal_input.bidirectional_mask if multimodal_input is not None else None
 
