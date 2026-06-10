@@ -48,6 +48,7 @@ from maxtext.configs import pyconfig
 from maxtext.layers.nnx_decoders import NNXDecoder, NNXDecoderLayer, NNXScannedPipelineStage
 from maxtext.models import gemma3, gemma4
 from maxtext.utils import maxtext_utils
+from maxtext.utils.model_creation_utils import get_transformer_model
 from tests.utils.test_helpers import get_test_config_path
 
 # ---------------------------------------------------------------------------
@@ -450,6 +451,57 @@ def test_fork_spy_control_no_scan_no_split():
   assert (
       cfg.num_decoder_layers not in recorded
   ), f"control: did not expect split={cfg.num_decoder_layers}, recorded={recorded}"
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek feature combos vs rngs.fork.
+#
+# MTP (multi-token prediction, mtp_num_layers>0) is set up on the full Transformer and forks the
+# SAME rngs the decoder forks for the scanned deepseek layers -- but via ``rngs.fork()`` (NO split),
+# once per MTP layer. This guards that the combination builds cleanly and never reuses an rng key
+# across the decoder's ``fork(split=N)`` and the MTP block's ``fork()``.
+#
+# MLA (multi-head latent attention) is deepseek's always-on attention; the scanned deepseek layer
+# that ``test_site2_scanned_fork_fires_per_model[DEEPSEEK]`` forks already contains MLA, so MLA needs
+# no separate fork test.
+# ---------------------------------------------------------------------------
+
+_DEEPSEEK_MTP_OVERRIDES = dict(
+    model_name="deepseek3-test", base_num_decoder_layers=4, base_moe_mlp_dim=512, scan_layers=True
+)
+
+
+@pytest.mark.parametrize("mtp_num_layers", [1, 2])
+def test_deepseek_mtp_forks_share_rngs_without_reuse(mtp_num_layers):
+  """deepseek + MTP: the decoder forks ``split=first_num_dense_layers`` and ``split=num_moe`` for the
+  scanned layers, and the MTP block forks ``fork()`` per layer on the SAME rngs. Asserts the full
+  Transformer builds, the deepseek SITE-2 forks still fire, the MTP block exists, and NO rng key is
+  reused across all forks (params + dropout streams)."""
+  cfg = _make_config(mtp_num_layers=mtp_num_layers, **_DEEPSEEK_MTP_OVERRIDES)
+  mesh = _make_mesh(cfg)
+
+  real_fork = nnx.Rngs.fork
+  splits = []
+  key_bytes = []
+
+  def spy(self, *args, **kwargs):  # autospec => self is positional
+    out = real_fork(self, *args, **kwargs)
+    splits.append(kwargs.get("split"))
+    for stream in ("params", "dropout"):
+      try:
+        key_bytes.append(jax.random.key_data(out[stream].key.value).tobytes())
+      except (KeyError, AttributeError, TypeError):
+        pass
+    return out
+
+  with mock.patch.object(nnx.Rngs, "fork", autospec=True, side_effect=spy):
+    model = get_transformer_model(cfg, mesh, None, MODEL_MODE_TRAIN, nnx.Rngs(params=0, dropout=1))
+
+  assert hasattr(model, "mtp_block"), "MTP block was not created"
+  num_moe = cfg.num_decoder_layers - cfg.first_num_dense_layers
+  assert cfg.first_num_dense_layers in splits, f"missing dense-layer SITE-2 fork; splits={splits}"
+  assert num_moe in splits, f"missing moe-layer SITE-2 fork; splits={splits}"
+  assert len(key_bytes) == len(set(key_bytes)), "rng key REUSED across deepseek decoder + MTP forks"
 
 
 if __name__ == "__main__":
