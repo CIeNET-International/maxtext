@@ -582,14 +582,37 @@ class Decoder(nn.Module):
     cfg = self.config
     base_stage_cls = decoder_blocks[1] if cfg.decoder_block == DecoderBlockType.DEEPSEEK else decoder_blocks[0]
 
+    # Per-stage-layer remat (+ params-only host-offload inside the stage) when the flag is set. The
+    # nnx-pipeline migration dropped this on the Linen-decoder pipeline path too; the old Linen
+    # get_pipeline_stage_module applied it via set_remat_policy. Mirrors NNXDecoder._get_pipeline_stage_module.
+    per_stage_remat = self.get_remat_policy() if cfg.set_remat_policy_on_layers_per_stage else None
+
     if cfg.num_layers_per_pipeline_stage == 1:
+      if per_stage_remat is not None:
+        return NNXSequentialPipelineStage(
+            base_stage_cls, 1, cfg, self.mesh, self.quant, self.model_mode, rngs=rngs, remat_policy=per_stage_remat
+        )
       return base_stage_cls(config=cfg, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=rngs)
     elif cfg.scan_layers_per_stage:
       return NNXScannedPipelineStage(
-          base_stage_cls, cfg.num_layers_per_pipeline_stage, cfg, self.mesh, self.quant, self.model_mode, rngs=rngs
+          base_stage_cls,
+          cfg.num_layers_per_pipeline_stage,
+          cfg,
+          self.mesh,
+          self.quant,
+          self.model_mode,
+          rngs=rngs,
+          remat_policy=per_stage_remat,
       )
     return NNXSequentialPipelineStage(
-        base_stage_cls, cfg.num_layers_per_pipeline_stage, cfg, self.mesh, self.quant, self.model_mode, rngs=rngs
+        base_stage_cls,
+        cfg.num_layers_per_pipeline_stage,
+        cfg,
+        self.mesh,
+        self.quant,
+        self.model_mode,
+        rngs=rngs,
+        remat_policy=per_stage_remat,
     )
 
   def get_pipeline_stage_module(self, decoder_blocks):

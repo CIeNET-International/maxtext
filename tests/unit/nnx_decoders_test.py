@@ -43,7 +43,13 @@ from maxtext.configs import pyconfig
 from maxtext.layers import linears
 from maxtext.layers.attentions import Attention
 from maxtext.layers.embeddings import Embed
-from maxtext.layers.nnx_decoders import NNXDecoder, NNXDecoderLayer, deepstack_process
+from maxtext.layers.nnx_decoders import (
+    NNXDecoder,
+    NNXDecoderLayer,
+    NNXScannedPipelineStage,
+    NNXSequentialPipelineStage,
+    deepstack_process,
+)
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.models import gemma4_small
 from maxtext.models.gpt3 import Gpt3LayerNorm
@@ -949,3 +955,95 @@ class TestGemma4SmallNNXDecoder(unittest.TestCase):
               model_mode=MODEL_MODE_TRAIN,
               kv_caches=kv_caches,
           )
+
+
+class TestNNXPipelineStages(unittest.TestCase):
+  """Tests for the NNX pipeline-stage modules (NNXSequentialPipelineStage / NNXScannedPipelineStage),
+  including per-stage remat + params-only host-offload (set_remat_policy_on_layers_per_stage /
+  parameter_memory_host_offload) that the nnx-based-pipeline migration dropped.
+
+  Per-stage remat and host-offload are output-transparent: rematerialization only changes which
+  activations are saved vs recomputed, and host-offload only changes where params live. Neither
+  changes the forward result, so a stage built with them must produce numerically identical output
+  to the same stage (same params/rngs) without them.
+  """
+
+  def setUp(self):
+    super().setUp()
+    self.cfg = _make_config()
+    self.mesh = _make_mesh(self.cfg)
+
+  def _inputs(self, cfg):
+    batch = cfg.global_batch_size_to_train_on
+    seq = cfg.max_target_length
+    inputs = jax.random.normal(jax.random.PRNGKey(0), (batch, seq, cfg.emb_dim)).astype(cfg.dtype)
+    segment_ids = jnp.full((batch, seq), DECODING_ACTIVE_SEQUENCE_INDICATOR)
+    positions = jnp.broadcast_to(jnp.arange(seq)[None], (batch, seq))
+    return inputs, segment_ids, positions
+
+  def _run_stage(self, stage_cls, remat_policy, num_layers=2, config=None):
+    """Builds a pipeline stage of num_layers NNXDecoderLayers and runs one train-mode forward.
+
+    Fresh rngs with a fixed seed each call -> two stages built this way share identical params, so
+    any output difference would come solely from remat / host-offload (which must be transparent).
+    """
+    cfg = config if config is not None else self.cfg
+    mesh = _make_mesh(cfg) if config is not None else self.mesh
+    stage = stage_cls(
+        NNXDecoderLayer,
+        num_layers,
+        cfg,
+        mesh,
+        None,
+        MODEL_MODE_TRAIN,
+        rngs=nnx.Rngs(params=0, dropout=1),
+        remat_policy=remat_policy,
+    )
+    inputs, segment_ids, positions = self._inputs(cfg)
+    out = stage(inputs, segment_ids, positions, True, MODEL_MODE_TRAIN)
+    return out[0] if isinstance(out, tuple) else out
+
+  def test_sequential_stage_forward_shape(self):
+    """NNXSequentialPipelineStage forward returns [batch, seq, emb] and finite values."""
+    inputs, _, _ = self._inputs(self.cfg)
+    out = self._run_stage(NNXSequentialPipelineStage, None)
+    self.assertEqual(out.shape, inputs.shape)
+    self.assertTrue(jnp.all(jnp.isfinite(out)))
+
+  def test_scanned_stage_forward_shape(self):
+    """NNXScannedPipelineStage forward returns [batch, seq, emb] and finite values."""
+    inputs, _, _ = self._inputs(self.cfg)
+    out = self._run_stage(NNXScannedPipelineStage, None)
+    self.assertEqual(out.shape, inputs.shape)
+    self.assertTrue(jnp.all(jnp.isfinite(out)))
+
+  def test_sequential_stage_remat_is_output_transparent(self):
+    """Per-stage remat on a sequential stage must not change the forward output."""
+    out_no_remat = self._run_stage(NNXSequentialPipelineStage, None)
+    out_remat = self._run_stage(NNXSequentialPipelineStage, jax.checkpoint_policies.nothing_saveable)
+    np.testing.assert_allclose(np.array(out_no_remat), np.array(out_remat), rtol=1e-5, atol=1e-5)
+
+  def test_scanned_stage_remat_is_output_transparent(self):
+    """Per-stage remat on a scanned stage must not change the forward output."""
+    out_no_remat = self._run_stage(NNXScannedPipelineStage, None)
+    out_remat = self._run_stage(NNXScannedPipelineStage, jax.checkpoint_policies.nothing_saveable)
+    np.testing.assert_allclose(np.array(out_no_remat), np.array(out_remat), rtol=1e-5, atol=1e-5)
+
+  def test_single_layer_stage_remat_is_output_transparent(self):
+    """num_layers_per_pipeline_stage==1: a 1-layer stage with remat must match the no-remat output."""
+    out_no_remat = self._run_stage(NNXSequentialPipelineStage, None, num_layers=1)
+    out_remat = self._run_stage(NNXSequentialPipelineStage, jax.checkpoint_policies.nothing_saveable, num_layers=1)
+    np.testing.assert_allclose(np.array(out_no_remat), np.array(out_remat), rtol=1e-5, atol=1e-5)
+
+  @pytest.mark.tpu_only
+  def test_remat_with_host_offload_is_output_transparent(self):
+    """Per-stage remat + params-only host-offload (parameter_memory_host_offload) must not change output.
+
+    tpu_only: host-offload uses jax.device_put(..., max_utils.device_space()) which targets TPU host
+    memory; on CPU fake-multi-device it pins params to a single device and breaks the input sharding.
+    The remat half is covered by the CPU tests above; this exercises the offload device_put on TPU.
+    """
+    plain = self._run_stage(NNXSequentialPipelineStage, None)
+    offload_cfg = _make_config(parameter_memory_host_offload=True)
+    offloaded = self._run_stage(NNXSequentialPipelineStage, jax.checkpoint_policies.nothing_saveable, config=offload_cfg)
+    np.testing.assert_allclose(np.array(plain), np.array(offloaded), rtol=1e-5, atol=1e-5)

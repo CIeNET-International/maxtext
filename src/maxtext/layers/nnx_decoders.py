@@ -266,10 +266,17 @@ class NNXSequentialPipelineStage(nnx.Module):
       model_mode: str,
       *,
       rngs: nnx.Rngs,
+      remat_policy: Any = None,
   ):
     self.config = config
     self.scan_layers = config.scan_layers
     self.num_layers = num_layers
+    # When set (via set_remat_policy_on_layers_per_stage) each inner layer's forward is
+    # rematerialized; if parameter_memory_host_offload is also enabled, its params are offloaded to
+    # host first. Mirrors the Linen reference Decoder.set_remat_policy (params-only nn.map_variables
+    # move_to_device, then nn.remat). Both default off, so this is dormant unless the flags are set.
+    self.remat_policy = remat_policy
+    self.prevent_cse = maxtext_utils.should_prevent_cse_in_remat(config)
     # Dynamically assign layers with explicit string names to ensure correct PyTree paths (layers_0)
     for i in range(num_layers):
       layer = layer_cls(config=config, mesh=mesh, quant=quant, model_mode=model_mode, rngs=rngs)
@@ -286,15 +293,31 @@ class NNXSequentialPipelineStage(nnx.Module):
   ):
     for i in range(self.num_layers):
       layer = getattr(self, f"layers_{i}")
-      out = layer(
-          inputs,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          **kwargs,
-      )
-      inputs = out[0] if isinstance(out, tuple) else out
+      if self.remat_policy is not None:
+        # Split params out so host-offload is params-only (mirrors Linen nn.map_variables(["params"])).
+        graphdef, params, rest = nnx.split(layer, nnx.Param, ...)
+
+        def pure_fn(params_in, rest_in, x_in, _graphdef=graphdef):
+          if self.config.parameter_memory_host_offload:
+            params_in = jax.tree.map(lambda x: jax.device_put(x, max_utils.device_space()), params_in)
+          merged = nnx.merge(_graphdef, params_in, rest_in)
+          out_inner = merged(x_in, decoder_segment_ids, decoder_positions, deterministic, model_mode, **kwargs)
+          out_inner = out_inner[0] if isinstance(out_inner, tuple) else out_inner
+          return out_inner, nnx.state(merged)
+
+        checkpointed_fn = jax.checkpoint(pure_fn, policy=self.remat_policy, prevent_cse=self.prevent_cse)
+        inputs, new_state = checkpointed_fn(params, rest, inputs)
+        nnx.update(layer, new_state)
+      else:
+        out = layer(
+            inputs,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+            **kwargs,
+        )
+        inputs = out[0] if isinstance(out, tuple) else out
     if self.scan_layers:
       return inputs, None
     return inputs
@@ -313,8 +336,11 @@ class NNXScannedPipelineStage(nnx.Module):
       model_mode: str,
       *,
       rngs: nnx.Rngs,
+      remat_policy: Any = None,
   ):
     self.config = config
+    self.remat_policy = remat_policy
+    self.prevent_cse = maxtext_utils.should_prevent_cse_in_remat(config)
 
     def create_layer_fn(rng):
       return layer_cls(config=config, mesh=mesh, quant=quant, model_mode=model_mode, rngs=rng)
@@ -347,6 +373,20 @@ class NNXScannedPipelineStage(nnx.Module):
 
     def layer_fn(carry, scanned_vars):
       current_params, current_state = scanned_vars
+      if self.remat_policy is not None:
+        # Per-stage-layer remat (set_remat_policy_on_layers_per_stage) + params-only host-offload,
+        # mirroring Linen set_remat_policy. current_params is already the Param-only slice.
+        def pure_fn(params_in, state_in, x_in):
+          if self.config.parameter_memory_host_offload:
+            params_in = jax.tree.map(lambda x: jax.device_put(x, max_utils.device_space()), params_in)
+          inner_layer = nnx.merge(graphdef, params_in, state_in)
+          out = inner_layer(x_in, decoder_segment_ids, decoder_positions, deterministic, model_mode, **kwargs)
+          out = out[0] if isinstance(out, tuple) else out
+          return out, nnx.state(inner_layer)
+
+        checkpointed_fn = jax.checkpoint(pure_fn, policy=self.remat_policy, prevent_cse=self.prevent_cse)
+        new_carry, new_state = checkpointed_fn(current_params, current_state, carry)
+        return new_carry, new_state
       layer = nnx.merge(graphdef, current_params, current_state)
       layer_out = layer(
           carry,
@@ -775,7 +815,18 @@ class NNXDecoder(nnx.Module):
     cfg = self.config
     base_stage_cls = decoder_blocks[1] if self.is_deepseek else decoder_blocks[0]
 
+    # Per-stage-layer remat (+ params-only host-offload inside the stage) when the flag is set.
+    # The migration that introduced these NNX stage classes dropped this; the old Linen
+    # Decoder.get_pipeline_stage_module applied it via set_remat_policy. Orthogonal to the
+    # pipeline-iteration remat (set_remat_policy_on_pipeline_iterations) applied in pipeline.py.
+    per_stage_remat = self.get_remat_policy() if cfg.set_remat_policy_on_layers_per_stage else None
+
     if cfg.num_layers_per_pipeline_stage == 1:
+      # Linen rematerialized even the single-layer stage; wrap it when the flag is set, else raw layer.
+      if per_stage_remat is not None:
+        return NNXSequentialPipelineStage(
+            base_stage_cls, 1, cfg, self.mesh, self.quant, self.model_mode, rngs=rngs, remat_policy=per_stage_remat
+        )
       return self._create_single_layer(base_stage_cls, rngs)
     elif cfg.scan_layers_per_stage:
       return NNXScannedPipelineStage(
@@ -786,6 +837,7 @@ class NNXDecoder(nnx.Module):
           self.quant,
           self.model_mode,
           rngs=rngs,
+          remat_policy=per_stage_remat,
       )
     return NNXSequentialPipelineStage(
         base_stage_cls,
@@ -795,6 +847,7 @@ class NNXDecoder(nnx.Module):
         self.quant,
         self.model_mode,
         rngs=rngs,
+        remat_policy=per_stage_remat,
     )
 
   def _create_and_register_layer(self, layer_cls, rngs, base_name, i, **layer_kwargs):
