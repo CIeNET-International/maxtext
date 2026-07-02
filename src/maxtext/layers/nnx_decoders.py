@@ -252,6 +252,33 @@ def deepstack_process(hidden_states, bidirectional_mask, visual_embeds):
   return hidden_states
 
 
+def _remat_wrapper(
+    layer_graphdef,
+    params,
+    rest,
+    host_offload: bool,
+    remat_policy,
+    prevent_cse: bool,
+    inputs,
+    decoder_segment_ids,
+    decoder_positions,
+    deterministic,
+    model_mode,
+    **kwargs,
+):
+  """Shared wrapper for applying jax.checkpoint and optional host-offload to a layer."""
+  def pure_fn(params_in, rest_in, x, det, mode):
+    if host_offload:
+      params_in = jax.tree.map(lambda x: jax.device_put(x, max_utils.device_space()), params_in)
+    merged = nnx.merge(layer_graphdef, params_in, rest_in)
+    out_inner = merged(x, decoder_segment_ids, decoder_positions, det, mode, **kwargs)
+    out_inner = out_inner[0] if isinstance(out_inner, tuple) else out_inner
+    return out_inner, nnx.state(merged)
+
+  checkpointed_fn = jax.checkpoint(pure_fn, policy=remat_policy, prevent_cse=prevent_cse, static_argnums=(3, 4))
+  return checkpointed_fn(params, rest, inputs, deterministic, model_mode)
+
+
 class NNXSequentialPipelineStage(nnx.Module):
   """Sequential unscanned series of decoder layers formatted for a single pipeline stage."""
 
@@ -298,16 +325,20 @@ class NNXSequentialPipelineStage(nnx.Module):
         # Split params out so host-offload is params-only (mirrors Linen nn.map_variables(["params"])).
         graphdef, params, rest = nnx.split(layer, nnx.Param, ...)
 
-        def pure_fn(params_in, rest_in, x_in, _graphdef=graphdef):
-          if self.config.parameter_memory_host_offload:
-            params_in = jax.tree.map(lambda x: jax.device_put(x, max_utils.device_space()), params_in)
-          merged = nnx.merge(_graphdef, params_in, rest_in)
-          out_inner = merged(x_in, decoder_segment_ids, decoder_positions, deterministic, model_mode, **kwargs)
-          out_inner = out_inner[0] if isinstance(out_inner, tuple) else out_inner
-          return out_inner, nnx.state(merged)
-
-        checkpointed_fn = jax.checkpoint(pure_fn, policy=self.remat_policy, prevent_cse=self.prevent_cse)
-        inputs, new_state = checkpointed_fn(params, rest, inputs)
+        inputs, new_state = _remat_wrapper(
+            graphdef,
+            params,
+            rest,
+            self.config.parameter_memory_host_offload,
+            self.remat_policy,
+            self.prevent_cse,
+            inputs,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+            **kwargs,
+        )
         nnx.update(layer, new_state)
       else:
         out = layer(
@@ -378,18 +409,20 @@ class NNXScannedPipelineStage(nnx.Module):
     def layer_fn(carry, scanned_vars):
       current_params, current_state = scanned_vars
       if self.apply_remat:
-
-        def pure_fn(params_in, state_in, x_in):
-          if self.config.parameter_memory_host_offload:
-            params_in = jax.tree.map(lambda x: jax.device_put(x, max_utils.device_space()), params_in)
-          inner_layer = nnx.merge(graphdef, params_in, state_in)
-          out = inner_layer(x_in, decoder_segment_ids, decoder_positions, deterministic, model_mode, **kwargs)
-          out = out[0] if isinstance(out, tuple) else out
-          return out, nnx.state(inner_layer)
-
-        checkpointed_fn = jax.checkpoint(pure_fn, policy=self.remat_policy, prevent_cse=self.prevent_cse)
-        new_carry, new_state = checkpointed_fn(current_params, current_state, carry)
-        return new_carry, new_state
+        return _remat_wrapper(
+            graphdef,
+            current_params,
+            current_state,
+            self.config.parameter_memory_host_offload,
+            self.remat_policy,
+            self.prevent_cse,
+            carry,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+            **kwargs,
+        )
       layer = nnx.merge(graphdef, current_params, current_state)
       layer_out = layer(
           carry,
@@ -737,6 +770,7 @@ class NNXDecoder(nnx.Module):
       )
 
     # 2. Scanned alternating HCA(128)/CSA(4) blocks.
+    assert (config.num_decoder_layers - self.num_prefix_layers) % 2 == 0, "DeepSeek-V4 requires an even number of scanned layers after prefix layers"
     num_full_blocks = (config.num_decoder_layers - self.num_prefix_layers) // 2
     self.scanned_blocks = (
         self._create_scanned_layers(scannable_cls, length=num_full_blocks, metadata_axis_name="layers", rngs=rngs)

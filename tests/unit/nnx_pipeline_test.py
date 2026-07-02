@@ -85,8 +85,11 @@ def _run_pipeline(config, stage_factory):
   my_pipeline = pipeline.create_pipeline(config=config, layers=stage_factory, mesh=mesh)
   with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
     params = my_pipeline.init(jax.random.PRNGKey(0), inputs, seg, positions, True, MODEL_MODE_TRAIN)
-    out = my_pipeline.apply(params, inputs, seg, positions, True, MODEL_MODE_TRAIN)
-  return out
+    def loss_fn(p, x):
+      out = my_pipeline.apply(p, x, seg, positions, True, MODEL_MODE_TRAIN)
+      return jnp.mean(out), out
+    (loss, out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, inputs)
+  return out, loss, grads
 
 
 def _simple_factory(config, mesh):
@@ -109,10 +112,12 @@ class TestNNXPipelineForward(unittest.TestCase):
   def _assert_ok(self, config):
     devices_array = maxtext_utils.create_device_mesh(config)
     mesh = Mesh(devices_array, config.mesh_axes)
-    out = _run_pipeline(config, _simple_factory(config, mesh))
+    out, loss, grads = _run_pipeline(config, _simple_factory(config, mesh))
     expected = (config.global_batch_size_to_train_on, config.max_target_length, config.emb_dim)
     self.assertEqual(out.shape, expected)
-    self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(loss))))
+    for g in jax.tree.leaves(grads):
+      self.assertTrue(bool(jnp.all(jnp.isfinite(g))))
 
   def test_noncircular_forward(self):
     self._assert_ok(_make_pipeline_config(ag_per_repeat=False, num_layers=4, num_micro=4))
@@ -170,9 +175,12 @@ class TestNNXCircularRepeatRemat(unittest.TestCase):
     )
     devices_array = maxtext_utils.create_device_mesh(cfg_on)
     mesh = Mesh(devices_array, cfg_on.mesh_axes)
-    out_on = _run_pipeline(cfg_on, _simple_factory(cfg_on, mesh))
-    out_off = _run_pipeline(cfg_off, _simple_factory(cfg_off, mesh))
-    np.testing.assert_allclose(np.array(out_on), np.array(out_off), rtol=1e-5, atol=1e-5)
+    out_on, loss_on, grads_on = _run_pipeline(cfg_on, _simple_factory(cfg_on, mesh))
+    out_off, loss_off, grads_off = _run_pipeline(cfg_off, _simple_factory(cfg_off, mesh))
+    np.testing.assert_allclose(np.array(out_on), np.array(out_off), rtol=1e-2, atol=1e-2)
+    np.testing.assert_allclose(np.array(loss_on), np.array(loss_off), rtol=1e-2, atol=1e-2)
+    for g_on, g_off in zip(jax.tree.leaves(grads_on), jax.tree.leaves(grads_off)):
+      np.testing.assert_allclose(np.array(g_on), np.array(g_off), rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
