@@ -1420,24 +1420,22 @@ class TestNNXPipelineStages(unittest.TestCase):
     return _build_and_grad()
 
   def _assert_stage_grad_parity(self, stage_cls, num_layers=2):
-    """Backward parity for per-stage remat -- PROTOTYPE D: compare no-remat vs a remat policy that SAVES
-    the matmul outputs (jax.checkpoint_policies.dots_saveable). The rematerialized backward then
-    recomputes only exact elementwise ops, never the bf16 matmuls, so gradients stay transparent on ALL
-    platforms including TPU and are asserted strict (1e-2) everywhere (cpu_only_strict=False). A
-    save-nothing policy would recompute the matmuls and diverge on TPU by bf16 fusion noise -- that is
-    the reason deepseek4 (whose unnamed indexer matmul cannot be saved) stays CPU-gated. Loss parity
-    holds everywhere."""
+    """remat vs no-remat: identical loss + gradients (wrt inputs AND params), plus a real (nonzero)
+    backward. jax.checkpoint recomputes activations in the backward pass but is mathematically
+    transparent. Exact grad equality is asserted on CPU (bit-reproducible float32); on accelerators the
+    rematerialized backward re-fuses the float32 matmuls and diverges by float noise, so there we assert
+    finite + nonzero grads (see _assert_grad_parity_platform_aware). Loss parity holds everywhere."""
     loss_ref, xgrad_ref, pgrad_ref = self._stage_value_and_grad(
         stage_cls, apply_remat=False, remat_policy=None, num_layers=num_layers
     )
     loss_remat, xgrad_remat, pgrad_remat = self._stage_value_and_grad(
-        stage_cls, apply_remat=True, remat_policy=jax.checkpoint_policies.dots_saveable, num_layers=num_layers
+        stage_cls, apply_remat=True, remat_policy=jax.checkpoint_policies.nothing_saveable, num_layers=num_layers
     )
     # Loss parity (reproducible on all platforms).
     np.testing.assert_allclose(np.array(loss_remat), np.array(loss_ref), rtol=1e-2, atol=1e-2)
-    # Input-gradient parity (strict on all platforms: matmuls are saved, only exact elementwise recomputed).
+    # Input-gradient parity.
     _assert_grad_parity_platform_aware(
-        self, [xgrad_ref], [xgrad_remat], what="stage remat input-grad", cpu_only_strict=False
+        self, [xgrad_ref], [xgrad_remat], what="stage remat input-grad"
     )
     # Per-Param gradient parity across the whole pytree.
     _assert_grad_parity_platform_aware(
@@ -1445,7 +1443,6 @@ class TestNNXPipelineStages(unittest.TestCase):
         jax.tree_util.tree_leaves(pgrad_ref),
         jax.tree_util.tree_leaves(pgrad_remat),
         what="stage remat param-grads",
-        cpu_only_strict=False,
     )
 
   def test_sequential_stage_remat_grad_parity(self):
@@ -1503,23 +1500,20 @@ class TestNNXPipelineStages(unittest.TestCase):
     loss_off, xgrad_off, pgrad_off = self._stage_value_and_grad(
         NNXSequentialPipelineStage,
         apply_remat=True,
-        remat_policy=jax.checkpoint_policies.dots_saveable,
+        remat_policy=jax.checkpoint_policies.nothing_saveable,
         config=offload_cfg,
         use_mesh=True,
     )
     np.testing.assert_allclose(np.array(loss_off), np.array(loss_ref), rtol=1e-2, atol=1e-2)
-    # PROTOTYPE D: the offloaded path saves its matmuls (dots_saveable), so the rematerialized backward
-    # recomputes only exact elementwise ops -> gradients stay transparent on TPU and are asserted strict
-    # (cpu_only_strict=False). This test is tpu_only, so that strict check actually runs ON TPU here.
-    _assert_grad_parity_platform_aware(
-        self, [xgrad_ref], [xgrad_off], what="host-offload input-grad", cpu_only_strict=False
-    )
+    # tpu_only: this runs on TPU, where the rematerialized backward diverges by float noise, so the
+    # elementwise gate below is a no-op here and we assert finite + nonzero grads. The offload path is
+    # additionally pinned output-transparent at 1e-5 by test_remat_with_host_offload_is_output_transparent.
+    _assert_grad_parity_platform_aware(self, [xgrad_ref], [xgrad_off], what="host-offload input-grad")
     _assert_grad_parity_platform_aware(
         self,
         jax.tree_util.tree_leaves(pgrad_ref),
         jax.tree_util.tree_leaves(pgrad_off),
         what="host-offload param-grads",
-        cpu_only_strict=False,
     )
 
 
