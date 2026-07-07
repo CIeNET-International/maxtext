@@ -743,6 +743,66 @@ class TestNNXDecoderDeepseekAndGemma4(unittest.TestCase):
         rngs=self.rngs,
     )
 
+  def test_gemma_scan_layers_equivalence(self):
+    # Test that scan_layers=True and scan_layers=False produce identical logits
+    # even when bidirectional_mask is provided, proving kwargs are not dropped.
+    cfg_base = {
+        "run_name": "gemma3_scan_equiv_test",
+        "decoder_block": "gemma3",
+        "model_name": "gemma3-4b",
+        "num_decoder_layers": 2,
+        "base_emb_dim": 128,
+        "base_num_query_heads": 4,
+        "base_num_kv_heads": 4,
+        "base_mlp_dim": 256,
+        "hidden_size_per_layer_input": 128,
+        "vocab_size_per_layer_input": 256,
+        "vocab_size": 256,
+        "max_target_length": 64,
+        "per_device_batch_size": 1.0,
+    }
+
+    cfg_scanned = _make_config(scan_layers=True, **cfg_base)
+    cfg_unscanned = _make_config(scan_layers=False, **cfg_base)
+
+    # Use identical RNGs to guarantee the same parameter initialization
+    rngs_scanned = nnx.Rngs(params=0, dropout=1)
+    rngs_unscanned = nnx.Rngs(params=0, dropout=1)
+
+    decoder_scanned = NNXDecoder(config=cfg_scanned, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=rngs_scanned)
+    decoder_unscanned = NNXDecoder(config=cfg_unscanned, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN, rngs=rngs_unscanned)
+
+    ids, segment_ids, positions = self._make_token_inputs(cfg_scanned)
+    shared_embedding = self._make_shared_embedding(cfg_scanned)
+
+    # Provide a mock bidirectional_mask to trigger the code path that dropped the kwarg
+    batch = cfg_scanned.global_batch_size_to_train_on
+    seq_len = cfg_scanned.max_target_length
+    bidirectional_mask = jax.random.normal(self.rng, (batch, seq_len)) > 0
+    mm_input = MultimodalInput(bidirectional_mask=bidirectional_mask)
+
+    logits_scanned, _, _ = decoder_scanned(
+        shared_embedding,
+        ids,
+        positions,
+        decoder_segment_ids=segment_ids,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+        multimodal_input=mm_input,
+    )
+
+    logits_unscanned, _, _ = decoder_unscanned(
+        shared_embedding,
+        ids,
+        positions,
+        decoder_segment_ids=segment_ids,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+        multimodal_input=mm_input,
+    )
+
+    np.testing.assert_allclose(logits_scanned, logits_unscanned, atol=1e-4, rtol=1e-4)
+
   def test_gemma4_scanned_layers(self):
     """Test NNXDecoder with gemma4 block and scan_layers=True."""
     cfg = _make_config(
@@ -799,6 +859,8 @@ class TestGemma4SmallNNXDecoder(unittest.TestCase):
             "hidden_size_per_layer_input=128",
             "vocab_size_per_layer_input=256",
             "vocab_size=256",
+            "max_target_length=128",
+            "per_device_batch_size=1.0",
         ],
         override_model_config=True,
     )
@@ -872,6 +934,8 @@ class TestGemma4SmallNNXDecoder(unittest.TestCase):
             "hidden_size_per_layer_input=128",
             "vocab_size_per_layer_input=256",
             "vocab_size=256",
+            "max_target_length=128",
+            "per_device_batch_size=1.0",
         ],
         override_model_config=True,
     )
