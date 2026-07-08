@@ -241,6 +241,19 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
         model=rollout_actor,
         backend="vllm_jax",
     )
+    engine_kwargs = {
+        "max_model_len": cache_config_or_size,
+        "model": rollout_config.rollout_vllm_model_version,
+        "swap_space": getattr(rollout_config, "rollout_vllm_swap_space_size_gb", maxtext_config.swap_space_vllm_gb),
+        # Async scheduling causes KeyError in dp_scheduler on slow models
+        # (30B+) where inference latency exceeds the scheduler's window.
+        "async_scheduling": rollout_config.rollout_vllm_async_scheduling,
+    }
+    
+    # Merge additional kwargs like dtype and hf_overrides provided by train_rl.py
+    if hasattr(rollout_config, "rollout_vllm_kwargs") and rollout_config.rollout_vllm_kwargs:
+        engine_kwargs.update(rollout_config.rollout_vllm_kwargs)
+
     self._sampler = MaxTextVllmSampler(
         tokenizer=tokenizer,
         config=VllmConfig(  # pylint: disable=unexpected-keyword-arg,no-value-for-parameter
@@ -254,14 +267,7 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
             tensor_parallel_size=rollout_config.tensor_parallel_size,
             data_parallel_size=rollout_config.data_parallel_size,
             enable_dp_attention=rollout_config.rollout_vllm_enable_dp_attention,
-            engine_kwargs={
-                "max_model_len": cache_config_or_size,
-                "model": rollout_config.rollout_vllm_model_version,
-                "swap_space": getattr(rollout_config, "rollout_vllm_swap_space_size_gb", maxtext_config.swap_space_vllm_gb),
-                # Async scheduling causes KeyError in dp_scheduler on slow models
-                # (30B+) where inference latency exceeds the scheduler's window.
-                "async_scheduling": rollout_config.rollout_vllm_async_scheduling,
-            },
+            engine_kwargs=engine_kwargs,
         ),
         converter=converter,
     )
