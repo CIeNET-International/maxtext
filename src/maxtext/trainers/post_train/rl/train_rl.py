@@ -65,6 +65,7 @@ from orbax import checkpoint as ocp
 from pprint import pprint
 from transformers import AutoTokenizer
 import maxtext.integration.vllm.maxtext_vllm_adapter as adapter
+
 adapter.register()
 import functools
 from tunix.rl import rl_cluster as rl_cluster_lib
@@ -503,7 +504,7 @@ def create_rl_components(
               "enable_expert_parallel": sampler_config.enable_expert_parallel,
               "enable_prefix_caching": True,  # Enable prefix caching to speed up generation for long prompts
               # Ensures vLLM model initializes with correct dtype (not float32 default)
-              "dtype": trainer_config.weight_dtype.name,
+              "dtype": trainer_config.weight_dtype.value,
           },
           rollout_vllm_sampling_kwargs={
               "stop": trainer_config.stop_strings,
