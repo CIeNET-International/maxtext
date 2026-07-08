@@ -1060,7 +1060,6 @@ class Attention(nnx.Module):
         q_scale,
         k_scale,
         v_scale,
-        update_kv_cache=update_kv_cache,
     )
     return output, kv_cache
 

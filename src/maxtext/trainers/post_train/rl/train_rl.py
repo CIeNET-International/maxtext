@@ -64,6 +64,8 @@ from flax import nnx
 from orbax import checkpoint as ocp
 from pprint import pprint
 from transformers import AutoTokenizer
+import maxtext.integration.vllm.maxtext_vllm_adapter as adapter
+adapter.register()
 import functools
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.rollout import base_rollout

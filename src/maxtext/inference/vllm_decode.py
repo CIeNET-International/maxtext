@@ -109,10 +109,6 @@ def decode_with_vllm(config: Config) -> None:
       },
   }
 
-  if config.scan_layers:
-    max_logging.log("CRITICAL WARNING: vLLM requires scan_layers=False. Forcing scan_layers to False in vllm_args.")
-    vllm_args["additional_config"]["maxtext_config"]["scan_layers"] = False
-
   if config.load_parameters_path:
     vllm_args["additional_config"]["maxtext_config"]["load_parameters_path"] = config.load_parameters_path
   else:
