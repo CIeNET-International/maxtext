@@ -36,6 +36,7 @@ from maxtext.common.common_types import (
     DECODING_ACTIVE_SEQUENCE_INDICATOR,
     MODEL_MODE_PREFILL,
     MODEL_MODE_TRAIN,
+    MODEL_MODE_AUTOREGRESSIVE,
     DecoderBlockType,
     MultimodalInput,
 )
@@ -803,6 +804,50 @@ class TestNNXDecoderDeepseekAndGemma4(unittest.TestCase):
 
     np.testing.assert_allclose(logits_scanned, logits_unscanned, atol=1e-4, rtol=1e-4)
 
+  def test_gemma_scan_layers_kv_cache_updated(self):
+    # Test that scan_layers=True correctly forwards kv_caches to _apply_layers_sequentially
+    from unittest.mock import MagicMock
+    cfg = _make_config(
+        run_name="gemma3_scan_kv_test",
+        decoder_block="gemma3",
+        model_name="gemma3-4b",
+        scan_layers=True,
+        num_decoder_layers=2,
+        base_emb_dim=128,
+        base_num_query_heads=4,
+        base_num_kv_heads=4,
+        base_mlp_dim=256,
+        hidden_size_per_layer_input=128,
+        vocab_size_per_layer_input=256,
+        vocab_size=256,
+        max_target_length=64,
+        per_device_batch_size=1.0,
+    )
+    
+    decoder = NNXDecoder(config=cfg, mesh=self.mesh, model_mode=MODEL_MODE_PREFILL, rngs=self.rngs)
+    ids, segment_ids, positions = self._make_token_inputs(cfg)
+    shared_embedding = self._make_shared_embedding(cfg)
+    
+    decoder._apply_gemma3_scanned_blocks = MagicMock(return_value=jnp.zeros((1, 1)))
+    
+    mock_kv_caches = [jnp.zeros((1, 1)) for _ in range(cfg.num_decoder_layers)]
+    
+    _ = decoder(
+        shared_embedding,
+        ids,
+        positions,
+        decoder_segment_ids=segment_ids,
+        deterministic=True,
+        model_mode=MODEL_MODE_PREFILL,
+        kv_caches=mock_kv_caches,
+    )
+    
+    # Verify that _apply_gemma3_scanned_blocks was called with the kv_caches
+    self.assertTrue(decoder._apply_gemma3_scanned_blocks.called)
+    call_kwargs = decoder._apply_gemma3_scanned_blocks.call_args[1]
+    self.assertIn("kv_caches", call_kwargs)
+    self.assertEqual(call_kwargs["kv_caches"], mock_kv_caches)
+    
   def test_gemma4_scanned_layers(self):
     """Test NNXDecoder with gemma4 block and scan_layers=True."""
     cfg = _make_config(
