@@ -1801,6 +1801,8 @@ class NNXDecoder(nnx.Module):
               bidirectional_mask,
               previous_chunk,
               slot,
+              kv_caches=kv_caches,
+              attention_metadata=attention_metadata,
           )
         elif self.is_gemma4:
           y = self._apply_gemma4_scanned_blocks(
@@ -1812,6 +1814,8 @@ class NNXDecoder(nnx.Module):
               bidirectional_mask,
               previous_chunk,
               slot,
+              kv_caches=kv_caches,
+              attention_metadata=attention_metadata,
           )
         else:
           scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
