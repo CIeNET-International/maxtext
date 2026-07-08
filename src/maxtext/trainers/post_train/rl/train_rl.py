@@ -452,11 +452,7 @@ def create_rl_components(
   argv_list = ["", str(vllm_config_path), "log_config=False"]
   vllm_config = pyconfig.initialize(argv_list)
 
-  rl_rollout_engine = (
-      functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config)
-      if trainer_config.use_standalone_converter
-      else "vllm"
-  )
+  rl_rollout_engine = functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config)
 
   cluster_config = rl_cluster_lib.ClusterConfig(
       role_to_mesh={
