@@ -29,6 +29,8 @@ import logging
 import time
 import jax
 from flax import nnx
+from flax.traverse_util import flatten_dict, unflatten_dict
+
 from pathwaysutils.experimental import reshard as _experimental_reshard
 from tunix.generate import mappings
 from tunix.generate.vllm_sampler import VllmConfig, VllmSampler
@@ -76,7 +78,6 @@ class MaxTextVllmSampler(VllmSampler):
       # --- Workaround for tunix unstacking bug with Gemma 3/4 scanned blocks ---
       # tunix fails to map nested layers like `layers.layers_0` to `layers_X`.
       # We manually unroll them here if we detect the structure.
-      from flax.traverse_util import flatten_dict, unflatten_dict
 
       def unroll_gemma_scanned_weights(weights):
         if not hasattr(weights, "to_pure_dict"):
@@ -99,7 +100,8 @@ class MaxTextVllmSampler(VllmSampler):
           if "decoder/layers/layers_" in k:
             layer_sub_idx = k.split("decoder/layers/layers_")[1].split("/")[0]
             pattern_keys.add(int(layer_sub_idx))
-            scan_length = v.shape[0] if v.shape else 0
+            if hasattr(v, "shape") and len(v.shape) > 0:
+              scan_length = max(scan_length, v.shape[0])
 
         pattern_length = max(pattern_keys) + 1 if pattern_keys else 0
 
