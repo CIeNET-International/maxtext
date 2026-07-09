@@ -270,6 +270,7 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
             data_parallel_size=rollout_config.data_parallel_size,
             enable_dp_attention=rollout_config.rollout_vllm_enable_dp_attention,
             engine_kwargs=engine_kwargs,
+            additional_config=getattr(rollout_config, "rollout_vllm_additional_config", None),
         ),
         converter=converter,
     )
