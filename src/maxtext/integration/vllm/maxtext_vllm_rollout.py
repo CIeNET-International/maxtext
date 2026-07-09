@@ -87,7 +87,7 @@ class MaxTextVllmSampler(VllmSampler):
 
         # Check if this is actually a scanned Gemma 3/4 checkpoint
         # by looking for the 'layers' and 'layers_0' nested structure.
-        is_gemma_scanned = any("/decoder/layers/layers_0/" in k for k in flat_w)
+        is_gemma_scanned = any("decoder/layers/layers_0/" in k for k in flat_w)
 
         if not is_gemma_scanned:
           return weights
@@ -96,18 +96,18 @@ class MaxTextVllmSampler(VllmSampler):
         pattern_keys = set()
         scan_length = 0
         for k, v in flat_w.items():
-          if "/decoder/layers/layers_" in k:
-            layer_sub_idx = k.split("/decoder/layers/layers_")[1].split("/")[0]
+          if "decoder/layers/layers_" in k:
+            layer_sub_idx = k.split("decoder/layers/layers_")[1].split("/")[0]
             pattern_keys.add(int(layer_sub_idx))
             scan_length = v.shape[0] if v.shape else 0
 
         pattern_length = max(pattern_keys) + 1 if pattern_keys else 0
 
         for k, v in flat_w.items():
-          if "/decoder/layers/layers_" in k:
+          if "decoder/layers/layers_" in k:
             # Unstack the array along the 0th axis
-            parts = k.split("/decoder/layers/layers_")
-            prefix = parts[0] + "/decoder/layers_"
+            parts = k.split("decoder/layers/layers_")
+            prefix = parts[0] + "decoder/layers_"
             layer_sub_idx = int(parts[1].split("/")[0])
             suffix = "/" + "/".join(parts[1].split("/")[1:])
 
@@ -118,9 +118,9 @@ class MaxTextVllmSampler(VllmSampler):
               global_idx = i * pattern_length + layer_sub_idx
               new_flat_w[f"{prefix}{global_idx}{suffix}"] = unstacked[i]
 
-          elif "/decoder/layers_remainder/layers_" in k:
-            parts = k.split("/decoder/layers_remainder/layers_")
-            prefix = parts[0] + "/decoder/layers_"
+          elif "decoder/layers_remainder/layers_" in k:
+            parts = k.split("decoder/layers_remainder/layers_")
+            prefix = parts[0] + "decoder/layers_"
             layer_sub_idx = int(parts[1].split("/")[0])
             suffix = "/" + "/".join(parts[1].split("/")[1:])
 
