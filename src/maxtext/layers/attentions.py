@@ -1038,12 +1038,6 @@ class Attention(nnx.Module):
 
     md = rpa_metadata
 
-    # With cross-layer KV sharing (Gemma 4 E2B / E4B), a KV-shared layer has no
-    # cache of its own: `rpa_kv_cache` here is the donor layer's cache, and
-    # attention must run against the K/V the donor already wrote for this
-    # position. Only the donor writes the cache; shared layers read it as-is.
-    update_kv_cache = not self.share_kv_layer
-
     output, kv_cache = rpa_ops(
         self.mesh,
         query,

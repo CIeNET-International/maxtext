@@ -23,6 +23,8 @@ Tests cover:
 
 import sys
 import unittest
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 import jax
@@ -36,7 +38,6 @@ from maxtext.common.common_types import (
     DECODING_ACTIVE_SEQUENCE_INDICATOR,
     MODEL_MODE_PREFILL,
     MODEL_MODE_TRAIN,
-    MODEL_MODE_AUTOREGRESSIVE,
     DecoderBlockType,
     MultimodalInput,
 )
@@ -805,8 +806,9 @@ class TestNNXDecoderDeepseekAndGemma4(unittest.TestCase):
     np.testing.assert_allclose(logits_scanned, logits_unscanned, atol=1e-4, rtol=1e-4)
 
   def test_gemma_scan_layers_kv_cache_updated(self):
-    # Test that scan_layers=True correctly forwards kv_caches to _apply_layers_sequentially
-    from unittest.mock import MagicMock
+    # Test that scan_layers=True correctly forwards kv_caches to _apply_layers_sequentially.
+    # Patching/inspecting the private _apply_gemma3_scanned_blocks is intentional here.
+    # pylint: disable=protected-access
     cfg = _make_config(
         run_name="gemma3_scan_kv_test",
         decoder_block="gemma3",
@@ -823,15 +825,15 @@ class TestNNXDecoderDeepseekAndGemma4(unittest.TestCase):
         max_target_length=64,
         per_device_batch_size=1.0,
     )
-    
+
     decoder = NNXDecoder(config=cfg, mesh=self.mesh, model_mode=MODEL_MODE_PREFILL, rngs=self.rngs)
     ids, segment_ids, positions = self._make_token_inputs(cfg)
     shared_embedding = self._make_shared_embedding(cfg)
-    
+
     decoder._apply_gemma3_scanned_blocks = MagicMock(return_value=jnp.zeros((1, 1)))
-    
+
     mock_kv_caches = [jnp.zeros((1, 1)) for _ in range(cfg.num_decoder_layers)]
-    
+
     _ = decoder(
         shared_embedding,
         ids,
@@ -841,13 +843,13 @@ class TestNNXDecoderDeepseekAndGemma4(unittest.TestCase):
         model_mode=MODEL_MODE_PREFILL,
         kv_caches=mock_kv_caches,
     )
-    
+
     # Verify that _apply_gemma3_scanned_blocks was called with the kv_caches
     self.assertTrue(decoder._apply_gemma3_scanned_blocks.called)
     call_kwargs = decoder._apply_gemma3_scanned_blocks.call_args[1]
     self.assertIn("kv_caches", call_kwargs)
     self.assertEqual(call_kwargs["kv_caches"], mock_kv_caches)
-    
+
   def test_gemma4_scanned_layers(self):
     """Test NNXDecoder with gemma4 block and scan_layers=True."""
     cfg = _make_config(
@@ -956,9 +958,6 @@ class TestGemma4SmallNNXDecoder(unittest.TestCase):
     )
 
   def test_gemma4_small_decoder_with_mock_cache_and_ple(self):
-    # pylint: disable=import-outside-toplevel
-    from unittest.mock import MagicMock, patch
-
     cfg = pyconfig.initialize(
         [
             None,
