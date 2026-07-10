@@ -448,23 +448,16 @@ def create_rl_components(
       except json.JSONDecodeError as e:
         raise ValueError(f"Failed to parse additional_config JSON: {e}") from e
 
-  # Parse vllm_hf_overrides
-  rollout_hf_overrides = None
-  if trainer_config.vllm_hf_overrides:
-    if isinstance(trainer_config.vllm_hf_overrides, dict):
-      rollout_hf_overrides = trainer_config.vllm_hf_overrides
-    elif isinstance(trainer_config.vllm_hf_overrides, str):
-      try:
-        rollout_hf_overrides = json.loads(trainer_config.vllm_hf_overrides)
-      except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse hf_overrides JSON: {e}") from e
-
   # We need to parse vLLM config to get the logical axis rules for the sampler config.
   vllm_config_path = os.path.join(MAXTEXT_CONFIGS_DIR, "inference", "vllm.yml")
   argv_list = ["", str(vllm_config_path), "log_config=False"]
   vllm_config = pyconfig.initialize(argv_list)
 
-  rl_rollout_engine = functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config)
+  rl_rollout_engine = (
+      functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config)
+      if trainer_config.use_standalone_converter
+      else "vllm"
+  )
 
   cluster_config = rl_cluster_lib.ClusterConfig(
       role_to_mesh={
@@ -511,7 +504,7 @@ def create_rl_components(
           rollout_vllm_server_mode=trainer_config.rl.use_agentic_rollout,
           rollout_vllm_reshard_chunk_size=trainer_config.rl.reshard_chunk_size,
           rollout_vllm_kwargs={
-              "hf_overrides": rollout_hf_overrides,
+              "hf_overrides": trainer_config.vllm_hf_overrides,
               "enable_expert_parallel": sampler_config.enable_expert_parallel,
               "enable_prefix_caching": True,  # Enable prefix caching to speed up generation for long prompts
               # Ensures vLLM model initializes with correct dtype (not float32 default)
