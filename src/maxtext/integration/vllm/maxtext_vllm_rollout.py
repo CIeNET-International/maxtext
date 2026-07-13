@@ -76,14 +76,17 @@ def unroll_gemma_scanned_weights(weights):
     if "decoder/layers/layers_" in k or "decoder/scanned_blocks/layers_" in k:
       layer_sub_idx = k.split("layers_")[-1].split("/")[0]
       pattern_keys.add(int(layer_sub_idx))
-      if hasattr(v, "shape") and len(v.shape) > 0:
-        scan_length = max(scan_length, v.shape[0])
+      # In MaxText, Gemma uses param_scan_axis=1, so the scan dimension is at axis 1
+      if hasattr(v, "shape") and len(v.shape) > 1:
+        scan_length = max(scan_length, v.shape[1])
 
   pattern_length = max(pattern_keys) + 1 if pattern_keys else 0
 
+  import numpy as np
+
   for k, v in flat_w.items():
     if "decoder/layers/layers_" in k or "decoder/scanned_blocks/layers_" in k:
-      # Unstack the array along the 0th axis
+      # Unstack the array along the 1st axis
       if "decoder/scanned_blocks/layers_" in k:
         parts = k.split("decoder/scanned_blocks/layers_")
         prefix = parts[0] + "decoder/scanned_blocks/layers_"
@@ -94,19 +97,24 @@ def unroll_gemma_scanned_weights(weights):
       layer_sub_idx = int(parts[1].split("/")[0])
       suffix = "/" + "/".join(parts[1].split("/")[1:])
 
-      unstacked = [v[i] for i in range(scan_length)] if hasattr(v, "shape") and len(v.shape) > 0 else [v] * scan_length
+      import jax.numpy as jnp
+      if hasattr(v, "shape") and len(v.shape) > 1:
+        v_swapped = jnp.swapaxes(v, 1, 0)
+        unstacked = [v_swapped[i] for i in range(scan_length)]
+      else:
+        unstacked = [v] * scan_length
+
       for i in range(scan_length):
         global_idx = i * pattern_length + layer_sub_idx
-        new_flat_w[f"{prefix}{global_idx}{suffix}"] = unstacked[i]
+        # Map back to nnx.List format which uses layers/X/ instead of layers_X
+        new_flat_w[f"decoder/layers/{global_idx}{suffix}"] = unstacked[i]
 
     elif "decoder/layers_remainder/layers_" in k:
-      parts = k.split("decoder/layers_remainder/layers_")
-      prefix = parts[0] + "decoder/layers_remainder/layers_"
-      layer_sub_idx = int(parts[1].split("/")[0])
-      suffix = "/" + "/".join(parts[1].split("/")[1:])
+      layer_sub_idx = int(k.split("decoder/layers_remainder/layers_")[1].split("/")[0])
+      suffix = "/" + "/".join(k.split("decoder/layers_remainder/layers_")[1].split("/")[1:])
 
       global_idx = scan_length * pattern_length + layer_sub_idx
-      new_flat_w[f"{prefix}{global_idx}{suffix}"] = v
+      new_flat_w[f"decoder/layers/{global_idx}{suffix}"] = v
     else:
       new_flat_w[k] = v
 

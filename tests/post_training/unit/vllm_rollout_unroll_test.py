@@ -46,8 +46,10 @@ class GemmaScannedWeightsUnrollTest(unittest.TestCase):
     """If the checkpoint is not scanned (no 'layers_0' inside 'decoder/layers/'), return unchanged."""
     pure_dict = {
         "decoder": {
-            "layers_0": {"attn": {"wq": np.ones(10)}},
-            "layers_1": {"attn": {"wq": np.ones(10)}},
+            "layers": {
+                "0": {"attn": {"wq": np.ones(10)}},
+                "1": {"attn": {"wq": np.ones(10)}},
+            }
         }
     }
     weights = MockWeights(pure_dict)
@@ -58,20 +60,34 @@ class GemmaScannedWeightsUnrollTest(unittest.TestCase):
   def test_correctly_unrolls_gemma_scanned_weights(self):
     """Verify that scanned layers are properly interleaved and mapped, and remainder layers are appended."""
     # Pattern length = 2 (layers_0 and layers_1)
-    # Scan length = 3 (leading dimension of arrays is 3)
+    # Scan length = 3. In MaxText, param_scan_axis=1, so shape is (feature_dim, scan_length, ...)
+    
+    # We want an array where axis 1 has length 3. Let's make it (2, 3, 1)
+    # For layers_0, values should be 0, 2, 4
+    arr0 = np.zeros((2, 3, 1))
+    arr0[:, 0, :] = 0
+    arr0[:, 1, :] = 2
+    arr0[:, 2, :] = 4
+    
+    # For layers_1, values should be 1, 3, 5
+    arr1 = np.zeros((2, 3, 1))
+    arr1[:, 0, :] = 1
+    arr1[:, 1, :] = 3
+    arr1[:, 2, :] = 5
+    
     pure_dict = {
         "decoder": {
             "layers": {
                 "layers_0": {
-                    "attn": {"wq": np.array([[0, 0], [2, 2], [4, 4]])},  # idx 0, 2, 4
+                    "attn": {"wq": arr0},
                 },
                 "layers_1": {
-                    "attn": {"wq": np.array([[1, 1], [3, 3], [5, 5]])},  # idx 1, 3, 5
+                    "attn": {"wq": arr1},
                 },
             },
             "layers_remainder": {
                 "layers_0": {
-                    "attn": {"wq": np.array([6, 6])},  # idx 3 * 2 + 0 = 6
+                    "attn": {"wq": np.array([[6, 6]]).transpose()}, # shape (2, 1)
                 }
             }
         }
@@ -82,40 +98,50 @@ class GemmaScannedWeightsUnrollTest(unittest.TestCase):
     # Check unrolled structure
     decoder_dict = unrolled["decoder"]
     
-    # Should contain keys layers_0 to layers_6 under layers
-    self.assertIn("layers_0", decoder_dict["layers"])
-    self.assertIn("layers_1", decoder_dict["layers"])
-    self.assertIn("layers_2", decoder_dict["layers"])
-    self.assertIn("layers_3", decoder_dict["layers"])
-    self.assertIn("layers_4", decoder_dict["layers"])
-    self.assertIn("layers_5", decoder_dict["layers"])
-    self.assertIn("layers_6", decoder_dict["layers_remainder"])
+    # Should contain keys 0 to 6 under layers
+    self.assertIn("0", decoder_dict["layers"])
+    self.assertIn("1", decoder_dict["layers"])
+    self.assertIn("2", decoder_dict["layers"])
+    self.assertIn("3", decoder_dict["layers"])
+    self.assertIn("4", decoder_dict["layers"])
+    self.assertIn("5", decoder_dict["layers"])
+    self.assertIn("6", decoder_dict["layers"])
 
     # Check that values are correctly sliced
-    np.testing.assert_array_equal(decoder_dict["layers"]["layers_0"]["attn"]["wq"], np.array([0, 0]))
-    np.testing.assert_array_equal(decoder_dict["layers"]["layers_1"]["attn"]["wq"], np.array([1, 1]))
-    np.testing.assert_array_equal(decoder_dict["layers"]["layers_2"]["attn"]["wq"], np.array([2, 2]))
-    np.testing.assert_array_equal(decoder_dict["layers"]["layers_3"]["attn"]["wq"], np.array([3, 3]))
-    np.testing.assert_array_equal(decoder_dict["layers"]["layers_4"]["attn"]["wq"], np.array([4, 4]))
-    np.testing.assert_array_equal(decoder_dict["layers"]["layers_5"]["attn"]["wq"], np.array([5, 5]))
-    np.testing.assert_array_equal(decoder_dict["layers_remainder"]["layers_6"]["attn"]["wq"], np.array([6, 6]))
+    np.testing.assert_array_equal(decoder_dict["layers"]["0"]["attn"]["wq"], np.array([[0], [0]]))
+    np.testing.assert_array_equal(decoder_dict["layers"]["1"]["attn"]["wq"], np.array([[1], [1]]))
+    np.testing.assert_array_equal(decoder_dict["layers"]["2"]["attn"]["wq"], np.array([[2], [2]]))
+    np.testing.assert_array_equal(decoder_dict["layers"]["3"]["attn"]["wq"], np.array([[3], [3]]))
+    np.testing.assert_array_equal(decoder_dict["layers"]["4"]["attn"]["wq"], np.array([[4], [4]]))
+    np.testing.assert_array_equal(decoder_dict["layers"]["5"]["attn"]["wq"], np.array([[5], [5]]))
+    np.testing.assert_array_equal(decoder_dict["layers"]["6"]["attn"]["wq"], np.array([[6], [6]]))
 
   @pytest.mark.cpu_only
   def test_correctly_unrolls_gemma3_gemma4_scanned_blocks(self):
     """Verify that scanned layers under scanned_blocks are properly interleaved and mapped."""
+    arr0 = np.zeros((2, 3, 1))
+    arr0[:, 0, :] = 0
+    arr0[:, 1, :] = 2
+    arr0[:, 2, :] = 4
+    
+    arr1 = np.zeros((2, 3, 1))
+    arr1[:, 0, :] = 1
+    arr1[:, 1, :] = 3
+    arr1[:, 2, :] = 5
+    
     pure_dict = {
         "decoder": {
             "scanned_blocks": {
                 "layers_0": {
-                    "attn": {"wq": np.array([[0, 0], [2, 2], [4, 4]])},
+                    "attn": {"wq": arr0},
                 },
                 "layers_1": {
-                    "attn": {"wq": np.array([[1, 1], [3, 3], [5, 5]])},
+                    "attn": {"wq": arr1},
                 },
             },
             "layers_remainder": {
                 "layers_0": {
-                    "attn": {"wq": np.array([6, 6])},
+                    "attn": {"wq": np.array([[6, 6]]).transpose()},
                 }
             }
         }
@@ -124,7 +150,7 @@ class GemmaScannedWeightsUnrollTest(unittest.TestCase):
     unrolled = unroll_gemma_scanned_weights(weights)
 
     decoder_dict = unrolled["decoder"]
-    self.assertIn("layers_0", decoder_dict["scanned_blocks"])
-    self.assertIn("layers_6", decoder_dict["layers_remainder"])
-    np.testing.assert_array_equal(decoder_dict["scanned_blocks"]["layers_0"]["attn"]["wq"], np.array([0, 0]))
-    np.testing.assert_array_equal(decoder_dict["layers_remainder"]["layers_6"]["attn"]["wq"], np.array([6, 6]))
+    self.assertIn("0", decoder_dict["layers"])
+    self.assertIn("6", decoder_dict["layers"])
+    np.testing.assert_array_equal(decoder_dict["layers"]["0"]["attn"]["wq"], np.array([[0], [0]]))
+    np.testing.assert_array_equal(decoder_dict["layers"]["6"]["attn"]["wq"], np.array([[6], [6]]))
