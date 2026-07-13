@@ -84,18 +84,13 @@ def unroll_gemma_scanned_weights(weights):
   for k, v in flat_w.items():
     if "decoder/layers/layers_" in k or "decoder/scanned_blocks/layers_" in k:
       # Unstack the array along the 0th axis
-      parts = k.split("layers_")
-      # Everything before the last 'layers_' becomes the prefix (e.g., ...decoder/scanned_blocks/)
-      # Wait, replace the path to be a standard flat layer for tunix, e.g. decoder/layers_X
-
-      # The safe way to map this is to simply replace 'decoder/scanned_blocks/layers_'
-      # or 'decoder/layers/layers_' with 'decoder/layers_'
       if "decoder/scanned_blocks/layers_" in k:
         parts = k.split("decoder/scanned_blocks/layers_")
+        prefix = parts[0] + "decoder/scanned_blocks/layers_"
       else:
         parts = k.split("decoder/layers/layers_")
+        prefix = parts[0] + "decoder/layers/layers_"
 
-      prefix = parts[0] + "decoder/layers_"
       layer_sub_idx = int(parts[1].split("/")[0])
       suffix = "/" + "/".join(parts[1].split("/")[1:])
 
@@ -106,7 +101,7 @@ def unroll_gemma_scanned_weights(weights):
 
     elif "decoder/layers_remainder/layers_" in k:
       parts = k.split("decoder/layers_remainder/layers_")
-      prefix = parts[0] + "decoder/layers_"
+      prefix = parts[0] + "decoder/layers_remainder/layers_"
       layer_sub_idx = int(parts[1].split("/")[0])
       suffix = "/" + "/".join(parts[1].split("/")[1:])
 
