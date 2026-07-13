@@ -68,6 +68,8 @@ def unroll_gemma_scanned_weights(weights):
 
   if not is_gemma_scanned:
     return weights
+    
+  logging.info("MaxTextVllmSampler: Detected Gemma scanned weights structure. Unrolling along axis 1...")
 
   # Determine attention pattern length and scan length
   pattern_keys = set()
@@ -81,9 +83,11 @@ def unroll_gemma_scanned_weights(weights):
         scan_length = max(scan_length, v.shape[1])
 
   pattern_length = max(pattern_keys) + 1 if pattern_keys else 0
+  logging.info(f"MaxTextVllmSampler: Discovered scan_length={scan_length}, pattern_length={pattern_length}")
 
   import numpy as np
 
+  unrolled_count = 0
   for k, v in flat_w.items():
     if "decoder/layers/layers_" in k or "decoder/scanned_blocks/layers_" in k:
       # Unstack the array along the 1st axis
@@ -108,6 +112,7 @@ def unroll_gemma_scanned_weights(weights):
         global_idx = i * pattern_length + layer_sub_idx
         # Map back to nnx.List format which uses layers/X/ instead of layers_X
         new_flat_w[f"decoder/layers/{global_idx}{suffix}"] = unstacked[i]
+        unrolled_count += 1
 
     elif "decoder/layers_remainder/layers_" in k:
       layer_sub_idx = int(k.split("decoder/layers_remainder/layers_")[1].split("/")[0])
@@ -115,9 +120,11 @@ def unroll_gemma_scanned_weights(weights):
 
       global_idx = scan_length * pattern_length + layer_sub_idx
       new_flat_w[f"decoder/layers/{global_idx}{suffix}"] = v
+      unrolled_count += 1
     else:
       new_flat_w[k] = v
 
+  logging.info(f"MaxTextVllmSampler: Successfully unrolled {unrolled_count} scanned tensor components into vLLM-compatible nnx.List format.")
   return unflatten_dict(new_flat_w, sep="/")
 
 
