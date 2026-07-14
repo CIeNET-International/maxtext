@@ -453,10 +453,16 @@ def create_rl_components(
   argv_list = ["", str(vllm_config_path), "log_config=False"]
   vllm_config = pyconfig.initialize(argv_list)
 
+  # Auto-enable MaxTextVllmRollout for Gemma models with scanned layers
+  # to ensure weights are unrolled before sending to flat vLLM rollout.
+  is_gemma = trainer_config.model_name.startswith("gemma")
+  is_scanned = getattr(trainer_config, "scan_layers", False)
+  is_native_vllm = "maxtext_config" in (rollout_additional_config or {})
+
+  use_maxtext_rollout = trainer_config.use_standalone_converter or (is_gemma and is_scanned and is_native_vllm)
+
   rl_rollout_engine = (
-      functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config)
-      if trainer_config.use_standalone_converter
-      else "vllm"
+      functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config) if use_maxtext_rollout else "vllm"
   )
 
   cluster_config = rl_cluster_lib.ClusterConfig(
