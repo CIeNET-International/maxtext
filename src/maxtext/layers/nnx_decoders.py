@@ -1947,7 +1947,7 @@ class NNXDecoder(nnx.Module):
     scan_length = cfg.num_decoder_layers // attention_pattern_length
 
     layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
-    layer_kwargs = {"bidirectional_mask": bidirectional_mask}
+    layer_kwargs = {"bidirectional_mask": bidirectional_mask, "slot": slot, "previous_chunk": previous_chunk}
     if attention_metadata is not None:
       layer_kwargs["attention_metadata"] = attention_metadata
 
