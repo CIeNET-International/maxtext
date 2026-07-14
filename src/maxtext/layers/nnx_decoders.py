@@ -1610,10 +1610,6 @@ class NNXDecoder(nnx.Module):
 
       if self.is_deepseek:
         # Pre-pipeline: dense layers + outside-pipeline MoE layers under PP-as-DP axis rules.
-        ds_layer_kwargs = {
-            "previous_chunk": previous_chunk,
-            "slot": slot,
-        }
         logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
         with self.mesh, nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp):
           if cfg.scan_layers:
@@ -1623,7 +1619,7 @@ class NNXDecoder(nnx.Module):
                   y,
                   *layer_args,
                   length=cfg.first_num_dense_layers,
-                  **ds_layer_kwargs,
+                  **layer_kwargs,
               )
             if hasattr(self, "moe_layers_outside_pipeline") and self.moe_layers_outside_pipeline is not None:
               num_moe_outside = (cfg.num_decoder_layers - cfg.first_num_dense_layers) - cfg.pipeline_parallel_layers
@@ -1632,17 +1628,17 @@ class NNXDecoder(nnx.Module):
                   y,
                   *layer_args,
                   length=num_moe_outside,
-                  **ds_layer_kwargs,
+                  **layer_kwargs,
               )
           else:
             # Unscanned: iterate registered layers by name.
             for i in range(getattr(self, "num_dense_layers", 0)):
               layer = getattr(self, f"dense_layers_{i}")
-              out = layer(y, *layer_args, **ds_layer_kwargs)
+              out = layer(y, *layer_args, **layer_kwargs)
               y = out[0] if isinstance(out, tuple) else out
             for i in range(getattr(self, "num_moe_outside_pipeline", 0)):
               layer = getattr(self, f"moe_layers_outside_pipeline_{i}")
-              out = layer(y, *layer_args, **ds_layer_kwargs)
+              out = layer(y, *layer_args, **layer_kwargs)
               y = out[0] if isinstance(out, tuple) else out
 
         y = self.pipeline_module(
@@ -1656,15 +1652,9 @@ class NNXDecoder(nnx.Module):
       elif self.is_gemma4:
         y = self._apply_gemma4_scanned_blocks(
             y,
-            decoder_segment_ids,
-            decoder_positions,
-            deterministic,
-            model_mode,
-            bidirectional_mask,
-            previous_chunk,
-            slot,
+            layer_args,
+            layer_kwargs,
             kv_caches=kv_caches,
-            attention_metadata=attention_metadata,
         )
       else:
         # Standard pipeline run (non-DeepSeek, incl. Gemma4 — matches Linen decoders.py).
@@ -1719,10 +1709,6 @@ class NNXDecoder(nnx.Module):
         )
       elif cfg.scan_layers:
         if self.is_deepseek:
-          layer_kwargs = {
-              "previous_chunk": previous_chunk,
-              "slot": slot,
-          }
 
           if cfg.engram_layers:
             common_kwargs = {
@@ -1797,28 +1783,16 @@ class NNXDecoder(nnx.Module):
         elif self.is_gemma3:
           y = self._apply_gemma3_scanned_blocks(
               y,
-              decoder_segment_ids,
-              decoder_positions,
-              deterministic,
-              model_mode,
-              bidirectional_mask,
-              previous_chunk,
-              slot,
+              layer_args,
+              layer_kwargs,
               kv_caches=kv_caches,
-              attention_metadata=attention_metadata,
           )
         elif self.is_gemma4:
           y = self._apply_gemma4_scanned_blocks(
               y,
-              decoder_segment_ids,
-              decoder_positions,
-              deterministic,
-              model_mode,
-              bidirectional_mask,
-              previous_chunk,
-              slot,
+              layer_args,
+              layer_kwargs,
               kv_caches=kv_caches,
-              attention_metadata=attention_metadata,
           )
         else:
           scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
@@ -1931,15 +1905,9 @@ class NNXDecoder(nnx.Module):
   def _apply_gemma3_scanned_blocks(
       self,
       y,
-      decoder_segment_ids,
-      decoder_positions,
-      deterministic,
-      model_mode,
-      bidirectional_mask,
-      previous_chunk,
-      slot,
+      layer_args,
+      layer_kwargs,
       kv_caches=None,
-      attention_metadata=None,
   ):
     """Applies Gemma3 scanned decoder blocks, handling main scan and remainders."""
 
@@ -1948,11 +1916,6 @@ class NNXDecoder(nnx.Module):
     # Define the repeating pattern length and calculate how many full blocks to scan
     attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
     scan_length = cfg.num_decoder_layers // attention_pattern_length
-
-    layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
-    layer_kwargs = {"bidirectional_mask": bidirectional_mask, "slot": slot, "previous_chunk": previous_chunk}
-    if attention_metadata is not None:
-      layer_kwargs["attention_metadata"] = attention_metadata
 
     # Apply the main scan over the full blocks
     if scan_length > 0:
@@ -1982,8 +1945,6 @@ class NNXDecoder(nnx.Module):
         call_kwargs = dict(layer_kwargs)
         if kv_in is not None:
           call_kwargs["kv_cache"] = kv_in
-        call_kwargs["previous_chunk"] = previous_chunk
-        call_kwargs["slot"] = slot
         out_res = merged_layer(y_in, *layer_args, **call_kwargs)
         if isinstance(out_res, tuple):
           out_y = out_res[0]
@@ -2009,15 +1970,9 @@ class NNXDecoder(nnx.Module):
   def _apply_gemma4_scanned_blocks(
       self,
       y,
-      decoder_segment_ids,
-      decoder_positions,
-      deterministic,
-      model_mode,
-      bidirectional_mask,
-      previous_chunk,
-      slot,
+      layer_args,
+      layer_kwargs,
       kv_caches=None,
-      attention_metadata=None,
   ):
     """Applies Gemma4 scanned decoder blocks, handling main scan and remainders."""
 
@@ -2026,11 +1981,6 @@ class NNXDecoder(nnx.Module):
     # Define the repeating pattern length and calculate how many full blocks to scan
     attention_pattern_length = len(gemma4.GEMMA4_ATTENTION_PATTERN)
     scan_length = cfg.num_decoder_layers // attention_pattern_length
-
-    layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
-    layer_kwargs = {"bidirectional_mask": bidirectional_mask, "slot": slot, "previous_chunk": previous_chunk}
-    if attention_metadata is not None:
-      layer_kwargs["attention_metadata"] = attention_metadata
 
     # Apply the main scan over the full blocks
     if scan_length > 0:
@@ -2060,8 +2010,6 @@ class NNXDecoder(nnx.Module):
         call_kwargs = dict(layer_kwargs)
         if kv_in is not None:
           call_kwargs["kv_cache"] = kv_in
-        call_kwargs["previous_chunk"] = previous_chunk
-        call_kwargs["slot"] = slot
         out_res = merged_layer(y_in, *layer_args, **call_kwargs)
         if isinstance(out_res, tuple):
           out_y = out_res[0]
