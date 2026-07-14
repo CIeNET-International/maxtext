@@ -1634,12 +1634,23 @@ class NNXDecoder(nnx.Module):
             # Unscanned: iterate registered layers by name.
             for i in range(getattr(self, "num_dense_layers", 0)):
               layer = getattr(self, f"dense_layers_{i}")
-              out = layer(y, *layer_args, **layer_kwargs)
+              call_kwargs = dict(layer_kwargs)
+              if kv_caches is not None:
+                call_kwargs["kv_cache"] = kv_caches[i]
+              out = layer(y, *layer_args, **call_kwargs)
               y = out[0] if isinstance(out, tuple) else out
+              if kv_caches is not None and isinstance(out, tuple) and len(out) > 1 and out[1] is not None:
+                kv_caches[i] = out[1]
             for i in range(getattr(self, "num_moe_outside_pipeline", 0)):
               layer = getattr(self, f"moe_layers_outside_pipeline_{i}")
-              out = layer(y, *layer_args, **layer_kwargs)
+              call_kwargs = dict(layer_kwargs)
+              kv_idx = getattr(self, "num_dense_layers", 0) + i
+              if kv_caches is not None:
+                call_kwargs["kv_cache"] = kv_caches[kv_idx]
+              out = layer(y, *layer_args, **call_kwargs)
               y = out[0] if isinstance(out, tuple) else out
+              if kv_caches is not None and isinstance(out, tuple) and len(out) > 1 and out[1] is not None:
+                kv_caches[kv_idx] = out[1]
 
         y = self.pipeline_module(
             y,
@@ -1689,8 +1700,14 @@ class NNXDecoder(nnx.Module):
             elif (not cfg.scan_layers) and hasattr(self, "num_layers_outside_pipeline"):
               for i in range(self.num_layers_outside_pipeline):
                 layer = getattr(self, f"layers_outside_pipeline_{i}")
-                out = layer(y, *layer_args, **layer_kwargs)
+                call_kwargs = dict(layer_kwargs)
+                kv_idx = cfg.pipeline_parallel_layers + i
+                if kv_caches is not None:
+                  call_kwargs["kv_cache"] = kv_caches[kv_idx]
+                out = layer(y, *layer_args, **call_kwargs)
                 y = out[0] if isinstance(out, tuple) else out
+                if kv_caches is not None and isinstance(out, tuple) and len(out) > 1 and out[1] is not None:
+                  kv_caches[kv_idx] = out[1]
 
     else:
       if self.is_gemma4_small:
