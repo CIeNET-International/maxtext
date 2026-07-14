@@ -1588,7 +1588,10 @@ class NNXDecoder(nnx.Module):
 
     layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
 
-    layer_kwargs = {}
+    layer_kwargs = {
+        "slot": slot,
+        "previous_chunk": previous_chunk,
+    }
     # Extract the bidirectional mask locally for layer configurations
     bidirectional_mask = multimodal_input.bidirectional_mask if multimodal_input is not None else None
 
