@@ -119,7 +119,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "0"
 
 from maxtext.configs import pyconfig
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
-from maxtext.integration.vllm.maxtext_vllm_rollout import MaxTextVllmRollout
+from maxtext.integration.vllm.maxtext_vllm_rollout import MaxTextVllmRollout, needs_maxtext_rollout
 from maxtext.trainers.post_train.rl.evaluate_rl import evaluate
 from maxtext.trainers.post_train.rl import utils_rl
 from maxtext.input_pipeline.instruction_data_processing import load_data_template_from_file
@@ -453,13 +453,14 @@ def create_rl_components(
   argv_list = ["", str(vllm_config_path), "log_config=False"]
   vllm_config = pyconfig.initialize(argv_list)
 
-  # Auto-enable MaxTextVllmRollout for Gemma models with scanned layers
-  # to ensure weights are unrolled before sending to flat vLLM rollout.
-  is_gemma = trainer_config.model_name.startswith("gemma")
-  is_scanned = getattr(trainer_config, "scan_layers", False)
-  is_native_vllm = "maxtext_config" in (rollout_additional_config or {})
-
-  use_maxtext_rollout = trainer_config.use_standalone_converter or (is_gemma and is_scanned and is_native_vllm)
+  # Auto-enable MaxTextVllmRollout for any scanned model on the native-vLLM
+  # path so weights are unrolled before syncing into the flat rollout engine.
+  use_maxtext_rollout = needs_maxtext_rollout(
+      scan_layers=getattr(trainer_config, "scan_layers", False),
+      rollout_additional_config=rollout_additional_config,
+      use_standalone_converter=trainer_config.use_standalone_converter,
+  )
+  max_logging.log(f"RL rollout engine: use_maxtext_rollout={use_maxtext_rollout}")
 
   rl_rollout_engine = (
       functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config) if use_maxtext_rollout else "vllm"
