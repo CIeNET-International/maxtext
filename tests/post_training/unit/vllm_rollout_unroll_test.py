@@ -177,6 +177,17 @@ class GenerateMaxtextConfigForVllmTest(unittest.TestCase):
     self.assertIs(payload["scan_layers"], False)
     self.assertEqual(payload["model_name"], "gemma3-4b")
 
+  @pytest.mark.cpu_only
+  def test_payload_keys_are_valid_config_fields(self):
+    """The engine-side pyconfig strictly validates override keys against the
+    pydantic schema — one unknown key (e.g. mrope_section_size) aborts vLLM
+    engine boot with ValueError."""
+    from maxtext.configs.types import MaxTextConfig  # pylint: disable=import-outside-toplevel
+
+    payload = generate_maxtext_config_for_vllm(self._mock_trainer_cfg())
+    unknown = set(payload) - set(MaxTextConfig.model_fields)
+    self.assertFalse(unknown, f"payload keys not in MaxTextConfig schema: {unknown}")
+
 
 class MockWeights:
   """A mock weight container that implements to_pure_dict."""

@@ -46,7 +46,9 @@ def generate_maxtext_config_for_vllm(maxtext_config):
       "vocab_size": cfg.vocab_size,
       "logits_via_embedding": getattr(cfg, "logits_via_embedding", False),
       "use_mrope": getattr(cfg, "use_mrope", False),
-      "mrope_section_size": getattr(cfg, "mrope_section_size", None),
+      # NOTE: keys here are merged as pyconfig overrides on the engine side
+      # and are STRICTLY validated against the MaxTextConfig schema — an
+      # unknown key (e.g. the old "mrope_section_size") aborts engine boot.
       "scan_layers": False,  # vLLM requires flattened layers
       "decoder_block": cfg.decoder_block,
       "emb_dim": cfg.emb_dim,
