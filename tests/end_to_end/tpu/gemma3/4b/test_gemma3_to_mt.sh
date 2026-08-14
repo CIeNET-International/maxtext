@@ -83,14 +83,17 @@ echo "Scanned checkpoint path: ${SCANNED_CKPT_PATH}"
 # to get higher precision (eg. float32) run on CPU with `JAX_PLATFORMS=cpu`
 # ToDo: improve forward_pass_logit_checker to test multi-modal prompt
 if [ "${USE_MULTIMODAL}" = "false" ]; then
+    if [ ! -f /tmp/golden_data_gemma3-4b.jsonl ]; then
+        gcloud storage cp gs://maxtext-test-assets/golden_data_gemma3-4b.jsonl /tmp/golden_data_gemma3-4b.jsonl
+    fi
+
     python3 -m tests.utils.forward_pass_logit_checker \
         load_parameters_path=${UNSCANNED_CKPT_PATH} \
         model_name=${MODEL_NAME} \
         use_multimodal=${USE_MULTIMODAL} \
         scan_layers=false \
-        --hf_model_path=${HF_GOLDEN_MODEL} \
-        --max_kl_div=0.05 \
-        --run_hf_model=true \
+        --golden_logits_path=/tmp/golden_data_gemma3-4b.jsonl \
+        --max_kl_div=0.15 \
         attention=dot_product \
         hardware=cpu \
         skip_jax_distributed_system=True

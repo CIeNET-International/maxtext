@@ -74,4 +74,6 @@ fi
         per_device_batch_size=1 \
         max_target_length=512 \
         --golden_logits_path=/tmp/golden_data_gpt-oss-20b.jsonl \
-        --max_kl_div=0.01
+        --max_kl_div=0.01 \
+        hardware=cpu \
+        skip_jax_distributed_system=True

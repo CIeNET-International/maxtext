@@ -72,4 +72,6 @@ python3 -m tests.utils.forward_pass_logit_checker \
     image_path=${TEST_IMAGE} \
     --max_kl_div=0.1 \
     --golden_logits_path=${GOLDEN_LOGITS_PATH} \
-    override_model_config=true
+    override_model_config=true \
+    hardware=cpu \
+    skip_jax_distributed_system=True
