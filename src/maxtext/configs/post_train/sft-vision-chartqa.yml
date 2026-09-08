@@ -30,3 +30,4 @@ train_split: 'train'
 hf_eval_split: 'val'
 train_data_columns: ['query', 'label']  # the first column is prompt, second column is completion
 eval_data_columns: ['query', 'label']  # the first column is prompt, second column is completion
+tokenizer_type: "huggingface"

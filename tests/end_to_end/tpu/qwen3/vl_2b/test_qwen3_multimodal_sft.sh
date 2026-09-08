@@ -64,6 +64,7 @@ python -m maxtext.trainers.post_train.sft.train_sft_native "${MAXTEXT_CONFIGS_DI
     async_checkpointing=False \
     float32_qk_product=True \
     float32_logits=True \
+    tokenizer_type=huggingface \
     dataset_type=hf \
     hf_path=parquet \
     hf_train_files=${DATASET_PATH}/hf/chartqa/train-* \
