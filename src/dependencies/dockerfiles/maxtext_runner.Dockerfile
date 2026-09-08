@@ -19,3 +19,4 @@ COPY ${PACKAGE_DIR}/maxtext/assets/ "${MAXTEXT_ASSETS_ROOT}"
 
 # Copy all files except assets from local workspace into docker container
 COPY --exclude=${PACKAGE_DIR}/maxtext/assets/ ${PACKAGE_DIR}/maxtext/ src/maxtext/
+COPY tests*/ tests/
