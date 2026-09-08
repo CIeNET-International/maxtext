@@ -71,6 +71,7 @@ python -m maxtext.trainers.post_train.sft.train_sft_native "${MAXTEXT_CONFIGS_DI
     hf_train_files=${DATASET_PATH}/hf/chartqa/train-* \
     base_output_directory=${BASE_OUTPUT_DIRECTORY}/multimodal/sft \
     load_parameters_path=${MULTIMODAL_SCANNED_CKPT_PATH} \
+    tokenizer_type=huggingface \
     dtype=bfloat16 \
     weight_dtype=bfloat16 \
     sharding_tolerance=0.05 \
