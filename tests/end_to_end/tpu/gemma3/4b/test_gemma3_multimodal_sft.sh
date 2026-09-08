@@ -66,6 +66,7 @@ python -m maxtext.trainers.post_train.sft.train_sft_native "${MAXTEXT_CONFIGS_DI
     scan_layers=true \
     async_checkpointing=False \
     attention=\'dot_product\' \
+    tokenizer_type=huggingface \
     dataset_type=hf \
     hf_path=parquet \
     hf_train_files=${DATASET_PATH}/hf/chartqa/train-* \
