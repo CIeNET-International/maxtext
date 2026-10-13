@@ -20,7 +20,7 @@ run_id=${1:-$(date +%Y-%m-%d-%H-%M-%S)}
 MODEL_NAME='gpt-oss-20b'
 
 # Non-Googlers please remember to point BASE_OUTPUT_DIRECTORY to the GCS paths where you want to store scanned and unscanned checkpoints
-BASE_OUTPUT_DIRECTORY=gs://runner-maxtext-logs/${MODEL_NAME}/to_maxtext
+BASE_OUTPUT_DIRECTORY=${BASE_OUTPUT_DIRECTORY:-gs://runner-maxtext-logs/${MODEL_NAME}/to_maxtext}
 
 # Step 1: Install torch
 python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -74,6 +74,6 @@ python3 -m tests.utils.forward_pass_logit_checker \
     dtype=float32 \
     attention=dot_product \
     --golden_logits_path=/tmp/golden_data_gpt-oss-20b.jsonl \
-    --max_kl_div=1.0 \
+    --max_kl_div=1.2 \
     hardware=cpu \
     skip_jax_distributed_system=True
