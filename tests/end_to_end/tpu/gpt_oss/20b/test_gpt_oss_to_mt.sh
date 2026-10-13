@@ -20,7 +20,7 @@ run_id=${1:-$(date +%Y-%m-%d-%H-%M-%S)}
 MODEL_NAME='gpt-oss-20b'
 
 # Non-Googlers please remember to point BASE_OUTPUT_DIRECTORY to the GCS paths where you want to store scanned and unscanned checkpoints
-BASE_OUTPUT_DIRECTORY=gs://runner-maxtext-logs/${MODEL_NAME}/to_maxtext
+BASE_OUTPUT_DIRECTORY=${BASE_OUTPUT_DIRECTORY:-gs://runner-maxtext-logs/${MODEL_NAME}/to_maxtext}
 
 # Step 1: Install torch
 python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
