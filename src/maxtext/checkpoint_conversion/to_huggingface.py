@@ -465,7 +465,15 @@ def main(argv: Sequence[str]) -> None:
   Args:
     argv: Command-line arguments, which are parsed by `pyconfig`.
   """
-  # Initialize maxtext config
+  # Initialize maxtext config on CPU without distributed initialization by default
+  argv = list(argv)
+  if not any(arg.startswith("hardware=") for arg in argv) and "M_HARDWARE" not in os.environ:
+    argv.append("hardware=cpu")
+  if (
+      not any(arg.startswith("skip_jax_distributed_system=") for arg in argv)
+      and "M_SKIP_JAX_DISTRIBUTED_SYSTEM" not in os.environ
+  ):
+    argv.append("skip_jax_distributed_system=True")
   config = pyconfig.initialize_pydantic(argv)
   assert (
       config.load_full_state_path == ""
