@@ -30,7 +30,7 @@ use_pathways=${2:-false}
 export MODEL_NAME='gpt-oss-20b'
 
 # Non-Googlers please remember to point BASE_OUTPUT_DIRECTORY to the GCS paths where you have the scanned and unscanned checkpoints stored
-BASE_OUTPUT_DIRECTORY=gs://runner-maxtext-logs/${MODEL_NAME}
+BASE_OUTPUT_DIRECTORY=${BASE_OUTPUT_DIRECTORY:-gs://runner-maxtext-logs/${MODEL_NAME}}
 SCANNED_CKPT_PATH=${BASE_OUTPUT_DIRECTORY}/to_maxtext/scanned/${run_id}/0/items
 
 # Step 1: Run RL on the converted checkpoint
@@ -43,7 +43,6 @@ python3 -m maxtext.trainers.post_train.rl.train_rl \
     train_micro_batch_size=16 \
     rollout_micro_batch_size=16 \
     profiler=xplane \
-    profiler_steps=2 \
     base_emb_dim=2880 \
     vocab_size=201088 \
     enable_dp_attention=False \
