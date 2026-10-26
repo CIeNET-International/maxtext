@@ -266,6 +266,48 @@ class QwenScannedWeightsUnrollTest(unittest.TestCase):
     self.assertEqual(validate_direct_sync_layer_coverage(unrolled, target), 4)
 
   @pytest.mark.cpu_only
+  def test_correctly_unrolls_nnx_scanned_layers(self):
+    """Verify NNX scanned layers with 'scanned_layers' container unroll to layers_{global_idx}."""
+    probe_arr = np.zeros((2, 4, 1), dtype=np.float32)
+    for i in range(4):
+      probe_arr[:, i, :] = i
+    weights = MockWeights(
+        {
+            "base": {
+                "decoder": {
+                    "layers": {
+                        "scanned_layers": {
+                            "mlp": {"wi_0": probe_arr},
+                        },
+                    },
+                    "decoder_norm": {"scale": np.ones(2)},
+                }
+            }
+        }
+    )
+
+    unrolled = unroll_qwen_scanned_weights(weights)
+
+    decoder = unrolled["base"]["decoder"]
+    for layer_idx in range(4):
+      self.assertIn(f"layers_{layer_idx}", decoder)
+      self.assertIn("mlp", decoder[f"layers_{layer_idx}"])
+      self.assertNotIn("scanned_layers", decoder[f"layers_{layer_idx}"])
+      np.testing.assert_array_equal(
+          decoder[f"layers_{layer_idx}"]["mlp"]["wi_0"],
+          np.full((2, 1), layer_idx, dtype=np.float32),
+      )
+    target = {
+        "model": {
+            "decoder": {
+                f"layers_{layer_idx}": {"mlp": {"wi_0": np.zeros((2, 1), dtype=np.float32)}}
+                for layer_idx in range(4)
+            }
+        }
+    }
+    self.assertEqual(validate_direct_sync_layer_coverage(unrolled, target), 4)
+
+  @pytest.mark.cpu_only
   def test_rejects_inconsistent_scan_lengths(self):
     weights = MockWeights(
         {

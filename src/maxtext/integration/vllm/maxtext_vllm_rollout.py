@@ -189,12 +189,14 @@ def _find_scanned_layer_idx(key_tuple, container_names=("layers", "scanned_block
 
 
 def _find_qwen_scanned_layer_idx(key_tuple):
-  """Finds a Qwen scanned block path like `layers.layer_0` or `layers.moe_block`."""
+  """Finds a Qwen or LLaMA scanned block path like `layers.layer_0`, `layers.scanned_layers`, or `layers.moe_block`."""
   for i in range(len(key_tuple) - 1):
     if key_tuple[i] != "layers" or not isinstance(key_tuple[i + 1], str):
       continue
     if key_tuple[i + 1].startswith("layers_"):
       continue
+    if key_tuple[i + 1] == "scanned_layers":
+      return i, 0, 2
     match = re.fullmatch(r"layer_(\d+)", key_tuple[i + 1])
     if match:
       return i, int(match.group(1)), 2
