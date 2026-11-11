@@ -502,3 +502,13 @@ def patch_kv_cache_manager():
 
   KVCacheManager.get_kv_cache_spec = patched_get_kv_cache_spec
   max_logging.log("Successfully applied KVCacheManager patch for hybrid GDN models.")
+
+  try:
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    if not hasattr(pltpu, "reciprocal") and hasattr(pl, "reciprocal"):
+      pltpu.reciprocal = pl.reciprocal
+      max_logging.log("Successfully patched pltpu.reciprocal with pl.reciprocal.")
+  except Exception as e:
+    max_logging.log(f"Note: Could not patch pltpu.reciprocal: {e}")
+
