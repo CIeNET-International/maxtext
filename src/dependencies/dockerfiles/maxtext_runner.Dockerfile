@@ -18,4 +18,12 @@ WORKDIR /deps
 COPY ${PACKAGE_DIR}/maxtext/assets/ "${MAXTEXT_ASSETS_ROOT}"
 
 # Copy all files except assets from local workspace into docker container
-COPY --exclude=${PACKAGE_DIR}/maxtext/assets/ ${PACKAGE_DIR}/maxtext/ src/maxtext/
+COPY --exclude=${PACKAGE_DIR}/maxtext/assets/ ${PACKAGE_DIR}/ src/
+COPY tests/ tests/
+
+# Install colorful 0.5.5 for Ray, remove broken aiohttp-cors, patch tpu_inference in site-packages and install sitecustomize
+RUN pip install --no-cache-dir colorful==0.5.5 && \
+    pip uninstall -y aiohttp-cors && \
+    cp -r src/maxtext /usr/local/lib/python3.12/site-packages/ && \
+    python3 src/dependencies/scripts/patch_tpu_inference.py && \
+    if [ -f src/sitecustomize.py ]; then cp src/sitecustomize.py /usr/local/lib/python3.12/site-packages/sitecustomize.py; fi
